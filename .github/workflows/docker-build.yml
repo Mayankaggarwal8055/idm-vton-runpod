@@ -25,6 +25,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./idm-vton-runpod
+          file: ./idm-vton-runpod/Dockerfile
           push: true
           tags: mayankaggarwal8055/idm-vton-runpod:latest
