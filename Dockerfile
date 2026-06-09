@@ -17,13 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc g++ python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Clone IDM-VTON repository and download LFS assets ───────────────────
-RUN git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git /workspace/IDM-VTON
-    && cd /workspace/IDM-VTON \
-    && git lfs pull
+# Clone IDM-VTON repository and download LFS assets
+RUN git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git /workspace/IDM-VTON && \
+    cd /workspace/IDM-VTON && \
+    git lfs pull
+
 WORKDIR /workspace/IDM-VTON
 
-# ── Install Python dependencies ───────────────────────────────────────────
+# Install Python dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         "accelerate==0.25.0" \
@@ -48,22 +49,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "requests==2.31.0" \
         "huggingface-hub==0.25.0"
 
-# Install detectron2 (needs building from source for CUDA 11.8)
+# Install detectron2
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-    "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
+    pip install "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
 
-# ── Pre-download model checkpoints ────────────────────────────────────────
+# Pre-download model checkpoints
 RUN python - <<'PY'
-import os
-import urllib.request
-import shutil
+import os, urllib.request
 
 models_dir = "/workspace/models"
-
-# DensePose weights
 densepose_path = os.path.join(models_dir, "densepose", "model_final_162be9.pkl")
 os.makedirs(os.path.dirname(densepose_path), exist_ok=True)
+
 if not os.path.exists(densepose_path):
     print("Downloading DensePose weights...")
     urllib.request.urlretrieve(
@@ -72,27 +69,22 @@ if not os.path.exists(densepose_path):
     )
     print("DensePose weights downloaded")
 
-# Create checkpoint directories and placeholders for parsing/openpose
-# The actual downloads happen at warmup via the IDM-VTON library
 idm_ckpt = "/workspace/IDM-VTON/ckpt"
 os.makedirs(f"{idm_ckpt}/densepose", exist_ok=True)
 os.makedirs(f"{idm_ckpt}/humanparsing", exist_ok=True)
 os.makedirs(f"{idm_ckpt}/openpose/ckpts", exist_ok=True)
 
-# Symlink DensePose weights
-if os.path.exists(densepose_path):
-    target = f"{idm_ckpt}/densepose/model_final_162be9.pkl"
-    if not os.path.exists(target):
-        os.symlink(densepose_path, target)
-        print("DensePose symlink created")
+target = f"{idm_ckpt}/densepose/model_final_162be9.pkl"
+if os.path.exists(densepose_path) and not os.path.exists(target):
+    os.symlink(densepose_path, target)
+    print("DensePose symlink created")
 
 print("All model weights pre-downloaded")
 PY
 
-# Pre-download the IDM-VTON model weights from HuggingFace using huggingface_hub
+# Pre-download the IDM-VTON model weights
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
-import os
 
 model_id = "yisol/IDM-VTON"
 print(f"Pre-downloading {model_id}...")
@@ -104,7 +96,7 @@ snapshot_download(
 print("IDM-VTON model weights pre-downloaded")
 PY
 
-# ── Build-time validation ─────────────────────────────────────────────────
+# Build-time validation
 RUN python -c "import diffusers, transformers, torch, cv2, detectron2, onnxruntime; print('Base imports OK')"
 RUN python -c "import sys; sys.path.insert(0, '/workspace/IDM-VTON'); from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as T; print('Pipeline import OK')"
 RUN python -c "import sys; sys.path.insert(0, '/workspace/IDM-VTON/gradio_demo'); from utils_mask import get_mask_location; print('Mask utils import OK')"
