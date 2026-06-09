@@ -2,13 +2,16 @@ name: Build and Push IDM-VTON RunPod Image
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
     paths:
-      - 'idm-vton-runpod/**'
+      - "idm-vton-runpod/**"
+      - ".github/workflows/**"
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,5 +26,6 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./idm-vton-runpod
+          file: ./idm-vton-runpod/Dockerfile
           push: true
           tags: mayankaggarwal8055/idm-vton-runpod:latest
