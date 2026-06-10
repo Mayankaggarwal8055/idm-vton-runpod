@@ -75,9 +75,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
 
 # =============================================================================
-# Layer 4 — Clone IDM-VTON repo + download binary checkpoints
+# Layer 4 — Clone IDM-VTON repo + download ALL binary checkpoints
 # =============================================================================
 
+# 4a — Clone the repository and download OpenPose checkpoint
 RUN git lfs install && \
     git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
     mkdir -p $IDM_VTON_DIR/ckpt/openpose/ckpts && \
@@ -88,7 +89,7 @@ RUN git lfs install && \
         $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
         $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
 
-# Download ONNX humanparsing models directly — bypasses LFS reliability issues
+# 4b — Download ONNX humanparsing models (bypasses git LFS issues)
 RUN python3 - <<'PY'
 from huggingface_hub import hf_hub_download
 import os, shutil, sys
@@ -115,6 +116,34 @@ shutil.rmtree("/tmp/hf_onnx_cache", ignore_errors=True)
 print("humanparsing ONNX downloads complete")
 PY
 
+# 4c — Download DensePose checkpoint (model_final_162be9.pkl)
+RUN python3 - <<'PY'
+from huggingface_hub import hf_hub_download
+import os, shutil, sys
+
+dest = os.environ["IDM_VTON_DIR"] + "/ckpt/densepose"
+os.makedirs(dest, exist_ok=True)
+
+fname = "model_final_162be9.pkl"
+print(f"Downloading {fname}...")
+cached = hf_hub_download(
+    repo_id="yisol/IDM-VTON",
+    filename=f"densepose/{fname}",
+    cache_dir="/tmp/hf_densepose_cache",
+)
+final = os.path.join(dest, fname)
+shutil.copy2(cached, final)
+
+size_mb = os.path.getsize(final) / 1024 / 1024
+print(f"{fname} = {size_mb:.1f} MB")
+if size_mb < 100:
+    sys.exit("DensePose checkpoint looks truncated or is a pointer file")
+
+shutil.rmtree("/tmp/hf_densepose_cache", ignore_errors=True)
+print("DensePose download complete")
+PY
+
+# 4d — Verify OpenPose checkpoint size
 RUN python3 - <<'PY'
 import os, sys
 p = "/workspace/IDM-VTON/ckpt/openpose/ckpts/body_pose_model.pth"
@@ -165,6 +194,7 @@ required_files = {
     os.path.join(root, "ckpt/humanparsing/parsing_atr.onnx"): 50,
     os.path.join(root, "ckpt/humanparsing/parsing_lip.onnx"): 50,
     os.path.join(root, "ckpt/openpose/ckpts/body_pose_model.pth"): 10,
+    os.path.join(root, "ckpt/densepose/model_final_162be9.pkl"): 100,
 }
 for path, min_mb in required_files.items():
     if not os.path.exists(path):
