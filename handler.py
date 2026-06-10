@@ -365,7 +365,7 @@ def load_models():
     config_path = os.path.join(IDM_VTON_DIR, "configs", "densepose_rcnn_R_50_FPN_s1x.yaml")
     densepose_cfg.merge_from_file(config_path)
     densepose_cfg.MODEL.WEIGHTS = DENSEPOSE_WEIGHTS
-    densepose_cfg.MODEL.DEVICE = "cuda"
+    densepose_cfg.MODEL.DEVICE = DEVICE
     densepose_cfg.freeze()
 
     densepose_predictor = DefaultPredictor(densepose_cfg)

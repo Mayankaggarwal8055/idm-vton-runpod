@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     IDM_VTON_MODEL=/workspace/models/yisol/IDM-VTON \
     CLOUDINARY_FOLDER=trylix/tryon/results \
     # Performance defaults
-    ENABLE_XFORMERS=1 \
+    ENABLE_XFORMERS=0 \
     ALLOW_TF32=1
 
 WORKDIR /workspace
