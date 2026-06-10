@@ -79,7 +79,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN git lfs install && \
     git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
-    mkdir -p $IDM_VTON_DIR/ckpt/openpose && \
+    mkdir -p $IDM_VTON_DIR/ckpt/openpose/ckpts && \
+    curl -L \
+        -o $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
+        https://huggingface.co/spaces/yisol/IDM-VTON/resolve/main/ckpt/openpose/ckpts/body_pose_model.pth && \
     ln -sf \
         $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
         $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
