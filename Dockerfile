@@ -1,4 +1,3 @@
-```dockerfile
 # syntax=docker/dockerfile:1.4
 
 # =============================================================================
@@ -165,4 +164,3 @@ COPY handler.py /workspace/handler.py
 WORKDIR $IDM_VTON_DIR
 
 CMD ["python", "-u", "/workspace/handler.py"]
-```
