@@ -1,83 +1,156 @@
 # syntax=docker/dockerfile:1.4
+# =============================================================================
+# Optimized Dockerfile for IDM-VTON inference on RunPod
+#
+# Build strategy:
+#   1. OS packages (rarely changes)
+#   2. Core Python packages (stable, cache-friendly)
+#   3. xformers (needs torch from base image)
+#   4. Detectron2 from source (long build, cached separately)
+#   5. Clone repo with LFS assets (all ckpt files are in the repo)
+#   6. Pre-download only the HF model (yisol/IDM-VTON)
+#   7. Build-time validation + copy handler
+# =============================================================================
+
 FROM runpod/pytorch:2.0.1-py3.10-cuda11.8.0-devel AS build
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
-    MODELS_DIR=/workspace/models \
     IDM_VTON_DIR=/workspace/IDM-VTON \
-    HF_HOME=/root/.cache/huggingface
+    # Point DensePose to the repo's ckpt/ — no separate download needed
+    DENSEPOSE_WEIGHTS=/workspace/IDM-VTON/ckpt/densepose/model_final_162be9.pkl \
+    # Where to download the HF model
+    IDM_VTON_MODEL=/workspace/models/yisol/IDM-VTON \
+    CLOUDINARY_FOLDER=trylix/tryon/results \
+    # Performance defaults
+    ENABLE_XFORMERS=1 \
+    ALLOW_TF32=1
 
 WORKDIR /workspace
 
+# ── Layer 1: OS dependencies ──────────────────────────────────────────────
+# git-lfs is needed to pull the LFS checkpoint files from the repo.
+# libgl1/libglib2.0-0 are required by OpenCV.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl git-lfs \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
-    build-essential gcc g++ python3-dev \
+    git git-lfs \
+    libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git /workspace/IDM-VTON && \
-    cd /workspace/IDM-VTON && \
-    git lfs pull
-WORKDIR /workspace/IDM-VTON
-
+# ── Layer 2: Core Python packages ─────────────────────────────────────────
+# torch & torchvision are pre-installed in the base image (via conda).
+# We only install what's missing or needs specific versions.
+# iopath and yacs are intentionally NOT pinned here — detectron2 resolves
+# them transitively in Layer 4 with its own version constraints.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
-        "runpod==1.9.1" \
-        "requests==2.32.3" \
-        "numpy==1.24.4" \
-        "scipy==1.10.1" \
-        "scikit-image==0.21.0" \
-        "opencv-python-headless==4.7.0.72" \
-        "Pillow==9.4.0" \
-        "matplotlib==3.7.4" \
-        "tqdm==4.64.1" \
-        "diffusers==0.25.1" \
-        "transformers==4.41.1" \
-        "huggingface_hub==0.25.2" \
-        "accelerate==0.31.0" \
-        "peft==0.11.1" \
-        "einops==0.7.0" \
-        "safetensors==0.4.3" \
-        "tokenizers==0.19.1" \
-        "onnxruntime-gpu==1.16.2" \
-        "omegaconf==2.3.0" \
-        "cloudpickle==3.0.0" \
-        "pycocotools==2.0.7" \
-        "fvcore==0.1.5.post20221221" \
-        "iopath==0.1.10" \
-        "yacs==0.1.8" \
-        "basicsr==1.4.2" \
-        "av==12.3.0" \
-        "cloudinary==1.40.0" \
-        "protobuf<5"
+        # Core model + diffusers ecosystem
+        diffusers==0.25.1 \
+        transformers==4.41.1 \
+        accelerate==0.25.0 \
+        peft==0.11.1 \
+        safetensors==0.4.3 \
+        tokenizers==0.19.1 \
+        huggingface-hub==0.25.2 \
+        # IP-Adapter / OpenPose / pipeline deps
+        einops==0.7.0 \
+        scipy==1.10.1 \
+        # Image processing
+        opencv-python-headless==4.7.0.72 \
+        Pillow==9.4.0 \
+        # Human parsing (ONNX)
+        onnxruntime-gpu==1.16.2 \
+        "protobuf<5" \
+        # Detectron2 transitive deps (core ones only)
+        fvcore \
+        cloudpickle \
+        omegaconf \
+        pycocotools \
+        # Inference-only extras
+        tqdm \
+        # Handler + cloud upload
+        requests==2.32.3 \
+        runpod==1.9.1 \
+        cloudinary==1.41.0
 
+# ── Layer 3: Install xformers for memory-efficient attention ──────────────
+# xformers reduces VRAM usage by ~40% during inference.
+# Must be installed AFTER torch (which is in the base image).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
+    pip install "xformers==0.0.20"
 
-RUN python - <<'PY'
-import os, urllib.request
-models_dir = "/workspace/models"
-densepose_path = os.path.join(models_dir, "densepose", "model_final_162be9.pkl")
-os.makedirs(os.path.dirname(densepose_path), exist_ok=True)
-if not os.path.exists(densepose_path):
-    urllib.request.urlretrieve(
-        "https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl",
-        densepose_path,
-    )
-PY
+# ── Layer 4: Build detectron2 from source ─────────────────────────────────
+# The repo bundles detectron2 under gradio_demo/detectron2/ but the
+# pre-compiled .so is for Python 3.9 only — it won't load under Python 3.10.
+# Building from source is required. This layer is cached independently.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+        "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
 
-RUN python - <<'PY'
+# ── Layer 5: Clone IDM-VTON repo (includes all ckpt assets via LFS) ──────
+# All checkpoints (DensePose, human parsing ONNX, OpenPose, IP-Adapter,
+# image_encoder) are stored in the repo with Git LFS, so cloning pulls them.
+RUN git lfs install && \
+    git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
+    cd $IDM_VTON_DIR && \
+    git lfs pull && \
+    # Fix OpenPose path: the handler expects body_pose_model.pth at
+    # ckpt/openpose/ but the repo stores it at ckpt/openpose/ckpts/.
+    # Create a symlink so the handler's _ensure_dir_layout() check passes.
+    ln -s $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
+
+# ── Layer 6: Pre-download IDM-VTON model weights from HuggingFace ─────────
+# This is the ~7GB SDXL-based model NOT stored in the repo.
+RUN python -c "
 from huggingface_hub import snapshot_download
+import os
+
+model_id = 'yisol/IDM-VTON'
+model_dir = os.environ['IDM_VTON_MODEL']
+os.makedirs(os.path.dirname(model_dir), exist_ok=True)
+print(f'Pre-downloading {model_id} to {model_dir}...')
 snapshot_download(
-    repo_id="yisol/IDM-VTON",
-    cache_dir="/root/.cache/huggingface",
-    local_dir="/workspace/IDM-VTON-model-cache",
+    model_id,
+    local_dir=model_dir,
     local_dir_use_symlinks=False,
 )
-PY
+print('IDM-VTON model weights downloaded')
+"
 
-COPY handler.py /workspace/IDM-VTON/gradio_demo/handler.py
-WORKDIR /workspace/IDM-VTON/gradio_demo
-CMD ["python", "-u", "/workspace/IDM-VTON/gradio_demo/handler.py"]
+# ── Layer 7: Build-time validation + RunPod handler ───────────────────────
+RUN python -c "
+import sys
+sys.path.insert(0, '$IDM_VTON_DIR')
+sys.path.insert(0, '$IDM_VTON_DIR/gradio_demo')
+
+# Core ecosystem
+import diffusers, transformers, torch, cv2, onnxruntime, detectron2, xformers
+print(f'Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})')
+
+# Custom pipeline module
+from src.tryon_pipeline import StableDiffusionXLInpaintPipeline
+print('Pipeline import OK')
+
+# Mask utility
+from utils_mask import get_mask_location
+print('Mask utils import OK')
+
+# Preprocessing modules
+from preprocess.humanparsing.run_parsing import Parsing
+from preprocess.openpose.run_openpose import OpenPose
+print('Parsing + OpenPose imports OK')
+
+# DensePose + Detectron2
+from densepose import add_densepose_config
+from detectron2.config import get_cfg
+from detectron2.engine.defaults import DefaultPredictor
+print('DensePose + Detectron2 imports OK')
+"
+
+# Copy the RunPod handler
+COPY handler.py /workspace/handler.py
+
+WORKDIR $IDM_VTON_DIR
+CMD ["python", "-u", "/workspace/handler.py"]
