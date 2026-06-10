@@ -223,20 +223,44 @@ def load_models():
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
 
     if pipe is not None:
+        logger.info("Models already loaded — skipping")
         return
+
+    logger.info("=" * 60)
+    logger.info("MODEL LOADING BEGIN")
+    logger.info("=" * 60)
 
     _ensure_dir_layout()
     _set_torch_perf_flags()
 
     load_start = time.perf_counter()
 
+    logger.info("torch_version=%s", torch.__version__)
+    logger.info("cuda_available=%s", torch.cuda.is_available())
+    logger.info("device=%s", DEVICE)
+
+    if torch.cuda.is_available():
+        logger.info("cuda_version=%s", torch.version.cuda)
+        logger.info("gpu_name=%s", torch.cuda.get_device_name(0))
+
+        try:
+            torch.cuda.empty_cache()
+            logger.info("cuda_cache_cleared=True")
+        except Exception as exc:
+            logger.warning("cuda_cache_clear_failed error=%s", exc)
+
     if IDM_VTON_DIR not in sys.path:
         sys.path.insert(0, IDM_VTON_DIR)
+
     gradio_demo_dir = os.path.join(IDM_VTON_DIR, "gradio_demo")
+
     if gradio_demo_dir not in sys.path:
         sys.path.insert(0, gradio_demo_dir)
 
+    logger.info("python_paths_configured=True")
+
     from torchvision import transforms
+
     tensor_transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -244,9 +268,22 @@ def load_models():
         ]
     )
 
-    from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
-    from src.unet_hacked_tryon import UNet2DConditionModel as UNet2DConditionModel_tryon
-    from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+    logger.info("Importing custom IDM-VTON modules...")
+
+    from src.unet_hacked_garmnet import (
+        UNet2DConditionModel as UNet2DConditionModel_ref
+    )
+
+    from src.unet_hacked_tryon import (
+        UNet2DConditionModel as UNet2DConditionModel_tryon
+    )
+
+    from src.tryon_pipeline import (
+        StableDiffusionXLInpaintPipeline as TryonPipeline
+    )
+
+    logger.info("Custom modules imported")
+
     from transformers import (
         CLIPImageProcessor,
         CLIPVisionModelWithProjection,
@@ -254,61 +291,77 @@ def load_models():
         CLIPTextModelWithProjection,
         AutoTokenizer,
     )
-    from diffusers import DDPMScheduler, AutoencoderKL
 
-    logger.info("Loading IDM-VTON model components from %s", IDM_VTON_MODEL)
+    from diffusers import (
+        DDPMScheduler,
+        AutoencoderKL,
+    )
 
+    logger.info("Loading IDM-VTON model from %s", IDM_VTON_MODEL)
+
+    logger.info("Loading UNet...")
     unet = UNet2DConditionModel_tryon.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="unet",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
 
+    logger.info("Loading tokenizer_one...")
     tokenizer_one = AutoTokenizer.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="tokenizer",
         use_fast=False,
     )
+
+    logger.info("Loading tokenizer_two...")
     tokenizer_two = AutoTokenizer.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="tokenizer_2",
         use_fast=False,
     )
 
+    logger.info("Loading scheduler...")
     noise_scheduler = DDPMScheduler.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="scheduler",
     )
 
+    logger.info("Loading text_encoder_one...")
     text_encoder_one = CLIPTextModel.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="text_encoder",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
 
+    logger.info("Loading text_encoder_two...")
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="text_encoder_2",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
 
+    logger.info("Loading image_encoder...")
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="image_encoder",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
 
+    logger.info("Loading VAE...")
     vae = AutoencoderKL.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="vae",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
 
+    logger.info("Loading UNet encoder...")
     unet_encoder = UNet2DConditionModel_ref.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="unet_encoder",
         torch_dtype=TORCH_DTYPE,
     ).requires_grad_(False)
+
+    logger.info("Building SDXL tryon pipeline...")
 
     pipe = TryonPipeline.from_pretrained(
         IDM_VTON_MODEL,
@@ -323,60 +376,117 @@ def load_models():
         image_encoder=image_encoder,
         torch_dtype=TORCH_DTYPE,
     )
+
+    logger.info("Assigning UNet encoder...")
     pipe.unet_encoder = unet_encoder
 
+    logger.info("Moving pipeline to device=%s", DEVICE)
+    pipe = pipe.to(DEVICE)
+
     if ENABLE_XFORMERS:
+
+        logger.info("Attempting xformers enable...")
+
         try:
             pipe.enable_xformers_memory_efficient_attention()
             logger.info("xformers_enabled=True")
+
         except Exception as exc:
-            logger.warning("xformers_enable_failed error=%s", exc)
+            logger.warning(
+                "xformers_enable_failed error=%s",
+                exc,
+            )
 
     if ENABLE_MODEL_CPU_OFFLOAD:
+
+        logger.info("Attempting model CPU offload...")
+
         try:
             pipe.enable_model_cpu_offload()
             logger.info("model_cpu_offload_enabled=True")
+
         except Exception as exc:
-            logger.warning("cpu_offload_enable_failed error=%s", exc)
+            logger.warning(
+                "cpu_offload_enable_failed error=%s",
+                exc,
+            )
 
     if ENABLE_TORCH_COMPILE and hasattr(torch, "compile"):
+
+        logger.info("Attempting torch.compile...")
+
         try:
-            pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead")
+            pipe.unet = torch.compile(
+                pipe.unet,
+                mode="reduce-overhead",
+            )
+
             logger.info("torch_compile_enabled=True")
+
         except Exception as exc:
-            logger.warning("torch_compile_failed error=%s", exc)
+            logger.warning(
+                "torch_compile_failed error=%s",
+                exc,
+            )
 
-    logger.info("IDM-VTON pipeline loaded")
+    logger.info("Pipeline fully initialized")
 
+    logger.info("Loading Parsing model...")
     from preprocess.humanparsing.run_parsing import Parsing
     parsing_model = Parsing(0)
 
+    logger.info("Loading OpenPose model...")
     from preprocess.openpose.run_openpose import OpenPose
     openpose_model = OpenPose(0)
 
-    logger.info("Parsing and OpenPose models loaded")
+    logger.info("Parsing + OpenPose ready")
+
+    logger.info("Loading DensePose config...")
 
     from detectron2.config import get_cfg
     from densepose import add_densepose_config
     from detectron2.engine.defaults import DefaultPredictor
 
     densepose_cfg = get_cfg()
+
     add_densepose_config(densepose_cfg)
-    config_path = os.path.join(IDM_VTON_DIR, "configs", "densepose_rcnn_R_50_FPN_s1x.yaml")
+
+    config_path = os.path.join(
+        IDM_VTON_DIR,
+        "configs",
+        "densepose_rcnn_R_50_FPN_s1x.yaml",
+    )
+
+    logger.info("DensePose config path=%s", config_path)
+
     densepose_cfg.merge_from_file(config_path)
+
     densepose_cfg.MODEL.WEIGHTS = DENSEPOSE_WEIGHTS
+
+    logger.info("DensePose weights=%s", DENSEPOSE_WEIGHTS)
+
     densepose_cfg.MODEL.DEVICE = DEVICE
+
     densepose_cfg.freeze()
 
+    logger.info("Creating DensePose predictor...")
+
     densepose_predictor = DefaultPredictor(densepose_cfg)
-    logger.info("DensePose predictor loaded")
+
+    logger.info("DensePose predictor ready")
+
+    logger.info("Loading mask utility...")
 
     from utils_mask import get_mask_location as _get_mask_location
+
     get_mask_location_fn = _get_mask_location
 
     load_ms = (time.perf_counter() - load_start) * 1000
-    logger.info("models_ready model_load_ms=%.0f", load_ms)
 
+    logger.info("=" * 60)
+    logger.info("MODELS READY")
+    logger.info("model_load_ms=%.0f", load_ms)
+    logger.info("=" * 60)
 
 # =============================================================================
 # Warmup
