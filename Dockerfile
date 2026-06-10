@@ -103,7 +103,7 @@ RUN git lfs install && \
 
 # ── Layer 6: Pre-download IDM-VTON model weights from HuggingFace ─────────
 # This is the ~7GB SDXL-based model NOT stored in the repo.
-RUN python -c "
+RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 import os
 
@@ -112,12 +112,12 @@ model_dir = os.environ['IDM_VTON_MODEL']
 os.makedirs(os.path.dirname(model_dir), exist_ok=True)
 print(f'Pre-downloading {model_id} to {model_dir}...')
 snapshot_download(
-    model_id,
+    repo_id=model_id,
     local_dir=model_dir,
     local_dir_use_symlinks=False,
 )
 print('IDM-VTON model weights downloaded')
-"
+PY
 
 # ── Layer 7: Build-time validation + RunPod handler ───────────────────────
 RUN python -c "
