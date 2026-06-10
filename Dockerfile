@@ -104,23 +104,31 @@ RUN git lfs install && \
 # ── Layer 6: Pre-download IDM-VTON model weights from HuggingFace ─────────
 # This is the ~7GB SDXL-based model NOT stored in the repo.
 RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-import os
+import sys
+sys.path.insert(0, '/workspace/IDM-VTON')
+sys.path.insert(0, '/workspace/IDM-VTON/gradio_demo')
 
-model_id = 'yisol/IDM-VTON'
-model_dir = os.environ['IDM_VTON_MODEL']
-os.makedirs(os.path.dirname(model_dir), exist_ok=True)
-print(f'Pre-downloading {model_id} to {model_dir}...')
-snapshot_download(
-    repo_id=model_id,
-    local_dir=model_dir,
-    local_dir_use_symlinks=False,
-)
-print('IDM-VTON model weights downloaded')
+import diffusers, transformers, torch, cv2, onnxruntime, detectron2
+print(f'Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})')
+
+from src.tryon_pipeline import StableDiffusionXLInpaintPipeline
+print('Pipeline import OK')
+
+from utils_mask import get_mask_location
+print('Mask utils import OK')
+
+from preprocess.humanparsing.run_parsing import Parsing
+from preprocess.openpose.run_openpose import OpenPose
+print('Parsing + OpenPose imports OK')
+
+from densepose import add_densepose_config
+from detectron2.config import get_cfg
+from detectron2.engine.defaults import DefaultPredictor
+print('DensePose + Detectron2 imports OK')
 PY
 
 # ── Layer 7: Build-time validation + RunPod handler ───────────────────────
-RUN python -c "
+RUN python - <<'PY'
 import sys
 sys.path.insert(0, '$IDM_VTON_DIR')
 sys.path.insert(0, '$IDM_VTON_DIR/gradio_demo')
@@ -147,7 +155,7 @@ from densepose import add_densepose_config
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
 print('DensePose + Detectron2 imports OK')
-"
+PY
 
 # Copy the RunPod handler
 COPY handler.py /workspace/handler.py
