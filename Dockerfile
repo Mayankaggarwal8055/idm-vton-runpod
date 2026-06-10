@@ -102,7 +102,6 @@ RUN python - <<'PY'
 import sys
 
 sys.path.insert(0, "/workspace/IDM-VTON")
-
 import diffusers, transformers, torch, cv2, onnxruntime, detectron2
 print(f"Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})")
 
