@@ -100,26 +100,27 @@ RUN git lfs install && \
 # This is the ~7GB SDXL-based model NOT stored in the repo.
 RUN python - <<'PY'
 import sys
-sys.path.insert(0, '/workspace/IDM-VTON')
-sys.path.insert(0, '/workspace/IDM-VTON/gradio_demo')
+
+sys.path.insert(0, "/workspace/IDM-VTON")
 
 import diffusers, transformers, torch, cv2, onnxruntime, detectron2
-print(f'Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})')
+print(f"Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})")
 
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline
-print('Pipeline import OK')
+print("Pipeline import OK")
 
+sys.path.insert(0, "/workspace/IDM-VTON/gradio_demo")
 from utils_mask import get_mask_location
-print('Mask utils import OK')
+print("Mask utils import OK")
 
 from preprocess.humanparsing.run_parsing import Parsing
 from preprocess.openpose.run_openpose import OpenPose
-print('Parsing + OpenPose imports OK')
+print("Parsing + OpenPose imports OK")
 
 from densepose import add_densepose_config
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
-print('DensePose + Detectron2 imports OK')
+print("DensePose + Detectron2 imports OK")
 PY
 
 # ── Layer 7: Build-time validation + RunPod handler ───────────────────────
