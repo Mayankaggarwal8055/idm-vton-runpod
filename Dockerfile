@@ -46,31 +46,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # them transitively in Layer 4 with its own version constraints.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
-        # Core model + diffusers ecosystem
         diffusers==0.25.1 \
         transformers==4.41.1 \
         accelerate==0.25.0 \
         peft==0.11.1 \
         safetensors==0.4.3 \
         tokenizers==0.19.1 \
-        huggingface-hub==0.25.2 \
-        # IP-Adapter / OpenPose / pipeline deps
+        huggingface_hub==0.25.2 \
         einops==0.7.0 \
         scipy==1.10.1 \
-        # Image processing
+        scikit-image==0.21.0 \
         opencv-python-headless==4.7.0.72 \
         Pillow==9.4.0 \
-        # Human parsing (ONNX)
         onnxruntime-gpu==1.16.2 \
         "protobuf<5" \
-        # Detectron2 transitive deps (core ones only)
         fvcore \
         cloudpickle \
         omegaconf \
         pycocotools \
-        # Inference-only extras
         tqdm \
-        # Handler + cloud upload
         requests==2.32.3 \
         runpod==1.9.1 \
         cloudinary==1.41.0
