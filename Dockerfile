@@ -124,28 +124,28 @@ PY
 
 # ── Layer 7: Build-time validation + RunPod handler ───────────────────────
 RUN python - <<'PY'
+import os
 import sys
-sys.path.insert(0, '$IDM_VTON_DIR')
-sys.path.insert(0, '$IDM_VTON_DIR/gradio_demo')
 
-# Core ecosystem
+root = os.environ["IDM_VTON_DIR"]
+demo = os.path.join(root, "gradio_demo")
+
+sys.path.insert(0, root)
+sys.path.insert(0, demo)
+
 import diffusers, transformers, torch, cv2, onnxruntime, detectron2, xformers
 print(f'Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})')
 
-# Custom pipeline module
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline
 print('Pipeline import OK')
 
-# Mask utility
 from utils_mask import get_mask_location
 print('Mask utils import OK')
 
-# Preprocessing modules
 from preprocess.humanparsing.run_parsing import Parsing
 from preprocess.openpose.run_openpose import OpenPose
 print('Parsing + OpenPose imports OK')
 
-# DensePose + Detectron2
 from densepose import add_densepose_config
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
