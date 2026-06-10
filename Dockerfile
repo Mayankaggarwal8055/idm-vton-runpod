@@ -59,6 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         opencv-python-headless==4.7.0.72 \
         Pillow==9.4.0 \
         onnxruntime-gpu==1.16.2 \
+        av==12.3.0 \
         "protobuf<5" \
         fvcore \
         cloudpickle \
