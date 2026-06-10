@@ -146,7 +146,6 @@ demo = os.path.join(root, "gradio_demo")
 sys.path.insert(0, root)
 sys.path.insert(0, demo)
 
-# ── 1. File size guard (catches LFS pointer files) ───────────────────────────
 required_files = {
     os.path.join(root, "ckpt/humanparsing/parsing_atr.onnx"): 50,
     os.path.join(root, "ckpt/humanparsing/parsing_lip.onnx"): 50,
@@ -162,7 +161,6 @@ for path, min_mb in required_files.items():
         )
     print(f"Size OK: {os.path.basename(path)} = {size_mb:.1f} MB")
 
-# ── 2. Core imports ───────────────────────────────────────────────────────────
 import diffusers, transformers, torch, cv2, onnxruntime, detectron2
 print(f"Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})")
 
@@ -172,17 +170,9 @@ print("Pipeline import OK")
 from utils_mask import get_mask_location
 print("Mask utils import OK")
 
-# ── 3. Actually instantiate the parsing models (this is what fails at runtime) ─
-os.chdir(root)
-
-from preprocess.humanparsing.run_parsing import Parsing
-parsing = Parsing(0)   # ← this is the line that was crashing on RunPod
-print("Parsing instantiation OK")
-
 from preprocess.openpose.run_openpose import OpenPose
 print("OpenPose import OK")
 
-# ── 4. DensePose ──────────────────────────────────────────────────────────────
 from densepose import add_densepose_config
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
