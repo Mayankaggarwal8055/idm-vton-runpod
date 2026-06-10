@@ -74,17 +74,42 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
 
 # =============================================================================
-# Layer 4 — Clone IDM-VTON repo + LFS assets
+# Layer 4 — Clone IDM-VTON repo + download binary checkpoints
 # =============================================================================
 
 RUN git lfs install && \
     git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
-    cd $IDM_VTON_DIR && \
-    git lfs pull && \
     mkdir -p $IDM_VTON_DIR/ckpt/openpose && \
     ln -sf \
         $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
         $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
+
+# Download ONNX humanparsing models directly — bypasses LFS reliability issues
+RUN python3 - <<'PY'
+from huggingface_hub import hf_hub_download
+import os, shutil, sys
+
+dest = os.environ["IDM_VTON_DIR"] + "/ckpt/humanparsing"
+os.makedirs(dest, exist_ok=True)
+
+for fname in ["parsing_atr.onnx", "parsing_lip.onnx"]:
+    print(f"Downloading {fname}...")
+    cached = hf_hub_download(
+        repo_id="levihsu/OOTDiffusion",
+        filename=f"checkpoints/humanparsing/{fname}",
+        cache_dir="/tmp/hf_onnx_cache",
+    )
+    final = os.path.join(dest, fname)
+    shutil.copy2(cached, final)
+    size_mb = os.path.getsize(final) / 1024 / 1024
+    if size_mb < 50:
+        print(f"FATAL: {fname} is {size_mb:.2f} MB — still a git LFS pointer", flush=True)
+        sys.exit(1)
+    print(f"  OK: {fname} = {size_mb:.1f} MB")
+
+shutil.rmtree("/tmp/hf_onnx_cache", ignore_errors=True)
+print("humanparsing ONNX downloads complete")
+PY
 
 # =============================================================================
 # Layer 5 — Download full IDM-VTON SDXL weights
@@ -121,18 +146,25 @@ demo = os.path.join(root, "gradio_demo")
 sys.path.insert(0, root)
 sys.path.insert(0, demo)
 
-import diffusers
-import transformers
-import torch
-import cv2
-import onnxruntime
-import detectron2
+# ── 1. File size guard (catches LFS pointer files) ───────────────────────────
+required_files = {
+    os.path.join(root, "ckpt/humanparsing/parsing_atr.onnx"): 50,
+    os.path.join(root, "ckpt/humanparsing/parsing_lip.onnx"): 50,
+}
+for path, min_mb in required_files.items():
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing: {path}")
+    size_mb = os.path.getsize(path) / 1024 / 1024
+    if size_mb < min_mb:
+        raise RuntimeError(
+            f"File too small ({size_mb:.2f} MB < {min_mb} MB) — "
+            f"likely a git LFS pointer: {path}"
+        )
+    print(f"Size OK: {os.path.basename(path)} = {size_mb:.1f} MB")
 
-print(
-    f"Core imports OK "
-    f"(diffusers={diffusers.__version__} "
-    f"torch={torch.__version__})"
-)
+# ── 2. Core imports ───────────────────────────────────────────────────────────
+import diffusers, transformers, torch, cv2, onnxruntime, detectron2
+print(f"Core imports OK (diffusers={diffusers.__version__} torch={torch.__version__})")
 
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline
 print("Pipeline import OK")
@@ -140,15 +172,23 @@ print("Pipeline import OK")
 from utils_mask import get_mask_location
 print("Mask utils import OK")
 
-from preprocess.humanparsing.run_parsing import Parsing
-from preprocess.openpose.run_openpose import OpenPose
-print("Parsing + OpenPose imports OK")
+# ── 3. Actually instantiate the parsing models (this is what fails at runtime) ─
+os.chdir(root)
 
+from preprocess.humanparsing.run_parsing import Parsing
+parsing = Parsing(0)   # ← this is the line that was crashing on RunPod
+print("Parsing instantiation OK")
+
+from preprocess.openpose.run_openpose import OpenPose
+print("OpenPose import OK")
+
+# ── 4. DensePose ──────────────────────────────────────────────────────────────
 from densepose import add_densepose_config
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
-
 print("DensePose + Detectron2 imports OK")
+
+print("All validation passed")
 PY
 
 # =============================================================================
