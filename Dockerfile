@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git-lfs \
     libgl1 \
     libglib2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
@@ -114,6 +115,17 @@ shutil.rmtree("/tmp/hf_onnx_cache", ignore_errors=True)
 print("humanparsing ONNX downloads complete")
 PY
 
+RUN python3 - <<'PY'
+import os, sys
+p = "/workspace/IDM-VTON/ckpt/openpose/ckpts/body_pose_model.pth"
+if not os.path.exists(p):
+    sys.exit(f"Missing: {p}")
+size_mb = os.path.getsize(p) / 1024 / 1024
+print("body_pose_model.pth size_mb =", size_mb)
+if size_mb < 10:
+    sys.exit("body_pose_model.pth looks corrupted or incomplete")
+PY
+
 # =============================================================================
 # Layer 5 — Download full IDM-VTON SDXL weights
 # =============================================================================
@@ -152,6 +164,7 @@ sys.path.insert(0, demo)
 required_files = {
     os.path.join(root, "ckpt/humanparsing/parsing_atr.onnx"): 50,
     os.path.join(root, "ckpt/humanparsing/parsing_lip.onnx"): 50,
+    os.path.join(root, "ckpt/openpose/ckpts/body_pose_model.pth"): 10,
 }
 for path, min_mb in required_files.items():
     if not os.path.exists(path):
@@ -160,7 +173,7 @@ for path, min_mb in required_files.items():
     if size_mb < min_mb:
         raise RuntimeError(
             f"File too small ({size_mb:.2f} MB < {min_mb} MB) — "
-            f"likely a git LFS pointer: {path}"
+            f"likely corrupted: {path}"
         )
     print(f"Size OK: {os.path.basename(path)} = {size_mb:.1f} MB")
 
