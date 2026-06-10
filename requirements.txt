@@ -32,4 +32,4 @@ av==12.3.0
 
 cloudinary==1.40.0
 
-protobuf<5
+protobuf<5 
