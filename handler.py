@@ -653,7 +653,7 @@ def run_idm_vton_inference(
             )[0]
 
     if auto_crop and crop_size is not None:
-        out_img = images.resize(crop_size)
+        out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
         return final_img
