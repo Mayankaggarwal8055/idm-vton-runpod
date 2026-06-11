@@ -6,6 +6,7 @@ import sys
 import time
 import logging
 import random
+import base64
 import threading
 import traceback
 from pathlib import Path
@@ -199,6 +200,32 @@ def download_image(url: str, timeout: int = 60) -> Image.Image:
     resp = session.get(url, timeout=timeout, stream=True)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+
+def _is_url_reference(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized.startswith("http://") or normalized.startswith("https://")
+
+
+def _decode_base64_image(value: str) -> Image.Image:
+    payload = value.strip()
+    if payload.startswith("data:"):
+        _, payload = payload.split(",", 1)
+
+    payload = "".join(payload.split())
+    padding = (-len(payload)) % 4
+    if padding:
+        payload += "=" * padding
+
+    raw = base64.b64decode(payload)
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def load_image_reference(value: str, timeout: int = 60) -> Image.Image:
+    """Load an image from either an http(s) URL or a base64/data URL payload."""
+    if _is_url_reference(value):
+        return download_image(value, timeout=timeout)
+    return _decode_base64_image(value)
 
 
 def _set_torch_perf_flags():
@@ -544,6 +571,7 @@ def run_idm_vton_inference(
     steps: int = 30,
     seed: int = 42,
     auto_crop: bool = True,
+    external_mask: Image.Image | None = None,
 ) -> Image.Image:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -576,10 +604,19 @@ def run_idm_vton_inference(
     else:
         human_img = human_img_orig.resize(TARGET_SIZE)
 
-    keypoints = openpose_model(human_img.resize((384, 512)))
-    model_parse, _ = parsing_model(human_img.resize((384, 512)))
-    mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
-    mask = mask.resize(TARGET_SIZE)
+    if external_mask is not None:
+        # Use externally-provided mask (from preprocessing) — skip AutoMasker
+        mask = external_mask
+        logger.info(
+            "using_external_mask cloth_type=%s mask_size=%s",
+            cloth_type, mask.size,
+        )
+    else:
+        # Fall back to internal AutoMasker (DensePose + SCHP + OpenPose)
+        keypoints = openpose_model(human_img.resize((384, 512)))
+        model_parse, _ = parsing_model(human_img.resize((384, 512)))
+        mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
+        mask = mask.resize(TARGET_SIZE)
 
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
@@ -670,6 +707,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     person_url = job_input.get("person_image_url") or job_input.get("person_image")
     garment_url = job_input.get("garment_image_url") or job_input.get("garment_image")
+    mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
@@ -697,6 +735,24 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     download_start = time.perf_counter()
     person_img = download_image(person_url)
     garment_img = download_image(garment_url)
+
+    # Load external mask if provided (URL or base64) and skip AutoMasker.
+    external_mask = None
+    if mask_image_ref:
+        try:
+            external_mask_img = load_image_reference(str(mask_image_ref))
+            external_mask = external_mask_img.convert("L").resize(TARGET_SIZE)
+            logger.info(
+                "external_mask_loaded source=%s mask_size=%s",
+                "url" if _is_url_reference(str(mask_image_ref)) else "base64",
+                external_mask.size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "external_mask_load_failed error=%s falling_back_to_automasker",
+                exc,
+            )
+
     download_ms = (time.perf_counter() - download_start) * 1000
 
     inference_start = time.perf_counter()
@@ -708,6 +764,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         steps=steps,
         seed=seed,
         auto_crop=True,
+        external_mask=external_mask,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
