@@ -572,7 +572,10 @@ def run_idm_vton_inference(
     seed: int = 42,
     auto_crop: bool = True,
     external_mask: Image.Image | None = None,
-) -> Image.Image:
+    protected_mask: Image.Image | None = None,
+    mask_strategy: str = "external",
+    mask_quality_score: float | None = None,
+) -> tuple[Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
 
@@ -584,6 +587,13 @@ def run_idm_vton_inference(
         openpose_model.preprocessor.body_estimation.model.to(device)
         pipe.to(device)
         pipe.unet_encoder.to(device)
+
+    from mask_pipeline import (
+        WorkerMaskStrategy,
+        apply_protected_mask,
+        fuse_hybrid_mask,
+        select_worker_mask_strategy,
+    )
 
     garm_img = garment_img.convert("RGB").resize(TARGET_SIZE)
     human_img_orig = person_img.convert("RGB")
@@ -604,19 +614,44 @@ def run_idm_vton_inference(
     else:
         human_img = human_img_orig.resize(TARGET_SIZE)
 
-    if external_mask is not None:
-        # Use externally-provided mask (from preprocessing) — skip AutoMasker
-        mask = external_mask
-        logger.info(
-            "using_external_mask cloth_type=%s mask_size=%s",
-            cloth_type, mask.size,
-        )
+    # Always compute AutoMasker mask (SCHP + OpenPose) for routing / hybrid
+    keypoints = openpose_model(human_img.resize((384, 512)))
+    model_parse, _ = parsing_model(human_img.resize((384, 512)))
+    automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
+    automasker_mask = automasker_mask.resize(TARGET_SIZE)
+
+    min_quality = float(os.environ.get("MASK_MIN_QUALITY_SCORE", "62.0"))
+    strategy = select_worker_mask_strategy(
+        external_mask,
+        mask_quality_score,
+        min_quality=min_quality,
+    )
+    if mask_strategy == "automasker":
+        strategy = WorkerMaskStrategy.AUTOMASKER
+    elif mask_strategy == "hybrid":
+        strategy = WorkerMaskStrategy.HYBRID
+
+    mask_meta: dict[str, object] = {
+        "mask_type_used": strategy.value,
+        "mask_quality_score": mask_quality_score,
+    }
+
+    if strategy == WorkerMaskStrategy.EXTERNAL and external_mask is not None:
+        mask = external_mask.convert("L").resize(TARGET_SIZE)
+    elif strategy == WorkerMaskStrategy.HYBRID:
+        mask = fuse_hybrid_mask(external_mask, automasker_mask, cloth_type)
+        mask_meta["mask_type_used"] = "hybrid"
     else:
-        # Fall back to internal AutoMasker (DensePose + SCHP + OpenPose)
-        keypoints = openpose_model(human_img.resize((384, 512)))
-        model_parse, _ = parsing_model(human_img.resize((384, 512)))
-        mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
-        mask = mask.resize(TARGET_SIZE)
+        mask = automasker_mask
+        mask_meta["mask_type_used"] = "automasker"
+
+    mask = apply_protected_mask(mask, protected_mask)
+    logger.info(
+        "mask_selected strategy=%s mask_size=%s quality_score=%s",
+        mask_meta["mask_type_used"],
+        mask.size,
+        mask_quality_score,
+    )
 
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
@@ -644,7 +679,10 @@ def run_idm_vton_inference(
         "deformed, distorted, disfigured, bad proportions, "
         "extra limbs, missing limbs, cloned head, body out of frame, "
         "poorly drawn face, mutation, mutated, extra fingers, "
-        "ugly, blurry, watermark, signature, text, logo"
+        "ugly, blurry, watermark, signature, text, logo, "
+        "beard on woman, mustache on woman, masculine face on woman, "
+        "feminine face on man, changed hairstyle, changed hair color, "
+        "changed skin tone, changed body shape, gender swap"
     )
 
     with torch.inference_mode():
@@ -693,9 +731,9 @@ def run_idm_vton_inference(
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
-        return final_img
+        return final_img, mask_meta
 
-    return images[0]
+    return images[0], mask_meta
 
 
 # =============================================================================
@@ -703,15 +741,28 @@ def run_idm_vton_inference(
 # =============================================================================
 
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
+    from mask_pipeline import (
+        WorkerMaskStrategy,
+        detect_inference_failures,
+    )
+
     job_start = time.perf_counter()
 
     person_url = job_input.get("person_image_url") or job_input.get("person_image")
     garment_url = job_input.get("garment_image_url") or job_input.get("garment_image")
     mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
+    protected_ref = job_input.get("protected_mask") or job_input.get("protected_mask_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
+    mask_quality_score = job_input.get("mask_quality_score")
+    if mask_quality_score is not None:
+        mask_quality_score = float(mask_quality_score)
+    mask_strategy_hint = str(job_input.get("mask_strategy", "auto"))
+    trace_id = job_input.get("trace_id", "")
+    max_retries = int(os.environ.get("MASK_WORKER_MAX_RETRIES", "2"))
+    retry_enabled = os.environ.get("MASK_WORKER_RETRY", "1") == "1"
 
     if not person_url or not garment_url:
         raise ValueError("Missing required inputs: person_image_url and garment_image_url")
@@ -724,28 +775,34 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "dress": "dresses",
         "dresses": "dresses",
         "overall": "dresses",
+        "full_body": "dresses",
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
 
+    # Gender-neutral garment description — avoid biasing body shape
+    garment_desc = garment_desc.strip()
+    if not garment_desc.lower().startswith(("a ", "an ", "the ")):
+        garment_desc = f"garment: {garment_desc}"
+
     logger.info(
-        "inference_start cloth_type=%s steps=%s seed=%s garment_desc=%s",
-        vton_type, steps, seed, garment_desc,
+        "inference_start cloth_type=%s steps=%s seed=%s garment_desc=%s trace_id=%s",
+        vton_type, steps, seed, garment_desc, trace_id,
     )
 
     download_start = time.perf_counter()
     person_img = download_image(person_url)
     garment_img = download_image(garment_url)
 
-    # Load external mask if provided (URL or base64) and skip AutoMasker.
     external_mask = None
     if mask_image_ref:
         try:
             external_mask_img = load_image_reference(str(mask_image_ref))
             external_mask = external_mask_img.convert("L").resize(TARGET_SIZE)
             logger.info(
-                "external_mask_loaded source=%s mask_size=%s",
+                "external_mask_loaded source=%s mask_size=%s quality_score=%s",
                 "url" if _is_url_reference(str(mask_image_ref)) else "base64",
                 external_mask.size,
+                mask_quality_score,
             )
         except Exception as exc:
             logger.warning(
@@ -753,19 +810,75 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 exc,
             )
 
+    protected_mask = None
+    if protected_ref:
+        try:
+            protected_mask = load_image_reference(str(protected_ref)).convert("L")
+            logger.info("protected_mask_loaded size=%s", protected_mask.size)
+        except Exception as exc:
+            logger.warning("protected_mask_load_failed error=%s", exc)
+
     download_ms = (time.perf_counter() - download_start) * 1000
 
+    # Retry strategies: external/automasker → automasker → hybrid
+    retry_strategies: list[str] = []
+    if external_mask and mask_strategy_hint not in ("automasker",):
+        retry_strategies.append("external")
+    retry_strategies.append("automasker")
+    if external_mask:
+        retry_strategies.append("hybrid")
+    if not retry_enabled:
+        retry_strategies = retry_strategies[:1]
+
     inference_start = time.perf_counter()
-    result = run_idm_vton_inference(
-        person_img=person_img,
-        garment_img=garment_img,
-        garment_desc=garment_desc,
-        cloth_type=vton_type,
-        steps=steps,
-        seed=seed,
-        auto_crop=True,
-        external_mask=external_mask,
-    )
+    result: Image.Image | None = None
+    mask_meta: dict[str, object] = {}
+    quality_report = None
+    retry_count = 0
+    failure_reasons: list[str] = []
+    last_inpaint_mask = external_mask
+
+    for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
+        retry_count = attempt_idx
+        result, mask_meta = run_idm_vton_inference(
+            person_img=person_img,
+            garment_img=garment_img,
+            garment_desc=garment_desc,
+            cloth_type=vton_type,
+            steps=steps,
+            seed=seed + attempt_idx,
+            auto_crop=True,
+            external_mask=external_mask,
+            protected_mask=protected_mask,
+            mask_strategy=strategy,
+            mask_quality_score=mask_quality_score,
+        )
+        last_inpaint_mask = external_mask if strategy == "external" else None
+
+        if not retry_enabled or attempt_idx >= len(retry_strategies) - 1:
+            break
+
+        inpaint_for_qa = external_mask if strategy == "external" else None
+        if inpaint_for_qa is None:
+            break
+
+        quality_report = detect_inference_failures(
+            person_img.resize(TARGET_SIZE),
+            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+            inpaint_for_qa,
+            protected_mask,
+        )
+        if quality_report.passed:
+            break
+
+        failure_reasons = list(quality_report.failure_reasons)
+        logger.warning(
+            "inference_qa_failed attempt=%s strategy=%s reasons=%s retrying",
+            attempt_idx,
+            strategy,
+            failure_reasons,
+        )
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
@@ -777,8 +890,12 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     total_ms = (time.perf_counter() - job_start) * 1000
 
     logger.info(
-        "job_complete total_ms=%.0f download_ms=%.0f inference_ms=%.0f upload_ms=%.0f",
+        "job_complete total_ms=%.0f download_ms=%.0f inference_ms=%.0f upload_ms=%.0f "
+        "mask_type=%s retry_count=%s trace_id=%s",
         total_ms, download_ms, inference_ms, upload_ms,
+        mask_meta.get("mask_type_used"),
+        retry_count,
+        trace_id,
     )
 
     return {
@@ -791,6 +908,14 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "upload_ms": round(upload_ms, 2),
         "download_ms": round(download_ms, 2),
         "total_ms": round(total_ms, 2),
+        "mask_type_used": mask_meta.get("mask_type_used"),
+        "mask_quality_score": mask_quality_score,
+        "retry_count": retry_count,
+        "failure_reasons": failure_reasons or None,
+        "identity_drift_score": (
+            quality_report.identity_drift_score if quality_report else None
+        ),
+        "trace_id": trace_id,
     }
 
 
