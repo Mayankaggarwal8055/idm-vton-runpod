@@ -15,6 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    PYTHONPATH=/workspace \
     IDM_VTON_DIR=/workspace/IDM-VTON \
     IDM_VTON_MODEL=/workspace/models/yisol/IDM-VTON \
     DENSEPOSE_WEIGHTS=/workspace/IDM-VTON/ckpt/densepose/model_final_162be9.pkl \
@@ -79,7 +80,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # =============================================================================
 
 # 4a — Clone the repository and download OpenPose checkpoint
+# The GIT_REVISION build arg acts as a cache buster — pass the latest commit SHA
+# at build time to invalidate this layer when the repo changes.
+#   docker build --build-arg GIT_REVISION=$(git rev-parse HEAD) ...
+ARG GIT_REVISION=unknown
 RUN git lfs install && \
+    echo "Cloning IDM-VTON at revision: ${GIT_REVISION}" && \
     git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
     mkdir -p $IDM_VTON_DIR/ckpt/openpose/ckpts && \
     curl -L \
@@ -177,7 +183,7 @@ print("Saved to:", target_dir)
 PY
 
 # =============================================================================
-# Layer 6 — Build validation
+# Layer 6 — Build validation (IDM-VTON pipeline)
 # =============================================================================
 
 RUN python - <<'PY'
@@ -228,10 +234,54 @@ print("All validation passed")
 PY
 
 # =============================================================================
-# Copy RunPod handler
+# Copy RunPod handler + mask pipeline
 # =============================================================================
 
 COPY handler.py /workspace/handler.py
+COPY mask_pipeline.py /workspace/mask_pipeline.py
+
+# =============================================================================
+# Layer 7 — Validate worker module (mask_pipeline.py)
+# =============================================================================
+# NOTE: This runs AFTER the COPY layer above, so /workspace/mask_pipeline.py exists.
+
+RUN python - <<'PY'
+import os
+import sys
+
+# Ensure /workspace is on the path — this is the target for COPY mask_pipeline.py
+_ws = "/workspace"
+sys.path.insert(0, _ws)
+
+_mp = os.path.join(_ws, "mask_pipeline.py")
+
+if not os.path.exists(_mp):
+    raise FileNotFoundError(
+        f"MASK_PIPELINE NOT FOUND at {_mp}. "
+        "This should never happen because the COPY layer above places it there."
+    )
+
+print(f"mask_pipeline.py exists at {_mp} ({os.path.getsize(_mp)} bytes)")
+
+try:
+    from mask_pipeline import (
+        WorkerMaskStrategy,
+        apply_protected_mask,
+        fuse_hybrid_mask,
+        detect_inference_failures,
+        select_worker_mask_strategy,
+    )
+    print("import mask_pipeline OK")
+    print(f"  WorkerMaskStrategy: {list(WorkerMaskStrategy)}")
+    print(f"  apply_protected_mask: {callable(apply_protected_mask)}")
+    print(f"  fuse_hybrid_mask: {callable(fuse_hybrid_mask)}")
+    print(f"  detect_inference_failures: {callable(detect_inference_failures)}")
+    print(f"  select_worker_mask_strategy: {callable(select_worker_mask_strategy)}")
+except Exception as exc:
+    raise RuntimeError(f"Failed to import mask_pipeline: {exc}") from exc
+
+print("Mask pipeline validation passed")
+PY
 
 # =============================================================================
 # Runtime

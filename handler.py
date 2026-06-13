@@ -964,6 +964,68 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 # =============================================================================
 
 _ensure_logging()
+
+# ── Startup diagnostics: verify mask_pipeline import ──────────────────
+def _startup_diagnostics():
+    """
+    Verify that mask_pipeline.py is available and importable at runtime.
+
+    Checks:
+      1. /workspace is in sys.path (or adds it)
+      2. /workspace/mask_pipeline.py exists on disk
+      3. The module imports correctly
+
+    This runs once at worker startup, before any job arrives, so the
+    ModuleNotFoundError that previously only appeared during jobs
+    is caught early.
+    """
+    logger.info("STARTUP_DIAG: cwd=%s", os.getcwd())
+    logger.info("STARTUP_DIAG: sys.path=%s", sys.path)
+    logger.info("STARTUP_DIAG: handler_location=%s", os.path.abspath(__file__))
+
+    # Belt-and-suspenders: ensure /workspace is on sys.path
+    ws = "/workspace"
+    if ws not in sys.path:
+        sys.path.insert(0, ws)
+        logger.info("STARTUP_DIAG: added %s to sys.path", ws)
+
+    # Check file exists on disk
+    mp_path = os.path.join(ws, "mask_pipeline.py")
+    if not os.path.isfile(mp_path):
+        logger.error(
+            "STARTUP_DIAG: mask_pipeline.py NOT FOUND at %s — "
+            "Dockerfile must have COPY mask_pipeline.py /workspace/mask_pipeline.py",
+            mp_path,
+        )
+        return False
+
+    logger.info("STARTUP_DIAG: mask_pipeline.py found at %s (%d bytes)", mp_path, os.path.getsize(mp_path))
+
+    # Actual import test — catches ModuleNotFoundError at startup, not during a job
+    try:
+        from mask_pipeline import (
+            WorkerMaskStrategy,
+            apply_protected_mask,
+            fuse_hybrid_mask,
+            detect_inference_failures,
+            select_worker_mask_strategy,
+        )
+        logger.info("STARTUP_DIAG: import mask_pipeline OK")
+        return True
+    except Exception as exc:
+        logger.error(
+            "STARTUP_DIAG: import mask_pipeline FAILED — %s: %s",
+            type(exc).__name__, exc,
+        )
+        return False
+
+_startup_diagnostics_result = _startup_diagnostics()
+if not _startup_diagnostics_result:
+    logger.warning(
+        "STARTUP_DIAG: mask_pipeline is unavailable — inference retry "
+        "and hybrid mask features will fail when a job arrives"
+    )
+
 logger.info("=" * 60)
 logger.info("IDM-VTON Worker v2.0.0 — loading")
 logger.info("target_size=%s", TARGET_SIZE)
