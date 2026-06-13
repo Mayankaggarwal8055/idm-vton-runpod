@@ -181,7 +181,7 @@ def _upload_to_cloudinary(image: Image.Image, job_id: str) -> str:
                 folder=CLOUDINARY_FOLDER,
                 public_id=f"result_{job_id}",
                 resource_type="image",
-                overwrite=False,
+                overwrite=True,  # Must be True so retried jobs upload fresh results
             )
             url = str(result["secure_url"])
             logger.info("cloudinary_upload_complete result_url=%s", url)
@@ -575,6 +575,7 @@ def run_idm_vton_inference(
     protected_mask: Image.Image | None = None,
     mask_strategy: str = "external",
     mask_quality_score: float | None = None,
+    guidance_scale: float | None = None,
 ) -> tuple[Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -673,6 +674,8 @@ def run_idm_vton_inference(
     pose_img = pose_img[:, :, ::-1]
     pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
 
+    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+
     prompt = "model is wearing " + garment_desc
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
@@ -724,7 +727,7 @@ def run_idm_vton_inference(
                 height=TARGET_H,
                 width=TARGET_W,
                 ip_adapter_image=garm_img.resize(TARGET_SIZE),
-                guidance_scale=GUIDANCE_SCALE,
+                guidance_scale=effective_guidance,
             )[0]
 
     if auto_crop and crop_size is not None:
@@ -779,15 +782,19 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
 
-    # Gender-neutral garment description — avoid biasing body shape
+    import numpy as np
+
+    # Color-preserving garment description — include color from preprocessing
     garment_desc = garment_desc.strip()
-    if not garment_desc.lower().startswith(("a ", "an ", "the ")):
-        garment_desc = f"garment: {garment_desc}"
+    if garment_desc.lower().startswith(("a ", "an ", "the ")):
+        garment_desc = garment_desc[garment_desc.index(" ") + 1:].strip()
 
     logger.info(
         "inference_start cloth_type=%s steps=%s seed=%s garment_desc=%s trace_id=%s",
         vton_type, steps, seed, garment_desc, trace_id,
     )
+
+    # ── Garment RGB diagnostics (after download below) ────────────────
 
     download_start = time.perf_counter()
     person_img = download_image(person_url)
@@ -820,6 +827,18 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     download_ms = (time.perf_counter() - download_start) * 1000
 
+    # ── Garment RGB diagnostics (must run AFTER garment_img is downloaded) ─
+    garm_np = np.array(garment_img.convert("RGB"), dtype=np.float32)
+    garm_mean_r = float(np.mean(garm_np[:, :, 0]))
+    garm_mean_g = float(np.mean(garm_np[:, :, 1]))
+    garm_mean_b = float(np.mean(garm_np[:, :, 2]))
+    garm_mean_all = (garm_mean_r + garm_mean_g + garm_mean_b) / 3.0
+    garm_is_dark = garm_mean_all < 80.0
+    logger.info(
+        "garment_rgb_stats mean_r=%.1f mean_g=%.1f mean_b=%.1f mean_all=%.1f is_dark=%s",
+        garm_mean_r, garm_mean_g, garm_mean_b, garm_mean_all, garm_is_dark,
+    )
+
     # Retry strategies: external/automasker → automasker → hybrid
     retry_strategies: list[str] = []
     if external_mask and mask_strategy_hint not in ("automasker",):
@@ -838,6 +857,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     failure_reasons: list[str] = []
     last_inpaint_mask = external_mask
 
+    # Detect dark garment — reduce guidance to prevent color drift
+    effective_guidance = GUIDANCE_SCALE
+    if garm_mean_all < 80.0:
+        effective_guidance = GUIDANCE_SCALE * 0.75  # Reduce guidance for dark garments
+        logger.info(
+            "dark_garment_detected mean=%.1f reducing_guidance from %.1f to %.1f",
+            garm_mean_all, GUIDANCE_SCALE, effective_guidance,
+        )
+
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
         result, mask_meta = run_idm_vton_inference(
@@ -852,6 +880,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             protected_mask=protected_mask,
             mask_strategy=strategy,
             mask_quality_score=mask_quality_score,
+            guidance_scale=effective_guidance,
         )
         last_inpaint_mask = external_mask if strategy == "external" else None
 
@@ -867,11 +896,24 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
             inpaint_for_qa,
             protected_mask,
+            garment_ref=garment_img,  # CRITICAL: pass garment source for TRUE color comparison
         )
-        if quality_report.passed:
+
+        # Color-driven retry: if color fidelity is low, retry
+        color_passed = True
+        if quality_report.color_fidelity_score < 50.0:
+            color_passed = False
+            logger.warning(
+                "color_fidelity_low attempt=%s score=%.1f garm_mean=%.1f retrying",
+                attempt_idx, quality_report.color_fidelity_score, garm_mean_all,
+            )
+
+        if quality_report.passed and color_passed:
             break
 
         failure_reasons = list(quality_report.failure_reasons)
+        if not color_passed:
+            failure_reasons.append(f"color_fidelity:{quality_report.color_fidelity_score:.0f}")
         logger.warning(
             "inference_qa_failed attempt=%s strategy=%s reasons=%s retrying",
             attempt_idx,
@@ -882,6 +924,23 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
+
+    # ── Color fidelity: computed via detect_inference_failures with garment_ref ──
+    # CRITICAL: We pass garment_img as garment_ref so the metric compares the
+    #           SOURCE GARMENT against the OUTPUT, not the original person's
+    #           clothing against the output (which would be backwards).
+    result_color_fidelity = quality_report.color_fidelity_score if quality_report else None
+    result_color_drift = quality_report.color_drift_mean_rgb if quality_report else None
+    if result_color_fidelity is None and result is not None and external_mask is not None:
+        qa = detect_inference_failures(
+            person_img.resize(TARGET_SIZE),
+            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+            external_mask,
+            protected_mask,
+            garment_ref=garment_img,
+        )
+        result_color_fidelity = qa.color_fidelity_score
+        result_color_drift = qa.color_drift_mean_rgb
 
     upload_start = time.perf_counter()
     result_url = _upload_to_cloudinary(result, job_id)
@@ -915,6 +974,10 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "identity_drift_score": (
             quality_report.identity_drift_score if quality_report else None
         ),
+        "color_fidelity_score": result_color_fidelity,
+        "color_drift_mean_rgb": result_color_drift,
+        "garment_mean_rgb": round(garm_mean_all, 1),
+        "guidance_scale_used": round(effective_guidance, 2),
         "trace_id": trace_id,
     }
 

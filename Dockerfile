@@ -96,7 +96,7 @@ RUN git lfs install && \
         $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
 
 # 4b — Download ONNX humanparsing models (bypasses git LFS issues)
-RUN python3 - <<'PY'
+RUN python - <<'PY'
 from huggingface_hub import hf_hub_download
 import os, shutil, sys
 
@@ -150,7 +150,7 @@ print("DensePose download complete")
 PY
 
 # 4d — Verify OpenPose checkpoint size
-RUN python3 - <<'PY'
+RUN python - <<'PY'
 import os, sys
 p = "/workspace/IDM-VTON/ckpt/openpose/ckpts/body_pose_model.pth"
 if not os.path.exists(p):
