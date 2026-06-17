@@ -69,6 +69,11 @@ ENABLE_TORCH_COMPILE = os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_MODEL_CPU_OFFLOAD = os.environ.get("ENABLE_MODEL_CPU_OFFLOAD", "0") == "1"
 ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
 
+# Concurrency — single GPU SDXL typically needs ~16-20 GB VRAM.
+# On a 24 GB card keep max_workers=1; set to 2+ only if the GPU
+# (or multi-GPU setup) has enough headroom for concurrent passes.
+MAX_WORKERS = int(os.environ.get("RUNPOD_MAX_WORKERS", "1"))
+
 # =============================================================================
 # Global state
 # =============================================================================
@@ -84,6 +89,7 @@ get_mask_location_fn = None
 _WARM = threading.Event()
 _STARTUP_TIME = time.perf_counter()
 _REUSE_COUNT: int = 0
+_REUSE_LOCK = threading.Lock()
 
 _SESSION: requests.Session | None = None
 _SESSION_LOCK = threading.Lock()
@@ -170,7 +176,7 @@ def _configure_cloudinary() -> bool:
 
 def _upload_to_cloudinary(image: Image.Image, job_id: str) -> str:
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
+    image.save(buffer, format="JPEG", quality=95, optimize=True, subsampling=0)
     buffer.seek(0)
 
     last_error: Exception | None = None
@@ -537,6 +543,28 @@ def warmup():
     except Exception as exc:
         logger.warning("gpu_warmup_skipped error=%s", exc)
 
+    # ── Dummy inference (single step) to compile CUDA kernels and warm memory ──
+    try:
+        logger.info("warmup_inference_start")
+        wt0 = time.perf_counter()
+        dummy_person = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
+        dummy_garment = Image.new("RGB", TARGET_SIZE, (200, 100, 50))
+        run_idm_vton_inference(
+            person_img=dummy_person,
+            garment_img=dummy_garment,
+            garment_desc="shirt",
+            cloth_type="upper_body",
+            steps=1,
+            seed=42,
+            auto_crop=False,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        wt1 = time.perf_counter()
+        logger.info("warmup_inference_complete elapsed_ms=%.0f", (wt1 - wt0) * 1000)
+    except Exception as exc:
+        logger.warning("warmup_inference_skipped error=%s", exc)
+
     cloudinary_ok = _configure_cloudinary()
 
     startup_total_ms = (time.perf_counter() - _STARTUP_TIME) * 1000
@@ -576,6 +604,7 @@ def run_idm_vton_inference(
     mask_strategy: str = "external",
     mask_quality_score: float | None = None,
     guidance_scale: float | None = None,
+    crop_preserve_lower: bool = True,
 ) -> tuple[Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -605,10 +634,39 @@ def run_idm_vton_inference(
     if auto_crop:
         target_width = int(min(width, height * (TARGET_W / TARGET_H)))
         target_height = int(min(height, width * (TARGET_H / TARGET_W)))
-        left = (width - target_width) / 2
-        top = (height - target_height) / 2
-        right = (width + target_width) / 2
-        bottom = (height + target_height) / 2
+
+        # Determine crop anchor based on cloth_type:
+        #   - lower_body / dresses: BOTTOM-anchored to preserve legs/feet
+        #   - upper_body / default: CENTER-anchored (original behavior)
+        #
+        # This is critical: the preprocessing service already pads the image
+        # correctly for the garment type (bottom-anchor for dresses/lower_body).
+        # A center crop would undo that work and cut off legs.
+        is_full_body = cloth_type in ("dresses", "lower_body", "full_body")
+        if crop_preserve_lower and is_full_body:
+            # Bottom-anchored crop: keep the bottom portion, sacrifice top
+            left = (width - target_width) / 2
+            bottom = height
+            top = height - target_height
+            right = (width + target_width) / 2
+            logger.info(
+                "auto_crop_bottom_anchored cloth_type=%s "
+                "target=%dx%d image=%dx%d crop_top=%d crop_bottom=%d",
+                cloth_type, target_width, target_height,
+                width, height, top, bottom,
+            )
+        else:
+            # Center-anchored crop (original)
+            left = (width - target_width) / 2
+            top = (height - target_height) / 2
+            right = (width + target_width) / 2
+            bottom = (height + target_height) / 2
+            logger.info(
+                "auto_crop_center_anchored cloth_type=%s "
+                "target=%dx%d image=%dx%d",
+                cloth_type, target_width, target_height, width, height,
+            )
+
         cropped_img = human_img_orig.crop((left, top, right, bottom))
         crop_size = cropped_img.size
         human_img = cropped_img.resize(TARGET_SIZE)
@@ -764,6 +822,11 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         mask_quality_score = float(mask_quality_score)
     mask_strategy_hint = str(job_input.get("mask_strategy", "auto"))
     trace_id = job_input.get("trace_id", "")
+    # Forward preprocessing warnings through the output so the frontend
+    # can display them to the user (body completeness, face, etc.)
+    input_warnings = job_input.get("warnings", [])
+    if not isinstance(input_warnings, list):
+        input_warnings = []
     max_retries = int(os.environ.get("MASK_WORKER_MAX_RETRIES", "2"))
     retry_enabled = os.environ.get("MASK_WORKER_RETRY", "1") == "1"
 
@@ -839,13 +902,18 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         garm_mean_r, garm_mean_g, garm_mean_b, garm_mean_all, garm_is_dark,
     )
 
-    # Retry strategies: external/automasker → automasker → hybrid
+    # Retry strategies — mask_strategy_hint overrides the first attempt
     retry_strategies: list[str] = []
-    if external_mask and mask_strategy_hint not in ("automasker",):
-        retry_strategies.append("external")
-    retry_strategies.append("automasker")
-    if external_mask:
-        retry_strategies.append("hybrid")
+    if mask_strategy_hint == "hybrid" and external_mask:
+        retry_strategies = ["hybrid", "automasker"]
+    elif mask_strategy_hint == "automasker":
+        retry_strategies = ["automasker"]
+    else:
+        if external_mask:
+            retry_strategies.append("external")
+        retry_strategies.append("automasker")
+        if external_mask:
+            retry_strategies.append("hybrid")
     if not retry_enabled:
         retry_strategies = retry_strategies[:1]
 
@@ -942,6 +1010,32 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         result_color_fidelity = qa.color_fidelity_score
         result_color_drift = qa.color_drift_mean_rgb
 
+    # ── Face restoration (post-processing) ──────────────────────────────
+    face_meta: dict[str, object] = {}
+    if os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1":
+        from face_restoration import enhance_face
+        face_start = time.perf_counter()
+        # Use the person_img to guide color reference for the face region
+        result, face_meta = enhance_face(
+            result,
+            person_original=person_img,
+            trace_id=trace_id,
+        )
+        face_ms = (time.perf_counter() - face_start) * 1000
+        if face_meta.get("face_detected") is True:
+            logger.info(
+                "face_restoration_completed method=%s time_ms=%.0f trace_id=%s",
+                face_meta.get("restoration_method", "unknown"),
+                face_ms,
+                trace_id,
+            )
+        else:
+            logger.info(
+                "face_restoration_skipped reason=no_face_detected time_ms=%.0f trace_id=%s",
+                face_ms,
+                trace_id,
+            )
+
     upload_start = time.perf_counter()
     result_url = _upload_to_cloudinary(result, job_id)
     upload_ms = (time.perf_counter() - upload_start) * 1000
@@ -979,6 +1073,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "garment_mean_rgb": round(garm_mean_all, 1),
         "guidance_scale_used": round(effective_guidance, 2),
         "trace_id": trace_id,
+        "warnings": input_warnings,
     }
 
 
@@ -996,7 +1091,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         cold_start = False
 
     global _REUSE_COUNT
-    _REUSE_COUNT += 1
+    with _REUSE_LOCK:
+        _REUSE_COUNT += 1
 
     logger.info(
         "handler_invoked cold_start=%s reuse_count=%s job_id=%s",
@@ -1104,7 +1200,11 @@ if __name__ == "__main__":
     try:
         if not os.environ.get("RUNPOD_WARMUP_DISABLE"):
             warmup()
-        runpod.serverless.start({"handler": handler})
+        logger.info("Starting RunPod serverless with max_workers=%s", MAX_WORKERS)
+        runpod.serverless.start(
+            {"handler": handler},
+            max_workers=MAX_WORKERS,
+        )
     except Exception:
         logger.error("Worker startup failed")
         traceback.print_exc()
