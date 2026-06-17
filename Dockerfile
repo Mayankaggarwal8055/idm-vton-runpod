@@ -161,13 +161,53 @@ if size_mb < 10:
     sys.exit("body_pose_model.pth looks corrupted or incomplete")
 PY
 
-# NOTE: The full IDM-VTON SDXL weights (~7-10 GB) are NOT downloaded at build
-# time. They are downloaded lazily at runtime by handler.py:load_models() when
-# the container first starts (warmup). This keeps the image under the disk
-# limit and avoids OOM during docker build.
+# =============================================================================
+# Layer 5 — Download full IDM-VTON SDXL weights
+# =============================================================================
+
+RUN python - <<'PY'
+from huggingface_hub import snapshot_download
+import os
+
+target_dir = "/workspace/models/yisol/IDM-VTON"
+os.makedirs(target_dir, exist_ok=True)
+
+print("Downloading IDM-VTON weights...")
+
+snapshot_download(
+    repo_id="yisol/IDM-VTON",
+    local_dir=target_dir,
+    local_dir_use_symlinks=False,
+)
+
+print("Download complete")
+PY
+
+# 5a — Clean up HuggingFace cache (~7-10 GB) to avoid image bloat
+RUN rm -rf /root/.cache/huggingface
+
+# 5b — Verify all required model subdirectories exist
+RUN python - <<'PY'
+import os, sys
+
+target = "/workspace/models/yisol/IDM-VTON"
+required = [
+    "unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
+    "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder",
+]
+for sub in required:
+    path = os.path.join(target, sub)
+    if not os.path.isdir(path):
+        print(f"FATAL: missing required subdirectory: {path}")
+        sys.exit(1)
+    print(f"  OK: {sub}")
+
+print("All model subdirectories verified — Layer 5 complete")
+PY
 
 # =============================================================================
 # Layer 6 — Build validation (IDM-VTON pipeline)
+# =============================================================================
 # =============================================================================
 
 RUN python - <<'PY'

@@ -109,8 +109,18 @@ def _require_path(path: str | Path, label: str):
 def _ensure_dir_layout():
     _require_path(IDM_VTON_DIR, "IDM_VTON_DIR")
 
-    # Lightweight assets bundled in the image (not the 7-10 GB model weights)
     needed = [
+        # Model weight subdirectories (baked into the image via Layer 5)
+        Path(IDM_VTON_MODEL) / "unet",
+        Path(IDM_VTON_MODEL) / "vae",
+        Path(IDM_VTON_MODEL) / "scheduler",
+        Path(IDM_VTON_MODEL) / "tokenizer",
+        Path(IDM_VTON_MODEL) / "tokenizer_2",
+        Path(IDM_VTON_MODEL) / "image_encoder",
+        Path(IDM_VTON_MODEL) / "text_encoder",
+        Path(IDM_VTON_MODEL) / "text_encoder_2",
+        Path(IDM_VTON_MODEL) / "unet_encoder",
+        # Lightweight build-time assets
         Path(IDM_VTON_DIR) / "configs" / "densepose_rcnn_R_50_FPN_s1x.yaml",
         Path(DENSEPOSE_WEIGHTS),
     ]
@@ -244,142 +254,6 @@ def _set_torch_perf_flags():
 # =============================================================================
 
 
-def ensure_idm_vton_weights() -> None:
-    """Ensure the full IDM-VTON SDXL model weights exist at IDM_VTON_MODEL.
-
-    The weights (~7-10 GB) are NOT baked into the Docker image.
-    They download once on first container start via snapshot_download.
-
-    Strategy to avoid 2x disk peak:
-
-      1. snapshot_download with local_dir_use_symlinks=True (default)
-         → files land in HF cache (~7-10 GB), target gets symlinks (~0 bytes)
-      2. After verification, resolve symlinks to real files (cp over link)
-      3. Delete HF cache → reclaims the cache copy
-
-      Peak disk: 1x model size (cache), NOT 2x (cache + copy).
-    """
-    target = Path(IDM_VTON_MODEL)
-    hf_cache_home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
-
-    required = [
-        "unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
-        "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder",
-    ]
-
-    # ── Disk diagnostics (before) ────────────────────────────────────
-    logger.info("MODEL_PATH=%s", target)
-    logger.info("MODEL_EXISTS=%s", target.exists())
-
-    import shutil, subprocess  # noqa: E704
-
-    def _run_df() -> None:
-        try:
-            out = subprocess.check_output(
-                ["df", "-h", "/workspace", "/root/.cache", "/tmp"],
-                stderr=subprocess.STDOUT, timeout=10, text=True,
-            )
-            for line in out.strip().split("\n"):
-                logger.info("DF: %s", line)
-        except Exception as exc:
-            logger.warning("df failed: %s", exc)
-
-    def _run_du(path: str, label: str) -> None:
-        try:
-            out = subprocess.check_output(
-                ["du", "-sh", path, "--exclude=proc"],
-                stderr=subprocess.STDOUT, timeout=30, text=True,
-            )
-            for line in out.strip().split("\n"):
-                logger.info("DU[%s]: %s", label, line)
-        except Exception as exc:
-            logger.warning("du %s failed: %s", path, exc)
-
-    _run_df()
-    for p in ["/workspace/*", "/root/.cache/*", "/tmp/*"]:
-        _run_du(p, p)
-
-    # ── Early return if model already complete ───────────────────────
-    if target.exists():
-        missing = [s for s in required if not (target / s).is_dir()]
-        if not missing:
-            logger.info("using existing model")
-            return
-        logger.info(
-            "model directory exists but missing folders: %s — will re-download",
-            missing,
-        )
-
-    logger.info("DOWNLOADING_MODEL=1 target=%s", target)
-
-    # ── Clean HF cache before download to reclaim space ──────────────
-    if hf_cache_home.exists():
-        cache_size_before = (
-            sum(f.stat().st_size for f in hf_cache_home.rglob("*") if f.is_file())
-            / (1024**3)
-        )
-        logger.info(
-            "HF cache size before cleanup: %.1f GB at %s",
-            cache_size_before, hf_cache_home,
-        )
-        shutil.rmtree(str(hf_cache_home), ignore_errors=True)
-        logger.info("HF cache purged")
-
-    # ── Partial target cleanup ───────────────────────────────────────
-    if target.exists():
-        shutil.rmtree(str(target))
-
-    target.mkdir(parents=True, exist_ok=True)
-    dl_start = time.perf_counter()
-
-    try:
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(
-            repo_id="yisol/IDM-VTON",
-            local_dir=str(target),
-            local_dir_use_symlinks=True,  # symlinks → no 2x copy
-        )
-    except Exception:
-        logger.exception("DOWNLOAD_FAILED=1 target=%s", target)
-        _run_df()
-        raise
-
-    dl_elapsed = time.perf_counter() - dl_start
-    logger.info("DOWNLOAD_COMPLETE=1 elapsed_seconds=%.1f", dl_elapsed)
-
-    # ── Verify required subdirectories exist ─────────────────────────
-    missing_after = [s for s in required if not (target / s).is_dir()]
-    if missing_after:
-        raise FileNotFoundError(
-            f"Download completed but required subdirectories still missing: {missing_after}"
-        )
-    logger.info("Verified folders: %s", required)
-
-    # ── Resolve symlinks → real files, then delete cache ─────────────
-    # After this, the model is self-contained and the HF cache can be
-    # deleted without breaking anything.
-    logger.info("Resolving symlinks in %s", target)
-    symlinks_resolved = 0
-    for root, _dirs, files in os.walk(str(target)):
-        for fname in files:
-            fp = os.path.join(root, fname)
-            if os.path.islink(fp):
-                real = os.path.realpath(fp)
-                os.unlink(fp)
-                shutil.copy2(real, fp)
-                symlinks_resolved += 1
-    logger.info("Symlinks resolved: %d", symlinks_resolved)
-
-    if hf_cache_home.exists():
-        shutil.rmtree(str(hf_cache_home), ignore_errors=True)
-        logger.info("HF cache deleted after download")
-
-    # ── Disk diagnostics (after) ─────────────────────────────────────
-    _run_df()
-    for p in ["/workspace/*", "/root/.cache/*", "/tmp/*"]:
-        _run_du(p, p)
-
 
 def load_models():
     global pipe, parsing_model, openpose_model
@@ -393,8 +267,14 @@ def load_models():
     logger.info("MODEL LOADING BEGIN")
     logger.info("=" * 60)
 
-    # ── Provision model weights (download at runtime if missing) ────────
-    ensure_idm_vton_weights()
+    # ── Startup diagnostics ────────────────────────────────────────────
+    logger.info("MODEL_PATH=%s", IDM_VTON_MODEL)
+    logger.info("MODEL_EXISTS=%s", os.path.isdir(IDM_VTON_MODEL))
+    if os.path.isdir(IDM_VTON_MODEL):
+        try:
+            logger.info("MODEL_CONTENTS=%s", sorted(os.listdir(IDM_VTON_MODEL)))
+        except Exception:
+            pass
 
     _ensure_dir_layout()
     _set_torch_perf_flags()
