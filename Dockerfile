@@ -161,26 +161,10 @@ if size_mb < 10:
     sys.exit("body_pose_model.pth looks corrupted or incomplete")
 PY
 
-# =============================================================================
-# Layer 5 — Download full IDM-VTON SDXL weights
-# =============================================================================
-
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-
-target_dir = "/workspace/models/yisol/IDM-VTON"
-
-print("Downloading IDM-VTON weights...")
-
-snapshot_download(
-    repo_id="yisol/IDM-VTON",
-    local_dir=target_dir,
-    local_dir_use_symlinks=False,
-)
-
-print("Download complete")
-print("Saved to:", target_dir)
-PY
+# NOTE: The full IDM-VTON SDXL weights (~7-10 GB) are NOT downloaded at build
+# time. They are downloaded lazily at runtime by handler.py:load_models() when
+# the container first starts (warmup). This keeps the image under the disk
+# limit and avoids OOM during docker build.
 
 # =============================================================================
 # Layer 6 — Build validation (IDM-VTON pipeline)
