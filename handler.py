@@ -109,16 +109,8 @@ def _require_path(path: str | Path, label: str):
 def _ensure_dir_layout():
     _require_path(IDM_VTON_DIR, "IDM_VTON_DIR")
 
+    # Lightweight assets bundled in the image (not the 7-10 GB model weights)
     needed = [
-        Path(IDM_VTON_MODEL) / "unet",
-        Path(IDM_VTON_MODEL) / "vae",
-        Path(IDM_VTON_MODEL) / "scheduler",
-        Path(IDM_VTON_MODEL) / "text_encoder",
-        Path(IDM_VTON_MODEL) / "text_encoder_2",
-        Path(IDM_VTON_MODEL) / "image_encoder",
-        Path(IDM_VTON_MODEL) / "tokenizer",
-        Path(IDM_VTON_MODEL) / "tokenizer_2",
-        Path(IDM_VTON_MODEL) / "unet_encoder",
         Path(IDM_VTON_DIR) / "configs" / "densepose_rcnn_R_50_FPN_s1x.yaml",
         Path(DENSEPOSE_WEIGHTS),
     ]
@@ -251,6 +243,67 @@ def _set_torch_perf_flags():
 # Model loading
 # =============================================================================
 
+
+def ensure_idm_vton_weights() -> None:
+    """Ensure the full IDM-VTON SDXL model weights exist at IDM_VTON_MODEL.
+
+    The weights (~7-10 GB) are NOT baked into the Docker image.
+    They download once on first container start via snapshot_download.
+    After download the required subdirectories are verified before proceeding.
+    """
+    target = Path(IDM_VTON_MODEL)
+
+    required = [
+        "unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
+        "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder",
+    ]
+
+    logger.info("MODEL_PATH=%s", target)
+    logger.info("MODEL_EXISTS=%s", target.exists())
+
+    if target.exists():
+        missing = [s for s in required if not (target / s).is_dir()]
+        if not missing:
+            logger.info("using existing model")
+            return
+        logger.info(
+            "model directory exists but missing folders: %s — will re-download",
+            missing,
+        )
+
+    logger.info("DOWNLOADING_MODEL=1 target=%s", target)
+
+    import shutil
+    if target.exists():
+        shutil.rmtree(str(target))
+
+    target.mkdir(parents=True, exist_ok=True)
+    dl_start = time.perf_counter()
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id="yisol/IDM-VTON",
+            local_dir=str(target),
+            local_dir_use_symlinks=False,
+        )
+    except Exception:
+        logger.exception("DOWNLOAD_FAILED=1 target=%s", target)
+        raise
+
+    dl_elapsed = time.perf_counter() - dl_start
+    logger.info("DOWNLOAD_COMPLETE=1 elapsed_seconds=%.1f", dl_elapsed)
+
+    missing_after = [s for s in required if not (target / s).is_dir()]
+    if missing_after:
+        raise FileNotFoundError(
+            f"Download completed but required subdirectories still missing: {missing_after}"
+        )
+
+    logger.info("Verified folders: %s", required)
+
+
 def load_models():
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -262,6 +315,9 @@ def load_models():
     logger.info("=" * 60)
     logger.info("MODEL LOADING BEGIN")
     logger.info("=" * 60)
+
+    # ── Provision model weights (download at runtime if missing) ────────
+    ensure_idm_vton_weights()
 
     _ensure_dir_layout()
     _set_torch_perf_flags()
