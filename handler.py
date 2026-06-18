@@ -69,6 +69,14 @@ ENABLE_TORCH_COMPILE = os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_MODEL_CPU_OFFLOAD = os.environ.get("ENABLE_MODEL_CPU_OFFLOAD", "0") == "1"
 ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
 
+# Post-processing feature flags
+#   ENABLE_FACE_RESTORATION=1   — GFPGAN or OpenCV face enhancement
+#   ENABLE_FACE_COMPOSITE=1     — composite original face/accessories back (default: on)
+#   ENABLE_SEAMLESS_CLONE=1     — Poisson edge blending on garment boundary (default: off)
+#   ENABLE_SKIN_TONE_CORRECTION=1 — per-channel skin color correction (default: off)
+#   ENABLE_DEBUG_IMAGES=1       — save 5-stage debug images to /tmp/trylix_debug/
+# All are read at runtime (not startup), so they can be toggled per-job via env injection.
+
 # Concurrency — single GPU SDXL typically needs ~16-20 GB VRAM.
 # On a 24 GB card keep max_workers=1; set to 2+ only if the GPU
 # (or multi-GPU setup) has enough headroom for concurrent passes.
@@ -614,7 +622,7 @@ def warmup():
         wt0 = time.perf_counter()
         dummy_person = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
         dummy_garment = Image.new("RGB", TARGET_SIZE, (200, 100, 50))
-        run_idm_vton_inference(
+        _, _, _ = run_idm_vton_inference(
             person_img=dummy_person,
             garment_img=dummy_garment,
             garment_desc="shirt",
@@ -861,13 +869,15 @@ def run_idm_vton_inference(
                 logger.error("pipeline_returned_empty_images")
                 raise RuntimeError("Pipeline returned empty images list — inference produced no output")
 
+    raw_output = images[0].copy()
+
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
-        return final_img, mask_meta
+        return final_img, raw_output, mask_meta
 
-    return images[0], mask_meta
+    return images[0], raw_output, mask_meta
 
 
 # =============================================================================
@@ -975,6 +985,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         garm_mean_r, garm_mean_g, garm_mean_b, garm_mean_all, garm_is_dark,
     )
 
+    # ── Garment dimension logging (fidelity audit) ──────────────────────
+    garm_w, garm_h = garment_img.size
+    garm_aspect = garm_w / max(garm_h, 1)
+    target_aspect = TARGET_W / TARGET_H
+    logger.info(
+        "garment_dimensions size=%dx%d aspect=%.4f target_aspect=%.4f cloth_type=%s trace_id=%s",
+        garm_w, garm_h, garm_aspect, target_aspect, vton_type, trace_id,
+    )
+
     # Retry strategies — mask_strategy_hint overrides the first attempt
     retry_strategies: list[str] = []
     if mask_strategy_hint == "hybrid" and external_mask:
@@ -1009,7 +1028,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
-        result, mask_meta = run_idm_vton_inference(
+        result, raw_output, mask_meta = run_idm_vton_inference(
             person_img=person_img,
             garment_img=garment_img,
             garment_desc=garment_desc,
@@ -1083,12 +1102,20 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         result_color_fidelity = qa.color_fidelity_score
         result_color_drift = qa.color_drift_mean_rgb
 
-    # ── Face restoration (post-processing) ──────────────────────────────
+    # ── Post-processing pipeline ────────────────────────────────────────
+    # Each stage is independently disableable and logs its own timing.
+    from post_processing import (
+        apply_face_composite,
+        apply_seamless_clone,
+        apply_skin_tone_correction,
+    )
+    pp_meta: dict[str, object] = {}
+
+    # Stage A: Face restoration (GFPGAN or OpenCV enhancement)
     face_meta: dict[str, object] = {}
     if os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1":
         from face_restoration import enhance_face
         face_start = time.perf_counter()
-        # Use the person_img to guide color reference for the face region
         result, face_meta = enhance_face(
             result,
             person_original=person_img,
@@ -1108,7 +1135,52 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 face_ms,
                 trace_id,
             )
+    pp_meta["face_restoration"] = face_meta
 
+    # Stage B: Face composite — preserve original face/accessory pixels
+    fc_start = time.perf_counter()
+    result = apply_face_composite(result, person_img, protected_mask)
+    fc_ms = (time.perf_counter() - fc_start) * 1000
+    pp_meta["face_composite_ms"] = round(fc_ms, 1)
+
+    # Stage C: Seamless clone — Poisson edge blending
+    sc_start = time.perf_counter()
+    seam_mask = last_inpaint_mask if last_inpaint_mask is not None else external_mask
+    result = apply_seamless_clone(result, person_img, seam_mask)
+    sc_ms = (time.perf_counter() - sc_start) * 1000
+    pp_meta["seamless_clone_ms"] = round(sc_ms, 1)
+
+    # Stage D: Skin tone correction
+    st_start = time.perf_counter()
+    face_bbox = face_meta.get("face_bbox")
+    if isinstance(face_bbox, (list, tuple)) and len(face_bbox) == 4:
+        st_bbox = tuple(int(v) for v in face_bbox)
+    else:
+        st_bbox = None
+    result = apply_skin_tone_correction(result, person_img, face_bbox=st_bbox)
+    st_ms = (time.perf_counter() - st_start) * 1000
+    pp_meta["skin_tone_ms"] = round(st_ms, 1)
+
+    # ── Debug: save all 5 pipeline images ────────────────────────────────
+    debug_dir = f"/tmp/trylix_debug/{job_id}"
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+        person_img.convert("RGB").save(f"{debug_dir}/01_person.jpg", quality=90)
+        garment_img.convert("RGB").save(f"{debug_dir}/02_garment.jpg", quality=90)
+        if external_mask is not None:
+            external_mask.convert("L").save(f"{debug_dir}/03_mask.png")
+        else:
+            logger.warning("debug_no_mask_to_save trace_id=%s", trace_id)
+        raw_output.convert("RGB").save(f"{debug_dir}/04_raw_output.jpg", quality=95)
+        result.convert("RGB").save(f"{debug_dir}/05_final_output.jpg", quality=95)
+        logger.info(
+            "debug_images_saved dir=%s files=5 trace_id=%s",
+            debug_dir, trace_id,
+        )
+    except Exception as exc:
+        logger.warning("debug_images_save_failed dir=%s error=%s trace_id=%s", debug_dir, exc, trace_id)
+
+    # ── Upload ───────────────────────────────────────────────────────────
     upload_start = time.perf_counter()
     result_url = _upload_to_cloudinary(result, job_id)
     upload_ms = (time.perf_counter() - upload_start) * 1000
@@ -1145,6 +1217,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "color_drift_mean_rgb": result_color_drift,
         "garment_mean_rgb": round(garm_mean_all, 1),
         "guidance_scale_used": round(effective_guidance, 2),
+        "pp_meta": pp_meta,
         "trace_id": trace_id,
         "warnings": input_warnings,
     }
