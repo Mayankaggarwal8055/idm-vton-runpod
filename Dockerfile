@@ -186,23 +186,60 @@ PY
 # 5a — Clean up HuggingFace cache (~7-10 GB) to avoid image bloat
 RUN rm -rf /root/.cache/huggingface
 
-# 5b — Verify all required model subdirectories exist
+# 5b — Verify required weight files exist (not just directories)
 RUN python - <<'PY'
 import os, sys
 
 target = "/workspace/models/yisol/IDM-VTON"
-required = [
-    "unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
-    "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder",
-]
-for sub in required:
+
+# Required weight files with minimum size in MB
+required = {
+    "unet/diffusion_pytorch_model.bin": 1000,
+    "vae/diffusion_pytorch_model.safetensors": 50,
+    "scheduler/scheduler_config.json": 0.001,
+    "tokenizer/tokenizer_config.json": 0.001,
+    "tokenizer_2/tokenizer_config.json": 0.001,
+    "image_encoder/config.json": 0.001,
+    "text_encoder/config.json": 0.001,
+    "text_encoder_2/config.json": 0.001,
+    "unet_encoder/config.json": 0.001,
+}
+all_ok = True
+for rel_path, min_mb in required.items():
+    full = os.path.join(target, rel_path)
+    if not os.path.isfile(full):
+        print(f"FATAL: missing required file: {full}")
+        all_ok = False
+        continue
+    if os.path.islink(full):
+        print(f"FATAL: {full} is a symlink — local_dir_use_symlinks did not work")
+        all_ok = False
+        continue
+    size_mb = os.path.getsize(full) / 1024 / 1024
+    if size_mb < min_mb:
+        print(f"FATAL: {rel_path} too small ({size_mb:.2f} MB < {min_mb} MB) — truncated or pointer file")
+        all_ok = False
+        continue
+    print(f"  OK: {rel_path} = {size_mb:.1f} MB")
+
+# Also verify model subdirectories exist
+for sub in ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
+            "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder"]:
     path = os.path.join(target, sub)
     if not os.path.isdir(path):
         print(f"FATAL: missing required subdirectory: {path}")
-        sys.exit(1)
-    print(f"  OK: {sub}")
+        all_ok = False
+    else:
+        print(f"  OK: {sub}/")
 
-print("All model subdirectories verified — Layer 5 complete")
+# Log disk usage
+import shutil
+total, used, free = shutil.disk_usage("/workspace")
+print(f"DISK: total_gb={total / (1024**3):.1f} used_gb={used / (1024**3):.1f} free_gb={free / (1024**3):.1f}")
+
+if not all_ok:
+    sys.exit(1)
+print("All model weight files verified — Layer 5 complete")
 PY
 
 # =============================================================================

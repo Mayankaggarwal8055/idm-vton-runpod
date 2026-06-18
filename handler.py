@@ -49,10 +49,10 @@ TARGET_SIZE = (768, 1024)
 TARGET_W, TARGET_H = TARGET_SIZE
 
 IDM_VTON_DIR = os.environ.get("IDM_VTON_DIR", "/workspace/IDM-VTON")
-IDM_VTON_MODEL = os.environ.get("IDM_VTON_MODEL", "/workspace/models/idm-vton")
+IDM_VTON_MODEL = os.environ.get("IDM_VTON_MODEL", "/workspace/models/yisol/IDM-VTON")
 DENSEPOSE_WEIGHTS = os.environ.get(
     "DENSEPOSE_WEIGHTS",
-    "/workspace/models/densepose/model_final_162be9.pkl",
+    "/workspace/IDM-VTON/ckpt/densepose/model_final_162be9.pkl",
 )
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
@@ -131,11 +131,19 @@ def _ensure_dir_layout():
         Path(IDM_VTON_DIR) / "ckpt" / "humanparsing" / "parsing_atr.onnx",
         Path(IDM_VTON_DIR) / "ckpt" / "humanparsing" / "parsing_lip.onnx",
         Path(IDM_VTON_DIR) / "ckpt" / "openpose" / "body_pose_model.pth",
-        Path(IDM_VTON_DIR) / "ckpt" / "image_encoder",
-        Path(IDM_VTON_DIR) / "ckpt" / "ip_adapter",
     ]
     for p in parsing_paths:
         _require_path(p, f"required path {p}")
+
+    optional_paths = [
+        ("ckpt/image_encoder", Path(IDM_VTON_DIR) / "ckpt" / "image_encoder"),
+        ("ckpt/ip_adapter", Path(IDM_VTON_DIR) / "ckpt" / "ip_adapter"),
+    ]
+    for label, p in optional_paths:
+        if not p.exists():
+            logger.warning("Optional path %s not found — IP-Adapter features may be degraded", label)
+        else:
+            logger.info("Optional path %s OK", label)
 
 
 def _get_session() -> requests.Session:
@@ -267,7 +275,12 @@ def load_models():
     logger.info("MODEL LOADING BEGIN")
     logger.info("=" * 60)
 
-    # ── Startup diagnostics ────────────────────────────────────────────
+    # ── Startup diagnostics: disk, symlinks, weight inventory ────────────
+    import shutil
+    total, used, free = shutil.disk_usage("/workspace")
+    logger.info("DISK: total_gb=%.1f used_gb=%.1f free_gb=%.1f",
+        total / (1024**3), used / (1024**3), free / (1024**3))
+
     logger.info("MODEL_PATH=%s", IDM_VTON_MODEL)
     logger.info("MODEL_EXISTS=%s", os.path.isdir(IDM_VTON_MODEL))
     if os.path.isdir(IDM_VTON_MODEL):
@@ -275,6 +288,45 @@ def load_models():
             logger.info("MODEL_CONTENTS=%s", sorted(os.listdir(IDM_VTON_MODEL)))
         except Exception:
             pass
+
+        # Per-subfolder weight file inventory
+        weight_extensions = (".bin", ".safetensors", ".pt", ".pth")
+        subfolders = ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
+                      "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder"]
+        for sub in subfolders:
+            subpath = os.path.join(IDM_VTON_MODEL, sub)
+            if not os.path.isdir(subpath):
+                logger.warning("MODEL_SUBFOLDER_MISSING sub=%s", sub)
+                continue
+            files = [f for f in os.listdir(subpath) if f.endswith(weight_extensions)]
+            if not files:
+                logger.warning("MODEL_SUBFOLDER_EMPTY sub=%s path=%s", sub, subpath)
+            for fname in files:
+                fpath = os.path.join(subpath, fname)
+                try:
+                    size_mb = os.path.getsize(fpath) / 1024 / 1024
+                    is_link = os.path.islink(fpath)
+                    link_info = " SYMLINK" if is_link else ""
+                    logger.info("WEIGHT: %s/%s size_mb=%.1f%s", sub, fname, size_mb, link_info)
+                except OSError as e:
+                    logger.error("WEIGHT_ERROR: %s/%s — %s", sub, fname, e)
+    else:
+        logger.warning("MODEL_DIR_DOES_NOT_EXIST — from_pretrained will trigger snapshot_download")
+
+    # ── snapshot_download monkey-patch for diagnostics ──────────────────
+    import huggingface_hub
+    _original_snapshot = huggingface_hub.snapshot_download
+    def _diagnostic_snapshot(*args, **kwargs):
+        logger.warning("SNAPSHOT_DOWNLOAD_TRIGGERED args=%s kwargs=%s", args, kwargs)
+        total2, used2, free2 = shutil.disk_usage("/workspace")
+        logger.warning("SNAPSHOT_DOWNLOAD_DISK pre: total_gb=%.1f used_gb=%.1f free_gb=%.1f",
+            total2 / (1024**3), used2 / (1024**3), free2 / (1024**3))
+        result = _original_snapshot(*args, **kwargs)
+        total3, used3, free3 = shutil.disk_usage("/workspace")
+        logger.warning("SNAPSHOT_DOWNLOAD_DISK post: total_gb=%.1f used_gb=%.1f free_gb=%.1f",
+            total3 / (1024**3), used3 / (1024**3), free3 / (1024**3))
+        return result
+    huggingface_hub.snapshot_download = _diagnostic_snapshot
 
     _ensure_dir_layout()
     _set_torch_perf_flags()
