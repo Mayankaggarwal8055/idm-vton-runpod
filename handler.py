@@ -782,7 +782,11 @@ def run_idm_vton_inference(
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
     with torch.no_grad():
-        densepose_outputs = densepose_predictor(human_img_arg)["instances"]
+        densepose_pred = densepose_predictor(human_img_arg)
+        if "instances" not in densepose_pred:
+            logger.error("densepose_no_instances image_shape=%s", human_img_arg.shape)
+            raise ValueError("DensePose detected no instances in input image")
+        densepose_outputs = densepose_pred["instances"]
 
     from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
     from densepose.vis.extractor import create_extractor
@@ -834,7 +838,7 @@ def run_idm_vton_inference(
 
     with torch.inference_mode():
         with _maybe_autocast():
-            images = pipe(
+            pipe_output = pipe(
                 prompt_embeds=prompt_embeds.to(device, TORCH_DTYPE),
                 negative_prompt_embeds=negative_prompt_embeds.to(device, TORCH_DTYPE),
                 pooled_prompt_embeds=pooled_prompt_embeds.to(device, TORCH_DTYPE),
@@ -851,7 +855,11 @@ def run_idm_vton_inference(
                 width=TARGET_W,
                 ip_adapter_image=garm_img.resize(TARGET_SIZE),
                 guidance_scale=effective_guidance,
-            )[0]
+            )
+            images = pipe_output[0]
+            if not images:
+                logger.error("pipeline_returned_empty_images")
+                raise RuntimeError("Pipeline returned empty images list — inference produced no output")
 
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size)
@@ -1266,10 +1274,7 @@ if __name__ == "__main__":
         if not os.environ.get("RUNPOD_WARMUP_DISABLE"):
             warmup()
         logger.info("Starting RunPod serverless with max_workers=%s", MAX_WORKERS)
-        runpod.serverless.start(
-            {"handler": handler},
-            max_workers=MAX_WORKERS,
-        )
+        runpod.serverless.start({"handler": handler})
     except Exception:
         logger.error("Worker startup failed")
         traceback.print_exc()
