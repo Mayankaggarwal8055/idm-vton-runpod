@@ -683,6 +683,7 @@ def run_idm_vton_inference(
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
 
     import cv2
+    import numpy as np
 
     device = DEVICE
 
@@ -696,9 +697,22 @@ def run_idm_vton_inference(
         apply_protected_mask,
         fuse_hybrid_mask,
         select_worker_mask_strategy,
+        validate_mask_coverage,
     )
 
-    garm_img = garment_img.convert("RGB").resize(TARGET_SIZE)
+    # Preserve garment aspect ratio — only pad to target, never stretch
+    garm_img = garment_img.convert("RGB")
+    if garm_img.size != TARGET_SIZE:
+        gw, gh = garm_img.size
+        scale = min(TARGET_W / gw, TARGET_H / gh)
+        nw = max(1, int(gw * scale))
+        nh = max(1, int(gh * scale))
+        garm_resized = garm_img.resize((nw, nh), Image.LANCZOS)
+        garm_canvas = Image.new("RGB", TARGET_SIZE, (255, 255, 255))
+        garm_canvas.paste(garm_resized, ((TARGET_W - nw) // 2, (TARGET_H - nh) // 2))
+        garm_img = garm_canvas
+    else:
+        garm_img = garm_img.convert("RGB")
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -752,6 +766,43 @@ def run_idm_vton_inference(
     automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
     automasker_mask = automasker_mask.resize(TARGET_SIZE)
 
+    # ── Universal AutoMasker mask enlargement ──────────────────────────
+    # CRITICAL FINDING from research: "The mask area needs to be as large
+    # as possible. The garment mask shouldn't just frame the garment itself
+    # but needs to leave enough drawing space for different garment
+    # replacements." (CatVTON training notes)
+    #
+    # ATR parsing (SCHP) clips tightly around detected body regions, which
+    # leaves no margin for the new garment to be rendered. The diffusion
+    # model needs "drawing space" — extra mask area around the body —
+    # especially for lower-body, full-body, and oversized clothing.
+    #
+    # This applies to ALL garment types with type-specific intensity:
+    #   lower_body/dresses: strong dilation on leg zone (21px × 2)
+    #   upper_body:         gentle dilation on whole mask (15px × 1)
+    auto_np = np.array(automasker_mask, dtype=np.uint8)
+    if cloth_type in ("lower_body", "dresses"):
+        h_auto = auto_np.shape[0]
+        lower_zone = auto_np[h_auto * 3 // 5:, :]
+        leg_cov = float(np.mean(lower_zone > 127))
+        if leg_cov < 0.15:
+            leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+            auto_np = cv2.dilate(auto_np, leg_k, iterations=2)
+            logger.info(
+                "automasker_boost lower_body leg_coverage=%.2f threshold=0.15",
+                leg_cov,
+            )
+    else:
+        cov = float(np.mean(auto_np > 127))
+        if cov < 0.08:
+            mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            auto_np = cv2.dilate(auto_np, mild_k, iterations=1)
+            logger.info(
+                "automasker_boost upper_body coverage=%.2f threshold=0.08",
+                cov,
+            )
+    automasker_mask = Image.fromarray(auto_np, mode="L")
+
     min_quality = float(os.environ.get("MASK_MIN_QUALITY_SCORE", "62.0"))
     strategy = select_worker_mask_strategy(
         external_mask,
@@ -785,29 +836,46 @@ def run_idm_vton_inference(
         mask_quality_score,
     )
 
+    # ── Pre-inference mask validation ──────────────────────────────────
+    # Catch pathological masks before they waste ~8s of GPU inference.
+    mask_v = validate_mask_coverage(mask, cloth_type, protected_mask=protected_mask)
+    logger.info(
+        "mask_coverage coverage=%.1f%% valid=%s cloth_type=%s",
+        mask_v["coverage_percent"], mask_v["valid"], cloth_type,
+    )
+    if not mask_v["valid"]:
+        logger.warning(
+            "pre_inference_mask_invalid reason=%s coverage=%.1f%% cloth_type=%s",
+            mask_v["reason"], mask_v["coverage_percent"], cloth_type,
+        )
+
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
     with torch.no_grad():
         densepose_pred = densepose_predictor(human_img_arg)
-        if "instances" not in densepose_pred:
-            logger.error("densepose_no_instances image_shape=%s", human_img_arg.shape)
-            raise ValueError("DensePose detected no instances in input image")
-        densepose_outputs = densepose_pred["instances"]
+        if "instances" not in densepose_pred or len(densepose_pred["instances"]) == 0:
+            logger.warning(
+                "densepose_no_instances_fallback image_shape=%s cloth_type=%s",
+                human_img_arg.shape, cloth_type,
+            )
+            pose_img = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
+        else:
+            densepose_outputs = densepose_pred["instances"]
 
-    from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
-    from densepose.vis.extractor import create_extractor
+            from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
+            from densepose.vis.extractor import create_extractor
 
-    vis = DensePoseResultsFineSegmentationVisualizer(cfg=densepose_cfg)
-    extractor = create_extractor(vis)
-    data = extractor(densepose_outputs)
+            vis = DensePoseResultsFineSegmentationVisualizer(cfg=densepose_cfg)
+            extractor = create_extractor(vis)
+            data = extractor(densepose_outputs)
 
-    gray_img = cv2.cvtColor(human_img_arg, cv2.COLOR_BGR2GRAY)
-    gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
-    pose_img = vis.visualize(gray_img, data)
-    pose_img = pose_img[:, :, ::-1]
-    pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
+            gray_img = cv2.cvtColor(human_img_arg, cv2.COLOR_BGR2GRAY)
+            gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
+            pose_img = vis.visualize(gray_img, data)
+            pose_img = pose_img[:, :, ::-1]
+            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
@@ -884,6 +952,25 @@ def run_idm_vton_inference(
 # Per-job
 # =============================================================================
 
+def _validate_person_quality(
+    person_img: Image.Image,
+    min_side: int = 300,
+) -> tuple[bool, str]:
+    """Quick quality check on the downloaded person image.
+
+    Returns (valid, reason). Runs before expensive GPU inference to catch
+    inputs that would produce garbage outputs regardless of model quality.
+    """
+    w, h = person_img.size
+    if w < min_side or h < min_side:
+        return False, f"image_too_small:{w}x{h}<{min_side}"
+    arr = np.array(person_img.convert("L"), dtype=np.float32)
+    std = float(np.std(arr))
+    if std < 1.0:
+        return False, f"blank_image:std={std:.2f}"
+    return True, ""
+
+
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     from mask_pipeline import (
         WorkerMaskStrategy,
@@ -946,6 +1033,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     person_img = download_image(person_url)
     garment_img = download_image(garment_url)
 
+    # ── Pre-inference quality check ────────────────────────────────────
+    q_ok, q_reason = _validate_person_quality(person_img)
+    if not q_ok:
+        raise ValueError(f"Person image rejected: {q_reason}")
+    logger.info("person_image_quality_ok size=%s std=%.2f", person_img.size,
+                float(np.std(np.array(person_img.convert("L"), dtype=np.float32))))
+
     external_mask = None
     if mask_image_ref:
         try:
@@ -972,6 +1066,28 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             logger.warning("protected_mask_load_failed error=%s", exc)
 
     download_ms = (time.perf_counter() - download_start) * 1000
+
+    # ── Garment foreground area check ──────────────────────────────────
+    # If the garment image is mostly white/background (e.g. a product shot
+    # placed on a white canvas with too much padding), the model doesn't
+    # have enough garment pixels to render correctly. Log the ratio for
+    # monitoring — severe cases could be addressed by fallback.
+    garm_check = np.array(garment_img.convert("RGB"), dtype=np.uint8)
+    non_white = (
+        (garm_check[:, :, 0] < 240)
+        | (garm_check[:, :, 1] < 240)
+        | (garm_check[:, :, 2] < 240)
+    )
+    garm_foreground_ratio = float(np.mean(non_white))
+    logger.info(
+        "garment_foreground_ratio=%.3f cloth_type=%s trace_id=%s",
+        garm_foreground_ratio, vton_type, trace_id,
+    )
+    if garm_foreground_ratio < 0.10:
+        logger.warning(
+            "garment_very_small_on_canvas ratio=%.3f cloth_type=%s trace_id=%s",
+            garm_foreground_ratio, vton_type, trace_id,
+        )
 
     # ── Garment RGB diagnostics (must run AFTER garment_img is downloaded) ─
     garm_np = np.array(garment_img.convert("RGB"), dtype=np.float32)
@@ -1017,17 +1133,33 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     failure_reasons: list[str] = []
     last_inpaint_mask = external_mask
 
-    # Detect dark garment — reduce guidance to prevent color drift
+    # Dark garment handling — per-channel guidance adjustment.
+    # Dark garments (mean < 80) need HIGHER guidance so the model
+    # preserves their color against the diffusion prior's tendency
+    # toward mid-gray. Low guidance on dark garments washes them out.
     effective_guidance = GUIDANCE_SCALE
     if garm_mean_all < 80.0:
-        effective_guidance = GUIDANCE_SCALE * 0.75  # Reduce guidance for dark garments
+        effective_guidance = GUIDANCE_SCALE * 1.15
         logger.info(
-            "dark_garment_detected mean=%.1f reducing_guidance from %.1f to %.1f",
-            garm_mean_all, GUIDANCE_SCALE, effective_guidance,
+            "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
+            "increasing_guidance from %.1f to %.1f",
+            garm_mean_r, garm_mean_g, garm_mean_b,
+            GUIDANCE_SCALE, effective_guidance,
         )
 
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
+        # For lower-body / dresses: try bottom-anchored crop on first
+        # attempt, then fall back to center crop on retry. This helps
+        # when the bottom-anchored crop cuts off the upper body in a
+        # way that degrades the torso-garment transition.
+        crop_preserve = True
+        if vton_type in ("lower_body", "dresses") and attempt_idx > 0:
+            crop_preserve = False
+            logger.info(
+                "retry_crop_variant center_crop attempt=%s cloth_type=%s",
+                attempt_idx, vton_type,
+            )
         result, raw_output, mask_meta = run_idm_vton_inference(
             person_img=person_img,
             garment_img=garment_img,
@@ -1041,6 +1173,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             mask_strategy=strategy,
             mask_quality_score=mask_quality_score,
             guidance_scale=effective_guidance,
+            crop_preserve_lower=crop_preserve,
         )
         last_inpaint_mask = external_mask if strategy == "external" else None
 

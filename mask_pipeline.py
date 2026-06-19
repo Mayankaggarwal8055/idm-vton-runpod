@@ -42,6 +42,80 @@ class InferenceQualityReport:
     failure_reasons: tuple[str, ...]
 
 
+def validate_mask_coverage(
+    mask: Image.Image,
+    cloth_type: str,
+    min_coverage: float = 0.04,
+    protected_mask: Image.Image | None = None,
+) -> dict[str, object]:
+    """
+    Pre-inference mask sanity check.
+
+    Returns a dict with:
+      - valid: True if the mask is reasonable enough for inference
+      - coverage_percent: percentage of image covered by mask
+      - reason: human-readable failure reason (empty if valid)
+
+    This runs on the GPU worker before ~8s of inference to catch
+    pathological masks early.
+
+    If protected_mask is provided, it is used for a precise face-in-mask
+    check instead of the heuristic top-12% band.
+    """
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    h, w = mask_np.shape[:2]
+    binary = (mask_np > 127).astype(np.uint8)
+    coverage = float(np.sum(binary)) / binary.size
+
+    # Mask too small — nothing to inpaint
+    if coverage < min_coverage:
+        return {
+            "valid": False,
+            "coverage_percent": round(coverage * 100.0, 2),
+            "reason": f"mask_too_small:{coverage*100:.1f}%",
+        }
+
+    # Face zone check: use protected mask if available (more precise),
+    # otherwise fall back to heuristic top-12% band.
+    if protected_mask is not None:
+        prot_np = np.array(protected_mask.convert("L"), dtype=np.uint8)
+        prot_binary = (prot_np > 127).astype(np.uint8)
+        overlap = np.sum((binary == 1) & (prot_binary == 1))
+        prot_total = np.sum(prot_binary)
+        if prot_total > 0 and overlap / prot_total > 0.70:
+            return {
+                "valid": False,
+                "coverage_percent": round(coverage * 100.0, 2),
+                "reason": f"mask_covers_protected:{overlap/prot_total*100:.0f}%",
+            }
+    else:
+        face_zone = binary[:int(0.12 * h), :]
+        face_coverage = float(np.sum(face_zone)) / face_zone.size
+        if face_coverage > 0.85:
+            return {
+                "valid": False,
+                "coverage_percent": round(coverage * 100.0, 2),
+                "reason": f"mask_covers_face:{face_coverage*100:.0f}%",
+            }
+
+    # For lower_body: check that bottom half has meaningful coverage
+    if cloth_type in ("lower_body", "dresses"):
+        lower_zone = binary[h * 3 // 5:, :]
+        lower_coverage = float(np.sum(lower_zone)) / lower_zone.size
+        if lower_coverage < 0.03:
+            return {
+                "valid": False,
+                "coverage_percent": round(coverage * 100.0, 2),
+                "reason": f"lower_body_too_sparse:{lower_coverage*100:.1f}%",
+            }
+
+    return {
+        "valid": True,
+        "coverage_percent": round(coverage * 100.0, 2),
+        "reason": "",
+    }
+
+
 def fuse_hybrid_mask(
     external: Image.Image | None,
     automasker: Image.Image,
@@ -50,6 +124,9 @@ def fuse_hybrid_mask(
     """
     GPU hybrid: union external rembg mask with AutoMasker semantic mask,
     then keep AutoMasker-fixed regions (head, shoes, hands).
+
+    Morphology kernel sizes are cloth-type-aware: lower_body and dresses
+    get stronger dilation to ensure leg coverage.
     """
     auto_np = np.array(automasker.convert("L"), dtype=np.uint8)
     if external is None:
@@ -68,10 +145,15 @@ def fuse_hybrid_mask(
         (auto_np > 127).astype(np.uint8) * 255,
     )
 
-    # Shrink union slightly to avoid background bleed from rembg
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Cloth-type-aware morphology: lower-body needs stronger dilation
+    # to ensure full leg coverage from the union mask.
+    is_lower = cloth_type in ("lower_body", "dresses")
+    erode_size = 5  # Same for all types — prevents background bleed
+    dilate_size = 15 if is_lower else 9
+
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
     fused = cv2.erode(fused, erode_k, iterations=1)
-    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
     fused = cv2.dilate(fused, dilate_k, iterations=1)
 
     return Image.fromarray(fused, mode="L")
