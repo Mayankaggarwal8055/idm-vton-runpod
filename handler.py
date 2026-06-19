@@ -57,8 +57,8 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "30"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.0"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "40"))
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16
@@ -68,6 +68,18 @@ ENABLE_XFORMERS = os.environ.get("ENABLE_XFORMERS", "1") == "1"
 ENABLE_TORCH_COMPILE = os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_MODEL_CPU_OFFLOAD = os.environ.get("ENABLE_MODEL_CPU_OFFLOAD", "0") == "1"
 ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
+
+# Multi-candidate generation — generate N candidates with different
+# seeds on the first mask strategy, pick the one with the best aggregate
+# quality score.  Set to 1 for original single-candidate behaviour.
+MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "3"))
+
+# Candidate diversity — vary guidance scale and denoising steps across
+# candidates so the scoring system can choose from structurally different
+# outputs rather than pure seed-noise variants.  Set to 0 to use the same
+# parameters for all candidates (original behaviour).
+CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
+CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
 
 # Post-processing feature flags
 #   ENABLE_FACE_RESTORATION=1   — GFPGAN or OpenCV face enhancement
@@ -194,7 +206,7 @@ def _configure_cloudinary() -> bool:
 
 def _upload_to_cloudinary(image: Image.Image, job_id: str) -> str:
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=95, optimize=True, subsampling=0)
+    image.save(buffer, format="JPEG", quality=98, optimize=True, subsampling=0)
     buffer.seek(0)
 
     last_error: Exception | None = None
@@ -669,6 +681,7 @@ def run_idm_vton_inference(
     garment_img: Image.Image,
     garment_desc: str,
     cloth_type: str,
+    garment_subtype: str = "",
     steps: int = 30,
     seed: int = 42,
     auto_crop: bool = True,
@@ -828,6 +841,10 @@ def run_idm_vton_inference(
         mask = automasker_mask
         mask_meta["mask_type_used"] = "automasker"
 
+    # Snapshot the pre-protection mask so the outer retry loop can use
+    # it for multi-candidate quality scoring (texture / artifact analysis).
+    mask_meta["inpaint_mask_pil"] = mask.copy()
+
     mask = apply_protected_mask(mask, protected_mask)
     logger.info(
         "mask_selected strategy=%s mask_size=%s quality_score=%s",
@@ -879,7 +896,34 @@ def run_idm_vton_inference(
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    prompt = "model is wearing " + garment_desc
+    _SUBTYPE_FABRIC = {
+        "jeans": "denim fabric, natural denim folds",
+        "hoodie": "cotton fabric, relaxed fit",
+        "sweatshirt": "cotton fabric, relaxed fit",
+        "t-shirt": "cotton fabric, natural fit",
+        "shirt": "woven fabric, tailored fit",
+        "blazer": "structured fabric, tailored fit",
+        "jacket": "structured fabric, fitted shoulders",
+        "sweater": "knit fabric, relaxed fit",
+        "cardigan": "knit fabric, relaxed fit",
+        "blouse": "flowing fabric, natural drape",
+        "top": "soft fabric, natural fit",
+        "vest": "structured fabric, fitted",
+        "kurta": "flowing fabric, straight cut",
+        "pants": "woven fabric, natural fabric folds",
+        "trousers": "woven fabric, tailored fit",
+        "shorts": "cotton fabric, relaxed fit",
+        "skirt": "flowing fabric, natural drape",
+        "dress": "flowing fabric, natural drape",
+        "gown": "flowing fabric, floor-length drape",
+        "jumpsuit": "structured fabric, tailored fit",
+        "saree": "draped fabric, flowing silhouette",
+        "lehenga": "structured waist, flowing skirt",
+        "tracksuit": "cotton fabric, sporty fit",
+        "co-ord": "matching fabric, coordinated fit",
+    }
+    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds")
+    prompt = "model is wearing " + garment_desc + ", " + fabric_desc
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
         "deformed, distorted, disfigured, bad proportions, "
@@ -888,7 +932,9 @@ def run_idm_vton_inference(
         "ugly, blurry, watermark, signature, text, logo, "
         "beard on woman, mustache on woman, masculine face on woman, "
         "feminine face on man, changed hairstyle, changed hair color, "
-        "changed skin tone, changed body shape, gender swap"
+        "changed skin tone, changed body shape, gender swap, "
+        "smooth fabric, blurry texture, low detail fabric, "
+        "missing texture, distorted pattern, washed out, faded"
     )
 
     with torch.inference_mode():
@@ -974,6 +1020,7 @@ def _validate_person_quality(
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     from mask_pipeline import (
         WorkerMaskStrategy,
+        compute_aggregate_quality_score,
         detect_inference_failures,
     )
 
@@ -984,6 +1031,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
     protected_ref = job_input.get("protected_mask") or job_input.get("protected_mask_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
+    garment_subtype = job_input.get("garment_subtype") or ""
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
@@ -1149,10 +1197,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
-        # For lower-body / dresses: try bottom-anchored crop on first
-        # attempt, then fall back to center crop on retry. This helps
-        # when the bottom-anchored crop cuts off the upper body in a
-        # way that degrades the torso-garment transition.
         crop_preserve = True
         if vton_type in ("lower_body", "dresses") and attempt_idx > 0:
             crop_preserve = False
@@ -1160,23 +1204,143 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 "retry_crop_variant center_crop attempt=%s cloth_type=%s",
                 attempt_idx, vton_type,
             )
-        result, raw_output, mask_meta = run_idm_vton_inference(
-            person_img=person_img,
-            garment_img=garment_img,
-            garment_desc=garment_desc,
-            cloth_type=vton_type,
-            steps=steps,
-            seed=seed + attempt_idx,
-            auto_crop=True,
-            external_mask=external_mask,
-            protected_mask=protected_mask,
-            mask_strategy=strategy,
-            mask_quality_score=mask_quality_score,
-            guidance_scale=effective_guidance,
-            crop_preserve_lower=crop_preserve,
-        )
+
+        # ── Multi-candidate generation ──────────────────────────────────
+        # On the first attempt, generate N candidates with different seeds
+        # and pick the one with the best aggregate quality score.  Retry
+        # attempts use a single candidate to minimise cost.
+        num_candidates = max(1, MULTI_CANDIDATE_COUNT) if attempt_idx == 0 else 1
+
+        candidates: list[dict] = []
+        for c in range(num_candidates):
+            c_seed = seed + c * 1000 + attempt_idx
+
+            # ── Per-candidate guidance scale ────────────────────────────
+            # Vary ±5 % around the effective guidance so candidates explore
+            # different regions of the adherence-vs-creativity trade-off.
+            # Lower guidance = more natural wrinkles; higher = sharper edge.
+            if num_candidates > 1 and CANDIDATE_GUIDANCE_VARY:
+                if num_candidates == 3:
+                    gmult = (0.95, 1.0, 1.05)[c]
+                elif num_candidates == 2:
+                    gmult = (0.95, 1.05)[c]
+                else:
+                    gmult = 1.0
+                c_guidance = effective_guidance * gmult
+            else:
+                c_guidance = effective_guidance
+
+            # ── Per-candidate denoising steps ───────────────────────────
+            # Vary ±5 steps to give the scoring system a choice between
+            # faster/coarser and slower/finer outputs.
+            if num_candidates > 1 and CANDIDATE_STEPS_VARY:
+                if num_candidates == 3:
+                    sdel = (-5, 0, 5)[c]
+                elif num_candidates == 2:
+                    sdel = (-5, 5)[c]
+                else:
+                    sdel = 0
+                c_steps = max(25, min(55, steps + sdel))
+            else:
+                c_steps = steps
+
+            c_result, c_raw, c_meta = run_idm_vton_inference(
+                person_img=person_img,
+                garment_img=garment_img,
+                garment_desc=garment_desc,
+                garment_subtype=garment_subtype,
+                cloth_type=vton_type,
+                steps=c_steps,
+                seed=c_seed,
+                auto_crop=True,
+                external_mask=external_mask,
+                protected_mask=protected_mask,
+                mask_strategy=strategy,
+                mask_quality_score=mask_quality_score,
+                guidance_scale=c_guidance,
+                crop_preserve_lower=crop_preserve,
+            )
+
+            c_inpaint = c_meta.get("inpaint_mask_pil") or external_mask
+            if c_inpaint is not None:
+                c_qa_report = detect_inference_failures(
+                    person_img.resize(TARGET_SIZE),
+                    c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
+                    c_inpaint,
+                    protected_mask,
+                    garment_ref=garment_img,
+                )
+                c_agg = compute_aggregate_quality_score(
+                    c_qa_report,
+                    c_result,
+                    c_inpaint,
+                    garment_img,
+                )
+            else:
+                c_qa_report = None
+                c_agg = {"aggregate_score": 50.0}
+
+            candidates.append({
+                "agg_score": c_agg["aggregate_score"],
+                "result": c_result,
+                "raw_output": c_raw,
+                "meta": c_meta,
+                "seed": c_seed,
+                "steps": c_steps,
+                "guidance": c_guidance,
+                "qa_report": c_qa_report,
+                "agg": c_agg,
+            })
+
+        # Select the best candidate
+        candidates.sort(key=lambda x: x["agg_score"], reverse=True)
+        best = candidates[0]
+        result = best["result"]
+        raw_output = best["raw_output"]
+        mask_meta = best["meta"]
+        best_seed = best["seed"]
+        best_steps: int = best["steps"]
+        best_guidance: float = best["guidance"]
+        quality_report = best["qa_report"]
+        best_agg = best["agg"]
+
+        # Clean up internal-only key before it leaks to serialisation
+        mask_meta.pop("inpaint_mask_pil", None)
+
         last_inpaint_mask = external_mask if strategy == "external" else None
 
+        logger.info(
+            "attempt_%d strategy=%s candidates=%d best_seed=%d "
+            "best_guidance=%.3f best_steps=%d "
+            "aggregate=%.1f identity=%.1f color=%.1f texture=%.1f artifact=%.1f "
+            "trace_id=%s",
+            attempt_idx, strategy, num_candidates, best_seed,
+            best_guidance, best_steps,
+            best_agg.get("aggregate_score", -1),
+            best_agg.get("identity_score", -1),
+            best_agg.get("color_fidelity_score", -1),
+            best_agg.get("texture_score", -1),
+            best_agg.get("artifact_score", -1),
+            trace_id,
+        )
+
+        if attempt_idx == 0 and num_candidates > 1:
+            spread = best_agg.get("aggregate_score", 0) - candidates[-1]["agg_score"]
+            params = ", ".join(
+                f"c{i}:s={c['seed']},g={c.get('guidance', 0):.2f},st={c.get('steps', 0)}"
+                for i, c in enumerate(candidates)
+            )
+            logger.info(
+                "multi_candidate_summary candidates=%d best=%.1f worst=%.1f "
+                "spread=%.1f params=[%s]",
+                num_candidates,
+                best_agg.get("aggregate_score", -1),
+                candidates[-1]["agg_score"],
+                spread,
+                params,
+            )
+
+        # ── Retry decision (same logic as before) ──────────────────────
         if not retry_enabled or attempt_idx >= len(retry_strategies) - 1:
             break
 
@@ -1184,15 +1348,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         if inpaint_for_qa is None:
             break
 
-        quality_report = detect_inference_failures(
-            person_img.resize(TARGET_SIZE),
-            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-            inpaint_for_qa,
-            protected_mask,
-            garment_ref=garment_img,  # CRITICAL: pass garment source for TRUE color comparison
-        )
+        if quality_report is None:
+            quality_report = detect_inference_failures(
+                person_img.resize(TARGET_SIZE),
+                result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+                inpaint_for_qa,
+                protected_mask,
+                garment_ref=garment_img,
+            )
 
-        # Color-driven retry: if color fidelity is low, retry
         color_passed = True
         if quality_report.color_fidelity_score < 50.0:
             color_passed = False
@@ -1244,9 +1408,31 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     )
     pp_meta: dict[str, object] = {}
 
-    # Stage A: Face restoration (GFPGAN or OpenCV enhancement)
     face_meta: dict[str, object] = {}
-    if os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1":
+
+    # Stage A: Face composite — preserve original face/accessory pixels
+    fc_start = time.perf_counter()
+    result = apply_face_composite(result, person_img, protected_mask)
+    fc_ms = (time.perf_counter() - fc_start) * 1000
+    pp_meta["face_composite_ms"] = round(fc_ms, 1)
+
+    # Stage B: Seamless clone — Poisson edge blending
+    sc_start = time.perf_counter()
+    seam_mask = last_inpaint_mask if last_inpaint_mask is not None else external_mask
+    result = apply_seamless_clone(result, person_img, seam_mask)
+    sc_ms = (time.perf_counter() - sc_start) * 1000
+    pp_meta["seamless_clone_ms"] = round(sc_ms, 1)
+
+    # Stage C: Skin tone correction
+    st_start = time.perf_counter()
+    result = apply_skin_tone_correction(result, person_img, face_bbox=None)
+    st_ms = (time.perf_counter() - st_start) * 1000
+    pp_meta["skin_tone_ms"] = round(st_ms, 1)
+
+    # Stage D: Face restoration (GFPGAN or OpenCV enhancement) — runs LAST
+    # so it enhances the composited original face rather than the
+    # diffusion-generated face that will be overwritten by Stage A.
+    if os.environ.get("ENABLE_FACE_RESTORATION", "1") == "1":
         from face_restoration import enhance_face
         face_start = time.perf_counter()
         result, face_meta = enhance_face(
@@ -1269,30 +1455,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 trace_id,
             )
     pp_meta["face_restoration"] = face_meta
-
-    # Stage B: Face composite — preserve original face/accessory pixels
-    fc_start = time.perf_counter()
-    result = apply_face_composite(result, person_img, protected_mask)
-    fc_ms = (time.perf_counter() - fc_start) * 1000
-    pp_meta["face_composite_ms"] = round(fc_ms, 1)
-
-    # Stage C: Seamless clone — Poisson edge blending
-    sc_start = time.perf_counter()
-    seam_mask = last_inpaint_mask if last_inpaint_mask is not None else external_mask
-    result = apply_seamless_clone(result, person_img, seam_mask)
-    sc_ms = (time.perf_counter() - sc_start) * 1000
-    pp_meta["seamless_clone_ms"] = round(sc_ms, 1)
-
-    # Stage D: Skin tone correction
-    st_start = time.perf_counter()
-    face_bbox = face_meta.get("face_bbox")
-    if isinstance(face_bbox, (list, tuple)) and len(face_bbox) == 4:
-        st_bbox = tuple(int(v) for v in face_bbox)
-    else:
-        st_bbox = None
-    result = apply_skin_tone_correction(result, person_img, face_bbox=st_bbox)
-    st_ms = (time.perf_counter() - st_start) * 1000
-    pp_meta["skin_tone_ms"] = round(st_ms, 1)
 
     # ── Debug: save all 5 pipeline images ────────────────────────────────
     debug_dir = f"/tmp/trylix_debug/{job_id}"
@@ -1333,8 +1495,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "status": "success",
         "result_url": result_url,
         "cloth_type_used": vton_type,
-        "steps_used": steps,
-        "seed": seed,
+        "steps_used": best_steps,
+        "seed": best_seed,
         "inference_ms": round(inference_ms, 2),
         "upload_ms": round(upload_ms, 2),
         "download_ms": round(download_ms, 2),
@@ -1349,7 +1511,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "color_fidelity_score": result_color_fidelity,
         "color_drift_mean_rgb": result_color_drift,
         "garment_mean_rgb": round(garm_mean_all, 1),
-        "guidance_scale_used": round(effective_guidance, 2),
+        "guidance_scale_used": round(best_guidance, 2),
         "pp_meta": pp_meta,
         "trace_id": trace_id,
         "warnings": input_warnings,

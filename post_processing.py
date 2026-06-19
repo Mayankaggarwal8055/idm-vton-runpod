@@ -4,7 +4,7 @@ Post-processing pipeline for TryLix — compositing, blending, color correction.
 Each stage can be disabled independently via env var:
   ENABLE_FACE_COMPOSITE=1       (default: 1)
   ENABLE_SEAMLESS_CLONE=1       (default: 0)
-  ENABLE_SKIN_TONE_CORRECTION=1 (default: 0)
+  ENABLE_SKIN_TONE_CORRECTION=1 (default: 1)
 
 Runs after inference, before Cloudinary upload.
 """
@@ -49,12 +49,17 @@ def apply_face_composite(
         mask_pil = protected_mask.convert("L").resize(result.size, Image.NEAREST)
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    # Dilate protected region slightly to ensure full coverage
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_dilated = cv2.dilate(mask_np, kernel, iterations=2)
+    # Dilate protected region to ensure full coverage with soft falloff.
+    # Larger kernel (7 vs 5) and more iterations (3 vs 2) create a wider
+    # transition band, reducing visible seams where the original face
+    # composite meets the diffusion output.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_dilated = cv2.dilate(mask_np, kernel, iterations=3)
 
-    # Feather the edges of the composite
-    feather = cv2.GaussianBlur(mask_dilated.astype(np.float32), (21, 21), 8)
+    # Feather the edges with a wider Gaussian for smooth blending.
+    # The larger sigma=12 spreads the blend over ~30px instead of ~20px,
+    # hiding lighting/color mismatches at the composite boundary.
+    feather = cv2.GaussianBlur(mask_dilated.astype(np.float32), (31, 31), 12)
     feather_3d = np.stack([feather / 255.0] * 3, axis=-1)
 
     # Blend: original person where mask is high, result where mask is low
@@ -125,7 +130,7 @@ def apply_skin_tone_correction(
     Computes per-channel gain in skin regions (face if detected, otherwise
     full image) and applies to the entire result.
     """
-    if os.environ.get("ENABLE_SKIN_TONE_CORRECTION", "0") != "1":
+    if os.environ.get("ENABLE_SKIN_TONE_CORRECTION", "1") != "1":
         return result
 
     result_np = np.array(result.convert("RGB"), dtype=np.float32)
@@ -144,10 +149,12 @@ def apply_skin_tone_correction(
         skin_ref_person = person_np[y1:y2, x1:x2]
         skin_ref_result = result_np[y1:y2, x1:x2]
     else:
-        # Fallback: use center 30% of image (rough face/torso area)
+        # Fallback: use upper-center region of image (expected face area).
+        # Center shifted to 20% height (was 25%) to capture faces in
+        # full-body shots where the face is at ~10-15% of image height.
         h, w = person_np.shape[:2]
-        cx, cy = w // 2, h // 4
-        roi_w, roi_h = w // 3, h // 6
+        cx, cy = w // 2, h // 5
+        roi_w, roi_h = w // 2, h // 5
         skin_ref_person = person_np[cy - roi_h // 2:cy + roi_h // 2, cx - roi_w // 2:cx + roi_w // 2]
         skin_ref_result = result_np[cy - roi_h // 2:cy + roi_h // 2, cx - roi_w // 2:cx + roi_w // 2]
 
