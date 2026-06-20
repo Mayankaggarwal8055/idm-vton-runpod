@@ -174,12 +174,6 @@ def apply_protected_mask(inpaint_mask: Image.Image, protected: Image.Image | Non
     if prot.shape != inp.shape:
         prot = np.array(protected.convert("L").resize(inpaint_mask.size, Image.NEAREST))
     prot_binary = (prot > 127).astype(np.uint8)
-    # Dilate protected region so diffusion cannot regenerate hand margins
-    prot_binary = cv2.dilate(
-        prot_binary,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-        iterations=2,
-    )
     dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
     feather = np.clip(dist.astype(np.float32) / 30.0, 0, 1)
     result = inp.astype(np.float32)
