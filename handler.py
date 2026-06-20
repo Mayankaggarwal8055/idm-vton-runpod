@@ -897,32 +897,32 @@ def run_idm_vton_inference(
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
     _SUBTYPE_FABRIC = {
-        "jeans": "denim fabric, natural denim folds",
-        "hoodie": "cotton fabric, relaxed fit",
-        "sweatshirt": "cotton fabric, relaxed fit",
-        "t-shirt": "cotton fabric, natural fit",
-        "shirt": "woven fabric, tailored fit",
-        "blazer": "structured fabric, tailored fit",
-        "jacket": "structured fabric, fitted shoulders",
-        "sweater": "knit fabric, relaxed fit",
-        "cardigan": "knit fabric, relaxed fit",
-        "blouse": "flowing fabric, natural drape",
-        "top": "soft fabric, natural fit",
-        "vest": "structured fabric, fitted",
-        "kurta": "flowing fabric, straight cut",
-        "pants": "woven fabric, natural fabric folds",
-        "trousers": "woven fabric, tailored fit",
-        "shorts": "cotton fabric, relaxed fit",
-        "skirt": "flowing fabric, natural drape",
-        "dress": "flowing fabric, natural drape",
-        "gown": "flowing fabric, floor-length drape",
-        "jumpsuit": "structured fabric, tailored fit",
-        "saree": "draped fabric, flowing silhouette",
-        "lehenga": "structured waist, flowing skirt",
-        "tracksuit": "cotton fabric, sporty fit",
-        "co-ord": "matching fabric, coordinated fit",
+        "jeans": "denim fabric, natural denim folds, realistic denim texture, faded seams",
+        "hoodie": "cotton fabric, relaxed fit, natural wrinkles, soft folds",
+        "sweatshirt": "cotton fabric, relaxed fit, natural wrinkles, soft folds",
+        "t-shirt": "cotton fabric, natural fit, soft folds, realistic drape",
+        "shirt": "woven fabric, tailored fit, sharp creases, natural wrinkles",
+        "blazer": "structured fabric, tailored fit, sharp seams, natural folds",
+        "jacket": "structured fabric, fitted shoulders, realistic seams, natural folds",
+        "sweater": "knit fabric, relaxed fit, knit texture, natural wrinkles",
+        "cardigan": "knit fabric, relaxed fit, knit texture, natural wrinkles",
+        "blouse": "flowing fabric, natural drape, soft wrinkles, realistic folds",
+        "top": "soft fabric, natural fit, realistic folds, soft drape",
+        "vest": "structured fabric, fitted, sharp seams, natural folds",
+        "kurta": "flowing fabric, straight cut, natural drape, soft folds",
+        "pants": "woven fabric, natural fabric folds, realistic wrinkles, tailored crease",
+        "trousers": "woven fabric, tailored fit, sharp crease, natural wrinkles",
+        "shorts": "cotton fabric, relaxed fit, soft folds, natural wrinkles",
+        "skirt": "flowing fabric, natural drape, realistic folds, soft wrinkles",
+        "dress": "flowing fabric, natural drape, realistic wrinkles, soft folds",
+        "gown": "flowing fabric, floor-length drape, elegant folds, natural wrinkles",
+        "jumpsuit": "structured fabric, tailored fit, sharp seams, natural folds",
+        "saree": "draped fabric, flowing silhouette, realistic saree folds, natural pleats",
+        "lehenga": "structured waist, flowing skirt, realistic pleats, natural folds",
+        "tracksuit": "cotton fabric, sporty fit, soft folds, natural wrinkles",
+        "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles",
     }
-    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds")
+    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds, realistic texture, sharp details")
     prompt = "model is wearing " + garment_desc + ", " + fabric_desc + ", without any accessories, no bag, no purse, no headphones, no necklace, no watch"
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
@@ -935,6 +935,9 @@ def run_idm_vton_inference(
         "changed skin tone, changed body shape, gender swap, "
         "smooth fabric, blurry texture, low detail fabric, "
         "missing texture, distorted pattern, washed out, faded, "
+        "plastic fabric, fake fabric, synthetic looking, "
+        "oversmooth, airbrushed, cg render, 3d render, "
+        "flat lighting, no shadows, no folds, no wrinkles, "
         "bag, purse, handbag, clutch, tote, backpack, "
         "headphones, earphones, headset, "
         "necklace, chain, pendant, choker, "
@@ -955,7 +958,7 @@ def run_idm_vton_inference(
                 negative_prompt=negative_prompt,
             )
 
-            prompt_c = "a photo of " + garment_desc
+            prompt_c = "a photo of " + garment_desc + ", " + fabric_desc
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
