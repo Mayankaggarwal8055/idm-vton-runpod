@@ -364,7 +364,10 @@ def _compute_texture_score(
         garment_ref.convert("L").resize(result.size, Image.LANCZOS),
         dtype=np.float32,
     )
-    mask_np = np.array(inpaint_mask.convert("L"), dtype=np.uint8) > 127
+    mask_np = np.array(
+        inpaint_mask.convert("L").resize(result.size, Image.LANCZOS),
+        dtype=np.uint8,
+    ) > 127
 
     if not np.any(mask_np):
         return 50.0
@@ -420,7 +423,10 @@ def _compute_artifact_score(
       2. Clipped pixels — burned highlights or crushed shadows
     """
     out_np = np.array(result.convert("L"), dtype=np.float32)
-    mask_np = np.array(inpaint_mask.convert("L"), dtype=np.uint8) > 127
+    mask_np = np.array(
+        inpaint_mask.convert("L").resize(result.size, Image.LANCZOS),
+        dtype=np.uint8,
+    ) > 127
 
     if not np.any(mask_np):
         return 50.0
