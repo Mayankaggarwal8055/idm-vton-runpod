@@ -35,7 +35,7 @@ def apply_face_composite(
     This is more reliable than face detection — it preserves whatever the
     preprocessing pipeline marked as protected (face, phone, clutch, watch).
     """
-    if os.environ.get("ENABLE_FACE_COMPOSITE", "1") != "1":
+    if os.environ.get("ENABLE_FACE_COMPOSITE", "0") != "1":
         return result
     if protected_mask is None:
         return result
@@ -130,7 +130,7 @@ def apply_skin_tone_correction(
     Computes per-channel gain in skin regions (face if detected, otherwise
     full image) and applies to the entire result.
     """
-    if os.environ.get("ENABLE_SKIN_TONE_CORRECTION", "1") != "1":
+    if os.environ.get("ENABLE_SKIN_TONE_CORRECTION", "0") != "1":
         return result
 
     result_np = np.array(result.convert("RGB"), dtype=np.float32)

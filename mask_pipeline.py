@@ -173,8 +173,14 @@ def apply_protected_mask(inpaint_mask: Image.Image, protected: Image.Image | Non
     prot = np.array(protected.convert("L"), dtype=np.uint8)
     if prot.shape != inp.shape:
         prot = np.array(protected.convert("L").resize(inpaint_mask.size, Image.NEAREST))
-    inp[prot > 127] = 0
-    return Image.fromarray(inp, mode="L")
+    prot_binary = (prot > 127).astype(np.uint8)
+    dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
+    feather = np.clip(dist.astype(np.float32) / 15.0, 0, 1)
+    result = inp.astype(np.float32)
+    result[prot_binary > 0] = 0.0
+    outside = (prot_binary == 0)
+    result[outside] = result[outside] * feather[outside]
+    return Image.fromarray(result.astype(np.uint8), mode="L")
 
 
 def detect_inference_failures(

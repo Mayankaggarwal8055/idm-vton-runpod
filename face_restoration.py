@@ -49,7 +49,7 @@ def enhance_face(
             enhanced_image — the output with face region enhanced.
             meta_dict — keys: face_detected, restoration_time_ms, restoration_method.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
@@ -75,8 +75,18 @@ def enhance_face(
         x1, y1, x2, y2, trace_id,
     )
 
-    # ── Step 2: Extract face region ─────────────────────────────────────
-    face_region = result_np[y1:y2, x1:x2]
+    # ── Step 2: Extract face region from ORIGINAL person photo ─────────
+    # Using person_original instead of result_np ensures the enhanced face
+    # shares the same identity/skin tone as the blend background, making
+    # the feathered transition nearly invisible.  Extracting from result_np
+    # (diffusion output) causes a visible rectangular seam because the
+    # diffusion may alter face appearance.
+    if person_original is not None:
+        person_np = np.array(person_original.convert("RGB"))
+        face_source = person_np
+    else:
+        face_source = result_np
+    face_region = face_source[y1:y2, x1:x2]
     if face_region.size == 0:
         elapsed = (time.perf_counter() - t0) * 1000
         meta["restoration_time_ms"] = round(elapsed, 1)
@@ -280,7 +290,7 @@ def _blend_face(
 
     # Create a feather mask: white center, Gaussian falloff at edges
     feather_mask = np.ones((fh, fw), dtype=np.float32)
-    feather_pixels = min(fh, fw) // 6  #  ~17% feather border
+    feather_pixels = min(fh, fw) // 3  # ~33% feather border (was ~17% — too narrow, caused visible seam)
     if feather_pixels > 2:
         kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3)
         kernel_1d = kernel_1d[feather_pixels:-feather_pixels].flatten()
