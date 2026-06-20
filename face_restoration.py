@@ -156,9 +156,9 @@ def _detect_face_bbox_from_array(
         return None
 
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-    pad_x = int(fw * 0.12)
-    pad_y_top = int(fh * 0.35)
-    pad_y_bottom = int(fh * 0.12)
+    pad_x = int(fw * 0.18)
+    pad_y_top = int(fh * 0.40)
+    pad_y_bottom = int(fh * 0.30)
     return (
         max(0, fx - pad_x),
         max(0, fy - pad_y_top),

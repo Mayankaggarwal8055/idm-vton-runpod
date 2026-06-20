@@ -923,7 +923,7 @@ def run_idm_vton_inference(
         "co-ord": "matching fabric, coordinated fit",
     }
     fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds")
-    prompt = "model is wearing " + garment_desc + ", " + fabric_desc
+    prompt = "model is wearing " + garment_desc + ", " + fabric_desc + ", without any accessories, no bag, no purse, no headphones, no necklace, no watch"
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
         "deformed, distorted, disfigured, bad proportions, "
@@ -934,7 +934,16 @@ def run_idm_vton_inference(
         "feminine face on man, changed hairstyle, changed hair color, "
         "changed skin tone, changed body shape, gender swap, "
         "smooth fabric, blurry texture, low detail fabric, "
-        "missing texture, distorted pattern, washed out, faded"
+        "missing texture, distorted pattern, washed out, faded, "
+        "bag, purse, handbag, clutch, tote, backpack, "
+        "headphones, earphones, headset, "
+        "necklace, chain, pendant, choker, "
+        "watch, wristwatch, bracelet, "
+        "sunglasses, eyewear, glasses, "
+        "phone, smartphone, mobile, "
+        "strap, belt, waist belt, "
+        "accessory, accessories, "
+        "extra object, held item, carrying"
     )
 
     with torch.inference_mode():
@@ -1419,7 +1428,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # Stage B: Seamless clone — Poisson edge blending
     sc_start = time.perf_counter()
     seam_mask = last_inpaint_mask if last_inpaint_mask is not None else external_mask
-    result = apply_seamless_clone(result, person_img, seam_mask)
+    if seam_mask is not None:
+        result = apply_seamless_clone(result, person_img, seam_mask)
     sc_ms = (time.perf_counter() - sc_start) * 1000
     pp_meta["seamless_clone_ms"] = round(sc_ms, 1)
 
@@ -1456,24 +1466,27 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             )
     pp_meta["face_restoration"] = face_meta
 
-    # ── Debug: save all 5 pipeline images ────────────────────────────────
-    debug_dir = f"/tmp/trylix_debug/{job_id}"
-    try:
-        os.makedirs(debug_dir, exist_ok=True)
-        person_img.convert("RGB").save(f"{debug_dir}/01_person.jpg", quality=90)
-        garment_img.convert("RGB").save(f"{debug_dir}/02_garment.jpg", quality=90)
-        if external_mask is not None:
-            external_mask.convert("L").save(f"{debug_dir}/03_mask.png")
-        else:
-            logger.warning("debug_no_mask_to_save trace_id=%s", trace_id)
-        raw_output.convert("RGB").save(f"{debug_dir}/04_raw_output.jpg", quality=95)
-        result.convert("RGB").save(f"{debug_dir}/05_final_output.jpg", quality=95)
-        logger.info(
-            "debug_images_saved dir=%s files=5 trace_id=%s",
-            debug_dir, trace_id,
-        )
-    except Exception as exc:
-        logger.warning("debug_images_save_failed dir=%s error=%s trace_id=%s", debug_dir, exc, trace_id)
+    # ── Debug: save all pipeline images ────────────────────────────────────
+    if os.environ.get("ENABLE_DEBUG_IMAGES") == "1":
+        debug_dir = f"/tmp/trylix_debug/{job_id}"
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            person_img.convert("RGB").save(f"{debug_dir}/01_person.jpg", quality=90)
+            garment_img.convert("RGB").save(f"{debug_dir}/02_garment.jpg", quality=90)
+            if external_mask is not None:
+                external_mask.convert("L").save(f"{debug_dir}/03_external_mask.png")
+            else:
+                logger.warning("debug_no_external_mask trace_id=%s", trace_id)
+            if protected_mask is not None:
+                protected_mask.convert("L").save(f"{debug_dir}/04_protected_mask.png")
+            raw_output.convert("RGB").save(f"{debug_dir}/06_raw_output.jpg", quality=95)
+            result.convert("RGB").save(f"{debug_dir}/07_final_output.jpg", quality=95)
+            logger.info(
+                "debug_images_saved dir=%s files=6 trace_id=%s",
+                debug_dir, trace_id,
+            )
+        except Exception as exc:
+            logger.warning("debug_images_save_failed dir=%s error=%s trace_id=%s", debug_dir, exc, trace_id)
 
     # ── Upload ───────────────────────────────────────────────────────────
     upload_start = time.perf_counter()
