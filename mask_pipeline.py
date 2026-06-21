@@ -155,8 +155,8 @@ def fuse_hybrid_mask(
     # Cloth-type-aware morphology: lower-body needs stronger dilation
     # to ensure full leg coverage from the union mask.
     is_lower = cloth_type in ("lower_body", "dresses")
-    erode_size = 5  # Same for all types — prevents background bleed
-    dilate_size = 15 if is_lower else 9
+    erode_size = 3  # Reduced from 5 — less aggressive erosion preserves more garment edge area
+    dilate_size = 21 if is_lower else 13  # Increased: more drawing space for diffusion
 
     erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
     fused = cv2.erode(fused, erode_k, iterations=1)
@@ -174,14 +174,17 @@ def apply_protected_mask(inpaint_mask: Image.Image, protected: Image.Image | Non
     if prot.shape != inp.shape:
         prot = np.array(protected.convert("L").resize(inpaint_mask.size, Image.NEAREST))
     prot_binary = (prot > 127).astype(np.uint8)
-    # Dilate protected region so diffusion cannot regenerate hand margins
+    # Dilate protected region more aggressively so diffusion cannot
+    # regenerate hand margins or create face/hair seams.
     prot_binary = cv2.dilate(
         prot_binary,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-        iterations=2,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=3,
     )
     dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
-    feather = np.clip(dist.astype(np.float32) / 30.0, 0, 1)
+    # Softer feather transition (40px vs 30px) prevents visible rectangular
+    # seams at face/hand boundaries while keeping protection firm.
+    feather = np.clip(dist.astype(np.float32) / 40.0, 0, 1)
     result = inp.astype(np.float32)
     result[prot_binary > 0] = 0.0
     outside = (prot_binary == 0)
@@ -400,22 +403,24 @@ def _compute_texture_score(
             return 90.0 - (ratio - 1.0) / 0.8 * 20.0
         return max(0.0, 70.0 - (ratio - 1.8) / 2.2 * 70.0)
 
-    # Calibrated curve: peak at ratio ≈ 1.5 where body-worn fabric
+    # Calibrated curve: peak at ratio ≈ 1.8 where body-worn fabric
     # has natural wrinkle/fold texture energy above a flat product shot.
+    # Shifted peak higher than before (1.5 → 1.8) to favor outputs with
+    # stronger wrinkle, fold, and fabric structure realism.
     #   ratio < 0.3  → severely under-textured (0)
-    #   ratio 0.3-0.8 → under-textured, flat (0→40)
-    #   ratio 0.8-1.5 → good body-worn texture (40→90)
-    #   ratio 1.5-2.5 → over-sharp but acceptable (90→60)
-    #   ratio > 2.5   → noisy / artifact (60→5)
+    #   ratio 0.3-0.7 → under-textured, flat (0→30)
+    #   ratio 0.7-1.8 → good body-worn texture (30→90)
+    #   ratio 1.8-3.0 → over-sharp but still realistic (90→60)
+    #   ratio > 3.0   → noisy / artifact (60→5)
     if ratio < 0.3:
         return 0.0
-    if ratio < 0.8:
-        return (ratio - 0.3) / 0.5 * 40.0
-    if ratio < 1.5:
-        return 40.0 + (ratio - 0.8) / 0.7 * 50.0
-    if ratio < 2.5:
-        return 90.0 - (ratio - 1.5) / 1.0 * 30.0
-    return max(5.0, 60.0 - (ratio - 2.5) / 2.5 * 55.0)
+    if ratio < 0.7:
+        return (ratio - 0.3) / 0.4 * 30.0
+    if ratio < 1.8:
+        return 30.0 + (ratio - 0.7) / 1.1 * 60.0
+    if ratio < 3.0:
+        return 90.0 - (ratio - 1.8) / 1.2 * 30.0
+    return max(5.0, 60.0 - (ratio - 3.0) / 3.0 * 55.0)
 
 
 def _compute_artifact_score(
@@ -459,9 +464,9 @@ def _compute_artifact_score(
     if _SCORE_LEGACY:
         score = 100.0 - dead_ratio * 50.0 - extreme_ratio * 50.0
     else:
-        # Increased penalty coefficients give meaningful differentiation:
-        # clean outputs score ~96, artifact-heavy outputs score ~65.
-        score = 100.0 - dead_ratio * 80.0 - extreme_ratio * 100.0
+        # Increased penalty coefficients: cleaner separation between
+        # clean outputs (~97) and artifact-heavy (~55).
+        score = 100.0 - dead_ratio * 100.0 - extreme_ratio * 120.0
     return max(5.0, min(100.0, score))
 
 
@@ -488,11 +493,11 @@ def compute_aggregate_quality_score(
     texture = _compute_texture_score(result, garment_ref, inpaint_mask)
     artifact = _compute_artifact_score(result, inpaint_mask)
 
-    # Calibrated weights (v2): identity reduced from 30→25% because the
-    # tighter face band produces higher scores for good candidates, so it
-    # needs less influence. Texture increased from 25→30% because the
-    # reworked curve now correctly rewards realistic body-worn fabric,
-    # making it a more reliable signal for visual quality.
+    # Realism-optimized weights (v3): texture increased to 35% because the
+    # shifted peak now correctly rewards realistic wrinkles, folds, and
+    # fabric detail — the highest correlate with perceived realism.
+    # Identity reduced to 20% (face preservation is good enough already).
+    # Artifact increased to 18% to penalize plastic/smooth outputs harder.
     if _SCORE_LEGACY:
         aggregate = (
             identity * 0.30 +
@@ -502,10 +507,10 @@ def compute_aggregate_quality_score(
         )
     else:
         aggregate = (
-            identity * 0.25 +
-            color * 0.30 +
-            texture * 0.30 +
-            artifact * 0.15
+            identity * 0.20 +
+            color * 0.27 +
+            texture * 0.35 +
+            artifact * 0.18
         )
 
     return {

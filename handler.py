@@ -57,8 +57,8 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "40"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "45"))
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.75"))
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16
@@ -72,7 +72,7 @@ ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
 # Multi-candidate generation — generate N candidates with different
 # seeds on the first mask strategy, pick the one with the best aggregate
 # quality score.  Set to 1 for original single-candidate behaviour.
-MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "3"))
+MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "4"))
 
 # Candidate diversity — vary guidance scale and denoising steps across
 # candidates so the scoring system can choose from structurally different
@@ -791,29 +791,30 @@ def run_idm_vton_inference(
     # especially for lower-body, full-body, and oversized clothing.
     #
     # This applies to ALL garment types with type-specific intensity:
-    #   lower_body/dresses: strong dilation on leg zone (21px × 2)
-    #   upper_body:         gentle dilation on whole mask (15px × 1)
+    #   lower_body/dresses: strong dilation on leg zone (25px × 3)
+    #   upper_body:         gentle dilation on whole mask (19px × 2)
+    #   full_body:          strongest dilation for full outfits (25px × 3)
+    # Increased intensity vs. previous: better drawing space for realistic
+    # wrinkles, folds, and fabric draping at garment edges.
     auto_np = np.array(automasker_mask, dtype=np.uint8)
-    if cloth_type in ("lower_body", "dresses"):
+    if cloth_type in ("lower_body", "dresses", "full_body"):
         h_auto = auto_np.shape[0]
         lower_zone = auto_np[h_auto * 3 // 5:, :]
         leg_cov = float(np.mean(lower_zone > 127))
-        if leg_cov < 0.15:
-            leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-            auto_np = cv2.dilate(auto_np, leg_k, iterations=2)
-            logger.info(
-                "automasker_boost lower_body leg_coverage=%.2f threshold=0.15",
-                leg_cov,
-            )
+        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        auto_np = cv2.dilate(auto_np, leg_k, iterations=3)
+        logger.info(
+            "automasker_boost lower_body leg_coverage=%.2f iterations=3",
+            leg_cov,
+        )
     else:
         cov = float(np.mean(auto_np > 127))
-        if cov < 0.08:
-            mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-            auto_np = cv2.dilate(auto_np, mild_k, iterations=1)
-            logger.info(
-                "automasker_boost upper_body coverage=%.2f threshold=0.08",
-                cov,
-            )
+        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+        auto_np = cv2.dilate(auto_np, mild_k, iterations=2)
+        logger.info(
+            "automasker_boost upper_body coverage=%.2f iterations=2",
+            cov,
+        )
     automasker_mask = Image.fromarray(auto_np, mode="L")
 
     min_quality = float(os.environ.get("MASK_MIN_QUALITY_SCORE", "62.0"))
@@ -897,47 +898,41 @@ def run_idm_vton_inference(
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
     _SUBTYPE_FABRIC = {
-        "jeans": "denim fabric, natural denim folds, realistic denim texture, faded seams",
-        "hoodie": "cotton fabric, relaxed fit, natural wrinkles, soft folds",
-        "sweatshirt": "cotton fabric, relaxed fit, natural wrinkles, soft folds",
-        "t-shirt": "cotton fabric, natural fit, soft folds, realistic drape",
-        "shirt": "woven fabric, tailored fit, sharp creases, natural wrinkles",
-        "blazer": "structured fabric, tailored fit, sharp seams, natural folds",
-        "jacket": "structured fabric, fitted shoulders, realistic seams, natural folds",
-        "sweater": "knit fabric, relaxed fit, knit texture, natural wrinkles",
-        "cardigan": "knit fabric, relaxed fit, knit texture, natural wrinkles",
-        "blouse": "flowing fabric, natural drape, soft wrinkles, realistic folds",
-        "top": "soft fabric, natural fit, realistic folds, soft drape",
-        "vest": "structured fabric, fitted, sharp seams, natural folds",
-        "kurta": "flowing fabric, straight cut, natural drape, soft folds",
-        "pants": "woven fabric, natural fabric folds, realistic wrinkles, tailored crease",
-        "trousers": "woven fabric, tailored fit, sharp crease, natural wrinkles",
-        "shorts": "cotton fabric, relaxed fit, soft folds, natural wrinkles",
-        "skirt": "flowing fabric, natural drape, realistic folds, soft wrinkles",
-        "dress": "flowing fabric, natural drape, realistic wrinkles, soft folds",
-        "gown": "flowing fabric, floor-length drape, elegant folds, natural wrinkles",
-        "jumpsuit": "structured fabric, tailored fit, sharp seams, natural folds",
-        "saree": "draped fabric, flowing silhouette, realistic saree folds, natural pleats",
-        "lehenga": "structured waist, flowing skirt, realistic pleats, natural folds",
-        "tracksuit": "cotton fabric, sporty fit, soft folds, natural wrinkles",
-        "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles",
+        "jeans": "denim fabric, realistic denim texture, natural denim folds, faded whiskers, authentic seams, coin pocket, rivet details, worn fabric texture",
+        "hoodie": "cotton fleece fabric, relaxed fit, natural wrinkles, soft folds, ribbed cuffs, drawstring hood, pouch pocket seams",
+        "sweatshirt": "cotton fleece fabric, relaxed fit, natural wrinkles, soft folds, ribbed hem and cuffs",
+        "t-shirt": "cotton jersey fabric, natural fit, soft folds, realistic drape, ribbed neckline seam, hem stitch detail",
+        "shirt": "woven cotton fabric, tailored fit, sharp creases, natural wrinkles, button placket seam, collar stand, cuffed sleeves",
+        "blazer": "structured woven fabric, tailored fit, sharp seams, natural folds, notch lapel, chest pocket seam, vent detail",
+        "jacket": "structured fabric, fitted shoulders, realistic seams, natural folds, zipper detail, pocket flaps, hem band",
+        "sweater": "knit fabric, relaxed fit, knit texture, natural wrinkles, ribbed crew neck, cable knit detail, hem ribbing",
+        "cardigan": "knit fabric, relaxed fit, knit texture, natural wrinkles, button placket, ribbed edges",
+        "blouse": "flowing fabric, natural drape, soft wrinkles, realistic folds, collar detail, pleated shoulder seam",
+        "top": "soft fabric, natural fit, realistic folds, soft drape, neckline seam, hem detail",
+        "vest": "structured fabric, fitted, sharp seams, natural folds, armhole binding, button front seam",
+        "kurta": "flowing fabric, straight cut, natural drape, soft folds, neckline embroidery detail, side slits",
+        "pants": "woven fabric, natural fabric folds, realistic wrinkles, tailored crease, belt loop seams, hem stitch, pocket outline",
+        "trousers": "woven fabric, tailored fit, sharp crease, natural wrinkles, pleated front seam, hem detail",
+        "shorts": "cotton fabric, relaxed fit, soft folds, natural wrinkles, hem seam, pocket stitching",
+        "skirt": "flowing fabric, natural drape, realistic folds, soft wrinkles, waistband seam, hemline detail",
+        "dress": "flowing fabric, natural drape, realistic wrinkles, soft folds, waist seam, neckline binding, hem detail",
+        "gown": "flowing fabric, floor-length drape, elegant folds, natural wrinkles, bodice seam, skirt gathers, hem stitch",
+        "jumpsuit": "structured fabric, tailored fit, sharp seams, natural folds, waist seam detail, leg hem, pocket stitching",
+        "saree": "draped silk fabric, flowing silhouette, realistic saree folds, natural pleats, decorative border detail, pallu drape, fabric sheen",
+        "lehenga": "structured waistband, flowing skirt, realistic pleats, natural folds, embroidered border detail, waist seam",
+        "tracksuit": "cotton fabric, sporty fit, soft folds, natural wrinkles, ribbed cuffs, drawstring waistband, leg zip detail",
+        "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles, waist seam detail, hem finishing",
     }
-    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds, realistic texture, sharp details")
-    prompt = "model is wearing " + garment_desc + ", " + fabric_desc + ", without any accessories, no bag, no purse, no headphones, no necklace, no watch"
+    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds, realistic texture, sharp details, visible seams, natural shadows, fabric grain visible")
+    prompt = "model is wearing " + garment_desc + ", " + fabric_desc + ", no accessories"
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
         "deformed, distorted, disfigured, bad proportions, "
         "extra limbs, missing limbs, cloned head, body out of frame, "
         "poorly drawn face, mutation, mutated, extra fingers, "
         "ugly, blurry, watermark, signature, text, logo, "
-        "beard on woman, mustache on woman, masculine face on woman, "
-        "feminine face on man, changed hairstyle, changed hair color, "
-        "changed skin tone, changed body shape, gender swap, "
-        "smooth fabric, blurry texture, low detail fabric, "
-        "missing texture, distorted pattern, washed out, faded, "
-        "plastic fabric, fake fabric, synthetic looking, "
-        "oversmooth, airbrushed, cg render, 3d render, "
-        "flat lighting, no shadows, no folds, no wrinkles, "
+        "smooth plastic, airbrushed, cg render, 3d render, "
+        "flat lighting, "
         "bag, purse, handbag, clutch, tote, backpack, "
         "headphones, earphones, headset, "
         "necklace, chain, pendant, choker, "
@@ -1228,14 +1223,17 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             c_seed = seed + c * 1000 + attempt_idx
 
             # ── Per-candidate guidance scale ────────────────────────────
-            # Vary ±5 % around the effective guidance so candidates explore
-            # different regions of the adherence-vs-creativity trade-off.
-            # Lower guidance = more natural wrinkles; higher = sharper edge.
+            # Vary guidance across candidates to explore the adherence-vs-creativity
+            # trade-off. Lower guidance = more natural wrinkles, folds, shadows.
+            # Higher guidance = sharper edges, better color adherence.
+            # 4-candidate spread: (0.90, 0.97, 1.03, 1.10) for wider diversity.
             if num_candidates > 1 and CANDIDATE_GUIDANCE_VARY:
-                if num_candidates == 3:
-                    gmult = (0.95, 1.0, 1.05)[c]
+                if num_candidates == 4:
+                    gmult = (0.90, 0.97, 1.03, 1.10)[c]
+                elif num_candidates == 3:
+                    gmult = (0.93, 1.0, 1.07)[c]
                 elif num_candidates == 2:
-                    gmult = (0.95, 1.05)[c]
+                    gmult = (0.93, 1.07)[c]
                 else:
                     gmult = 1.0
                 c_guidance = effective_guidance * gmult
@@ -1243,16 +1241,19 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 c_guidance = effective_guidance
 
             # ── Per-candidate denoising steps ───────────────────────────
-            # Vary ±5 steps to give the scoring system a choice between
-            # faster/coarser and slower/finer outputs.
+            # Vary steps to give the scoring system a choice between
+            # faster/coarser and slower/finer outputs. More steps = more
+            # detail in wrinkles, folds, fabric texture.
             if num_candidates > 1 and CANDIDATE_STEPS_VARY:
-                if num_candidates == 3:
+                if num_candidates == 4:
+                    sdel = (-8, -3, 3, 8)[c]
+                elif num_candidates == 3:
                     sdel = (-5, 0, 5)[c]
                 elif num_candidates == 2:
                     sdel = (-5, 5)[c]
                 else:
                     sdel = 0
-                c_steps = max(25, min(55, steps + sdel))
+                c_steps = max(25, min(60, steps + sdel))
             else:
                 c_steps = steps
 

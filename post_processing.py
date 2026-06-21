@@ -49,17 +49,17 @@ def apply_face_composite(
         mask_pil = protected_mask.convert("L").resize(result.size, Image.NEAREST)
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    # Dilate protected region to ensure full coverage with soft falloff.
-    # Larger kernel (7 vs 5) and more iterations (3 vs 2) create a wider
-    # transition band, reducing visible seams where the original face
-    # composite meets the diffusion output.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask_dilated = cv2.dilate(mask_np, kernel, iterations=3)
+    # Dilate protected region more aggressively to ensure full coverage
+    # with wide, soft falloff. Larger kernel (9 vs 7) and more iterations
+    # (4 vs 3) create a wider transition band, making the original face
+    # composite invisible against the diffusion output.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask_dilated = cv2.dilate(mask_np, kernel, iterations=4)
 
     # Feather the edges with a wider Gaussian for smooth blending.
-    # The larger sigma=12 spreads the blend over ~30px instead of ~20px,
-    # hiding lighting/color mismatches at the composite boundary.
-    feather = cv2.GaussianBlur(mask_dilated.astype(np.float32), (31, 31), 12)
+    # Larger sigma=15 spreads the blend over ~40px, hiding lighting/color
+    # mismatches and preventing visible rectangular face seams.
+    feather = cv2.GaussianBlur(mask_dilated.astype(np.float32), (35, 35), 15)
     feather_3d = np.stack([feather / 255.0] * 3, axis=-1)
 
     # Blend: original person where mask is high, result where mask is low
@@ -93,8 +93,10 @@ def apply_seamless_clone(
         mask_pil = inpaint_mask.convert("L").resize(result.size, Image.NEAREST)
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    # Only apply seamlessClone on the mask edge band (not the whole mask)
-    eroded = cv2.erode(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    # Create a wider edge band for seamlessClone — wider band = smoother transition.
+    # Previous erosion kernel was (11,11) with 1 iteration, producing a ~5px band.
+    # Now (7,7) with 2 iterations produces an ~8px band for better blending.
+    eroded = cv2.erode(mask_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=2)
     edge_band = mask_np.copy()
     edge_band[eroded > 127] = 0
 
@@ -102,7 +104,7 @@ def apply_seamless_clone(
         return result  # Edge band too small — skip
 
     try:
-        # Use the result garment as the source
+        # Use the result garment as the source with the edge band
         src = result_np.copy()
         src[edge_band == 0] = 0  # Only keep edge band pixels
 
@@ -112,7 +114,9 @@ def apply_seamless_clone(
             return result
         center = (int(np.mean(xs)), int(np.mean(ys)))
 
-        cloned = cv2.seamlessClone(src, person_np, mask_np, center, cv2.NORMAL_CLONE)
+        # Use MIXED_CLONE for garment boundaries — preserves texture better
+        # than NORMAL_CLONE which can wash out fabric patterns.
+        cloned = cv2.seamlessClone(src, person_np, mask_np, center, cv2.MIXED_CLONE)
         return Image.fromarray(cloned)
     except Exception as exc:
         logger.warning("seamless_clone_failed error=%s", exc)
