@@ -773,6 +773,18 @@ def run_idm_vton_inference(
     else:
         human_img = human_img_orig.resize(TARGET_SIZE)
 
+    # Align protected_mask with auto-crop — the mask was computed from the
+    # full-image resize, but the inference image was cropped then resized.
+    # Without alignment, face protection is applied at wrong coordinates,
+    # exposing face boundary pixels to diffusion modification.
+    if auto_crop and crop_size is not None and protected_mask is not None:
+        t_left = int(left * TARGET_W / width)
+        t_top = int(top * TARGET_H / height)
+        t_right = int(right * TARGET_W / width)
+        t_bottom = int(bottom * TARGET_H / height)
+        prot_cropped = protected_mask.crop((t_left, t_top, t_right, t_bottom))
+        protected_mask = prot_cropped.resize(TARGET_SIZE, Image.NEAREST)
+
     # Always compute AutoMasker mask (SCHP + OpenPose) for routing / hybrid
     keypoints = openpose_model(human_img.resize((384, 512)))
     model_parse, _ = parsing_model(human_img.resize((384, 512)))
@@ -1423,6 +1435,30 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     face_meta: dict[str, object] = {}
 
+    # ── Face bbox detection for skin-tone correction ───────────────────
+    import cv2
+    # Detect face bounding box from the ORIGINAL person image so that
+    # skin-tone correction samples from the actual face region (which was
+    # composited from the original), not the diffusion-modified neck area.
+    # When face_bbox is provided, gain ≈ 1.0 (face matches original),
+    # correction is skipped, and face color is preserved intact.
+    person_cv = cv2.cvtColor(np.array(person_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    face_cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    face_cascade = cv2.CascadeClassifier(face_cascade_path)
+    if not face_cascade.empty():
+        gray = cv2.cvtColor(person_cv, cv2.COLOR_BGR2GRAY)
+        h_i, w_i = gray.shape
+        min_dim = max(30, int(min(w_i, h_i) * 0.04))
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(min_dim, min_dim))
+        if len(faces) > 0:
+            (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
+            face_bbox = (fx, fy, fx + fw, fy + fh)
+            logger.info("skin_tone_face_bbox_detected bbox=(%d,%d,%d,%d)", fx, fy, fx + fw, fy + fh)
+        else:
+            face_bbox = None
+    else:
+        face_bbox = None
+
     # Stage A: Face composite — preserve original face/accessory pixels
     fc_start = time.perf_counter()
     result = apply_face_composite(result, person_img, protected_mask)
@@ -1439,7 +1475,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # Stage C: Skin tone correction
     st_start = time.perf_counter()
-    result = apply_skin_tone_correction(result, person_img, face_bbox=None)
+    result = apply_skin_tone_correction(result, person_img, face_bbox=face_bbox)
     st_ms = (time.perf_counter() - st_start) * 1000
     pp_meta["skin_tone_ms"] = round(st_ms, 1)
 
