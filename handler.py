@@ -72,7 +72,7 @@ ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
 # Multi-candidate generation — generate N candidates with different
 # seeds on the first mask strategy, pick the one with the best aggregate
 # quality score.  Set to 1 for original single-candidate behaviour.
-MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "4"))
+MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
 
 # Candidate diversity — vary guidance scale and denoising steps across
 # candidates so the scoring system can choose from structurally different
@@ -1064,8 +1064,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     input_warnings = job_input.get("warnings", [])
     if not isinstance(input_warnings, list):
         input_warnings = []
-    max_retries = int(os.environ.get("MASK_WORKER_MAX_RETRIES", "2"))
-    retry_enabled = os.environ.get("MASK_WORKER_RETRY", "1") == "1"
+    max_retries = int(os.environ.get("MASK_WORKER_MAX_RETRIES", "0"))
+    retry_enabled = os.environ.get("MASK_WORKER_RETRY", "0") == "1"
 
     if not person_url or not garment_url:
         raise ValueError("Missing required inputs: person_image_url and garment_image_url")

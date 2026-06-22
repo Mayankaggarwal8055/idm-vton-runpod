@@ -507,10 +507,10 @@ def compute_aggregate_quality_score(
         )
     else:
         aggregate = (
-            identity * 0.20 +
+            identity * 0.30 +
             color * 0.27 +
-            texture * 0.35 +
-            artifact * 0.18
+            texture * 0.23 +
+            artifact * 0.20
         )
 
     return {

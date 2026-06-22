@@ -73,7 +73,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
-        "detectron2@git+https://github.com/facebookresearch/detectron2.git@main"
+        "detectron2@git+https://github.com/facebookresearch/detectron2.git@02b5c4e295e990042a714712c21dc79b731e8833"
 
 # =============================================================================
 # Layer 4 — Clone IDM-VTON repo + download ALL binary checkpoints

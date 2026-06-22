@@ -49,7 +49,7 @@ def enhance_face(
             enhanced_image — the output with face region enhanced.
             meta_dict — keys: face_detected, restoration_time_ms, restoration_method.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "1":
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
