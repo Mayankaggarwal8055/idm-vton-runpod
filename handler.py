@@ -791,40 +791,41 @@ def run_idm_vton_inference(
     automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
     automasker_mask = automasker_mask.resize(TARGET_SIZE)
 
-    # ── Universal AutoMasker mask enlargement ──────────────────────────
-    # CRITICAL FINDING from research: "The mask area needs to be as large
-    # as possible. The garment mask shouldn't just frame the garment itself
-    # but needs to leave enough drawing space for different garment
-    # replacements." (CatVTON training notes)
+    # ── Contour-aware AutoMasker enlargement ──────────────────────────
+    # Standard uniform dilation expands the mask in ALL directions equally,
+    # causing the inpaint area to bleed into background AND immovable body
+    # regions (shoulder, chest, torso outline). This makes the model
+    # regenerate the body silhouette and background — the opposite of try-on.
     #
-    # ATR parsing (SCHP) clips tightly around detected body regions, which
-    # leaves no margin for the new garment to be rendered. The diffusion
-    # model needs "drawing space" — extra mask area around the body —
-    # especially for lower-body, full-body, and oversized clothing.
+    # Contour-aware dilation uses anisotropic kernels:
+    #   lower_body/dresses: VERTICAL ellipse (19×29) — leg room downward
+    #   upper_body:         HORIZONTAL ellipse (25×15) — shoulder room sideways
     #
-    # This applies to ALL garment types with type-specific intensity:
-    #   lower_body/dresses: strong dilation on leg zone (25px × 3)
-    #   upper_body:         gentle dilation on whole mask (19px × 2)
-    #   full_body:          strongest dilation for full outfits (25px × 3)
-    # Increased intensity vs. previous: better drawing space for realistic
-    # wrinkles, folds, and fabric draping at garment edges.
+    # Dilation iterations reduced from 3→2 (lower) and 2→1 (upper) to
+    # prevent the mask from swallowing the background. Combined with
+    # edge-reflect padding (image.py) and body-boundary protection
+    # (build_protected_region_mask), this keeps the mask near the garment
+    # contour while giving just enough drawing space for realistic draping.
     auto_np = np.array(automasker_mask, dtype=np.uint8)
+    auto_np_pre = auto_np.copy()  # pre-dilation copy for body boundary detection
     if cloth_type in ("lower_body", "dresses", "full_body"):
         h_auto = auto_np.shape[0]
         lower_zone = auto_np[h_auto * 3 // 5:, :]
         leg_cov = float(np.mean(lower_zone > 127))
-        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-        auto_np = cv2.dilate(auto_np, leg_k, iterations=3)
+        # Vertical ellipse: dilate downward for leg length, minimal sideways
+        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 29))
+        auto_np = cv2.dilate(auto_np, leg_k, iterations=2)
         logger.info(
-            "automasker_boost lower_body leg_coverage=%.2f iterations=3",
+            "automasker_boost lower_body leg_coverage=%.2f kernel=19x29 iterations=2",
             leg_cov,
         )
     else:
         cov = float(np.mean(auto_np > 127))
-        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
-        auto_np = cv2.dilate(auto_np, mild_k, iterations=2)
+        # Horizontal ellipse: dilate sideways for shoulder width, minimal downward
+        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 15))
+        auto_np = cv2.dilate(auto_np, mild_k, iterations=1)
         logger.info(
-            "automasker_boost upper_body coverage=%.2f iterations=2",
+            "automasker_boost upper_body coverage=%.2f kernel=25x15 iterations=1",
             cov,
         )
     automasker_mask = Image.fromarray(auto_np, mode="L")
@@ -858,7 +859,27 @@ def run_idm_vton_inference(
     # it for multi-candidate quality scoring (texture / artifact analysis).
     mask_meta["inpaint_mask_pil"] = mask.copy()
 
+    # ── Body boundary protection ───────────────────────────────────────
+    # Locks the body contour (skin/face near garment edge) so the
+    # diffusion model cannot change body silhouette. Computed from the
+    # pre-dilation automasker mask + SCHP model_parse. Only protects
+    # the garment-to-skin interface, NOT the garment-to-background
+    # boundary (which stays open for drawing space).
+    body_prot = _build_body_boundary_protection(
+        model_parse, auto_np_pre, TARGET_SIZE,
+    )
+    if body_prot is not None:
+        if protected_mask is None:
+            protected_mask = Image.fromarray(body_prot, mode="L")
+            logger.info("body_boundary_protection applied (new mask) band_size=~15px")
+        else:
+            prot_np = np.array(protected_mask.convert("L"), dtype=np.uint8)
+            prot_np = np.maximum(prot_np, body_prot).astype(np.uint8)
+            protected_mask = Image.fromarray(prot_np, mode="L")
+            logger.info("body_boundary_protection merged into existing protected_mask")
+
     mask = apply_protected_mask(mask, protected_mask)
+    mask_meta["region_freeze_mask"] = mask.copy()
     logger.info(
         "mask_selected strategy=%s mask_size=%s quality_score=%s",
         mask_meta["mask_type_used"],
@@ -936,7 +957,12 @@ def run_idm_vton_inference(
         "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles, waist seam detail, hem finishing",
     }
     fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds, realistic texture, sharp details, visible seams, natural shadows, fabric grain visible")
-    prompt = "model is wearing " + garment_desc + ", " + fabric_desc + ", no accessories"
+    prompt = (
+        "model is wearing " + garment_desc + ", " + fabric_desc
+        + ", photorealistic, sharp focus, fashion photography, "
+        + "soft studio lighting, high quality, detailed fabric texture, "
+        + "natural skin, professional photo, no accessories"
+    )
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
         "deformed, distorted, disfigured, bad proportions, "
@@ -1016,6 +1042,69 @@ def run_idm_vton_inference(
 # =============================================================================
 # Per-job
 # =============================================================================
+
+def _build_body_boundary_protection(
+    model_parse: torch.Tensor | np.ndarray,
+    garment_mask: np.ndarray | None,
+    target_size: tuple[int, int],
+) -> np.ndarray | None:
+    """Build body contour protection mask.
+
+    Protects the boundary between garment and visible body parts
+    (skin, face) so the diffusion model cannot change the body
+    silhouette. Garment-to-background boundaries are left open
+    for drawing space — this is where the model needs room to
+    render realistic folds, draping, and garment edges.
+
+    Uses SCHP model_parse to identify non-garment foreground
+    regions (face, arms, legs) that are adjacent to the garment.
+    These regions get a narrow protection band in the mask so
+    the diffusion model treats them as fixed context.
+    """
+    import cv2
+    from PIL import Image
+
+    if isinstance(model_parse, torch.Tensor):
+        parse = model_parse.cpu().numpy()
+        if parse.ndim == 3:
+            parse = parse.squeeze(0)
+    else:
+        parse = np.array(model_parse)
+
+    # Garment mask from automasker (pre-dilation) — tells us
+    # what the model identified as the garment region.
+    # Must be resized to model_parse resolution for pixel-wise ops.
+    h, w = parse.shape  # typically (384, 512)
+    if garment_mask is not None:
+        garment_pil = Image.fromarray(
+            (garment_mask > 127).astype(np.uint8) * 255, mode="L",
+        ).resize((w, h), Image.NEAREST)
+        garment_bin = (np.array(garment_pil) > 127).astype(np.uint8)
+    else:
+        # LIP garment classes: upper-clothes(5), dress(6), coat(7),
+        # pants(9), jumpsuits(10), skirt(12)
+        garment_bin = np.isin(parse, [5, 6, 7, 9, 10, 12]).astype(np.uint8)
+
+    foreground = (parse > 0).astype(np.uint8)
+    body = foreground - garment_bin  # non-garment foreground
+    body = np.clip(body, 0, 1).astype(np.uint8)
+
+    if body.sum() < 50:
+        return None
+
+    kernel = np.ones((5, 5), dtype=np.uint8)
+    garment_border = cv2.dilate(garment_bin, kernel, iterations=2)
+    body_near_garment = garment_border & body
+
+    if body_near_garment.sum() < 20:
+        return None
+
+    band = cv2.dilate(body_near_garment.astype(np.uint8), kernel, iterations=1)
+    band = (band * 255).astype(np.uint8)
+
+    band_pil = Image.fromarray(band, mode="L").resize(target_size, Image.NEAREST)
+    return np.array(band_pil, dtype=np.uint8)
+
 
 def _validate_person_quality(
     person_img: Image.Image,
@@ -1217,12 +1306,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
         crop_preserve = True
-        if vton_type in ("lower_body", "dresses") and attempt_idx > 0:
-            crop_preserve = False
-            logger.info(
-                "retry_crop_variant center_crop attempt=%s cloth_type=%s",
-                attempt_idx, vton_type,
-            )
 
         # ── Multi-candidate generation ──────────────────────────────────
         # On the first attempt, generate N candidates with different seeds
@@ -1329,7 +1412,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         quality_report = best["qa_report"]
         best_agg = best["agg"]
 
-        # Clean up internal-only key before it leaks to serialisation
+        # Extract region_freeze_mask cleanly before it leaks to serialisation
+        _region_freeze_mask = mask_meta.pop("region_freeze_mask", None)
         mask_meta.pop("inpaint_mask_pil", None)
 
         last_inpaint_mask = external_mask if strategy == "external" else None
@@ -1428,6 +1512,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # Each stage is independently disableable and logs its own timing.
     from post_processing import (
         apply_face_composite,
+        apply_region_freeze,
         apply_seamless_clone,
         apply_skin_tone_correction,
     )
@@ -1479,7 +1564,18 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     st_ms = (time.perf_counter() - st_start) * 1000
     pp_meta["skin_tone_ms"] = round(st_ms, 1)
 
-    # Stage D: Face restoration (GFPGAN or OpenCV enhancement) — runs LAST
+    # Stage D: Region freezing — restore ALL original pixels outside inpaint mask
+    # This is the final safety net: every pixel not in the inpaint mask is
+    # copied from the original person image. Background, face, hair, hands,
+    # and body silhouette are all preserved exactly as the original photo.
+    rf_start = time.perf_counter()
+    rf_mask = _region_freeze_mask if _region_freeze_mask is not None else (last_inpaint_mask if last_inpaint_mask is not None else external_mask)
+    if rf_mask is not None:
+        result = apply_region_freeze(result, person_img, rf_mask)
+    rf_ms = (time.perf_counter() - rf_start) * 1000
+    pp_meta["region_freeze_ms"] = round(rf_ms, 1)
+
+    # Stage E: Face restoration (GFPGAN or OpenCV enhancement) — runs LAST
     # so it enhances the composited original face rather than the
     # diffusion-generated face that will be overwritten by Stage A.
     if os.environ.get("ENABLE_FACE_RESTORATION", "1") == "1":
@@ -1519,6 +1615,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 logger.warning("debug_no_external_mask trace_id=%s", trace_id)
             if protected_mask is not None:
                 protected_mask.convert("L").save(f"{debug_dir}/04_protected_mask.png")
+            inpaint_debug = last_inpaint_mask or external_mask
+            if inpaint_debug is not None:
+                inpaint_debug.convert("L").save(f"{debug_dir}/05_inpaint_mask.png")
             raw_output.convert("RGB").save(f"{debug_dir}/06_raw_output.jpg", quality=95)
             result.convert("RGB").save(f"{debug_dir}/07_final_output.jpg", quality=95)
             logger.info(

@@ -187,3 +187,42 @@ def apply_skin_tone_correction(
 
     corrected = result_np * gain.reshape(1, 1, 3)
     return Image.fromarray(np.clip(corrected, 0, 255).astype(np.uint8))
+
+
+def apply_region_freeze(
+    result: Image.Image,
+    person_original: Image.Image,
+    inpaint_mask: Image.Image,
+) -> Image.Image:
+    """
+    Copy ALL non-masked pixels from original person image back into result.
+
+    The "region freezing" step ensures the diffusion model only modified the
+    garment area. Every pixel outside the inpaint mask (background, face,
+    hair, hands, body contour) is restored from the original photo.
+
+    This is the final safety net — even if a few non-garment pixels leak
+    into the mask, region freezing puts them back.
+    """
+    result_np = np.array(result.convert("RGB"), dtype=np.uint8)
+    person_np = np.array(person_original.convert("RGB"), dtype=np.uint8)
+    mask_np = np.array(inpaint_mask.convert("L"), dtype=np.uint8)
+
+    if mask_np.shape[:2] != result_np.shape[:2]:
+        mask_pil = inpaint_mask.convert("L").resize(result.size, Image.NEAREST)
+        mask_np = np.array(mask_pil, dtype=np.uint8)
+
+    if person_np.shape[:2] != result_np.shape[:2]:
+        person_pil = person_original.convert("RGB").resize(result.size, Image.LANCZOS)
+        person_np = np.array(person_pil, dtype=np.uint8)
+
+    # Every pixel where mask is 0 → copy from original person
+    frozen = result_np.copy()
+    outside_mask = mask_np < 128
+    frozen[outside_mask] = person_np[outside_mask]
+
+    logger.info(
+        "region_freeze applied frozen_pixels=%.1f%%",
+        100.0 * float(np.sum(outside_mask)) / outside_mask.size,
+    )
+    return Image.fromarray(frozen, mode="RGB")
