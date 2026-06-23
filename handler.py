@@ -21,6 +21,17 @@ import cloudinary
 import cloudinary.uploader
 from requests.adapters import HTTPAdapter
 
+# Post-inference quality recovery — face restoration module.
+# enhanace_face() is called in run_inference() after inference completes.
+# It applies mild sharpening to the face region (or GFPGAN if available)
+# and blends back with Gaussian feathering. No original pixels are pasted
+# over generated clothing — only the face region is touched.
+_FACE_RESTORATION_AVAILABLE = True
+try:
+    from face_restoration import enhance_face as _do_enhance_face
+except ImportError:
+    _FACE_RESTORATION_AVAILABLE = False
+    _do_enhance_face = None
 
 # =============================================================================
 # Logging
@@ -81,12 +92,15 @@ MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
 CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
 CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
 
-# Post-processing — ALL REMOVED from active pipeline.
-#   face_restoration.py         — exists as file but is NOT imported or called.
+# Post-processing:
+#   face_restoration.py         — RE-ENABLED: enhance_face() runs after inference.
+#                                 Mild unsharp mask (or GFPGAN if available) on the
+#                                 face region only, blended with Gaussian feather.
+#                                 Sources face from original person image for
+#                                 identity preservation, never overwrites clothing.
 #   post_processing.py          — placeholder docstring only, all functions removed.
-#   None of: face composite, skin tone correction, region freeze, seamless clone,
-#   feather-mask restore, or original-pixel overwrite — exist in the active handler.
-# The model output is the final image. Identity preservation happens via SCHP
+# None of: skin tone correction, region freeze, seamless clone, or original-pixel
+# overwrite — exist in the active handler. Identity preservation happens via SCHP
 # binary mask protection at inference time, never via post-inference restore.
 
 # Concurrency — single GPU SDXL typically needs ~16-20 GB VRAM.
@@ -707,6 +721,7 @@ def run_idm_vton_inference(
         apply_protection_binary,
         assert_binary_mask,
         validate_mask_coverage,
+        validate_mask_integrity,
         detect_inference_failures,
     )
 
@@ -773,7 +788,11 @@ def run_idm_vton_inference(
     # SCHP is the single authoritative mask source.
     # Build binary inpaint + protect masks from SCHP labels.
     keypoints = openpose_model(human_img.resize((384, 512)))
-    model_parse, _ = parsing_model(human_img.resize((384, 512)))
+    # SCHP at full TARGET_SIZE resolution so mask boundaries are native-res,
+    # not interpolated from 384x512. The ONNX models internally affine-warp
+    # to 512x512, so the compute cost is identical — only the output label
+    # map resolution increases (1024x768 vs 512x384).
+    model_parse, _ = parsing_model(human_img)
     # Build binary masks from SCHP labels
     schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
     if isinstance(model_parse, torch.Tensor):
@@ -786,17 +805,30 @@ def run_idm_vton_inference(
     protect_mask_np = build_schp_protect_mask(schp_np, cloth_type)
 
     # ── Contour-aware inpaint mask dilation ───────────────────────────
+    # Kernel sizes scale with SCHP resolution so coverage is consistent
+    # regardless of whether SCHP ran at 384x512 or 768x1024.
+    mask_h = schp_np.shape[0]
+    scale = mask_h / 512.0
     if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 29))
+        leg_ks = (max(3, int(19 * scale)), max(3, int(29 * scale)))
+        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
         inpaint_mask_np = cv2.dilate(inpaint_mask_np, leg_k, iterations=2)
     else:
-        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 15))
+        mild_ks = (max(3, int(25 * scale)), max(3, int(15 * scale)))
+        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
         inpaint_mask_np = cv2.dilate(inpaint_mask_np, mild_k, iterations=1)
 
     # Binary protection — clip-subtract, no feathering
     final_mask_np = apply_protection_binary(inpaint_mask_np, protect_mask_np)
     assert_binary_mask(final_mask_np, "final_mask before inference")
-    final_mask = Image.fromarray(final_mask_np, mode="L").resize(TARGET_SIZE, Image.NEAREST)
+    validate_mask_integrity(final_mask_np, "final_mask")
+    # Smooth upscale: LANCZOS + threshold to 255/0 gives anti-aliased
+    # mask boundaries instead of the jagged pixel blocks from NEAREST.
+    final_mask = Image.fromarray(final_mask_np, mode="L")
+    if final_mask.size != TARGET_SIZE:
+        final_mask = final_mask.resize(TARGET_SIZE, Image.LANCZOS)
+        final_mask = final_mask.point(lambda x: 255 if x > 127 else 0)
+        assert_binary_mask(np.array(final_mask, dtype=np.uint8), "final_mask after resize")
 
     mask_meta: dict[str, object] = {
         "mask_type_used": "automasker",
@@ -925,6 +957,30 @@ def run_idm_vton_inference(
 
     with torch.inference_mode():
         with _maybe_autocast():
+            # ── Input shape verification ──────────────────────────────────
+            _person_sz = human_img.size
+            _garment_sz = garm_img.size
+            _mask_sz = mask.size
+            _pose_sz = pose_img.size
+            _ip_sz = garm_img.resize(TARGET_SIZE).size
+            _all_ok = (
+                _person_sz == TARGET_SIZE
+                and _garment_sz == TARGET_SIZE
+                and _mask_sz == TARGET_SIZE
+                and _pose_sz == TARGET_SIZE
+                and _ip_sz == TARGET_SIZE
+            )
+            if not _all_ok:
+                logger.error(
+                    "SHAPE_MISMATCH person=%s garment=%s mask=%s pose=%s "
+                    "ip_adapter=%s expected=%s",
+                    _person_sz, _garment_sz, _mask_sz, _pose_sz, _ip_sz, TARGET_SIZE,
+                )
+            logger.info(
+                "INPUT_SHAPES person=%s garment=%s mask=%s pose=%s "
+                "openpose=384x512 ip_adapter=%s all_ok=%s",
+                _person_sz, _garment_sz, _mask_sz, _pose_sz, _ip_sz, _all_ok,
+            )
             pipe_output = pipe(
                 prompt_embeds=prompt_embeds.to(device, TORCH_DTYPE),
                 negative_prompt_embeds=negative_prompt_embeds.to(device, TORCH_DTYPE),
@@ -1175,16 +1231,24 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
-    # ── No post-processing — model output is final ───────────────────────
-    # Face restoration: DISABLED (face_restoration.py is not imported or called).
-    # Post-processing (composite, skin tone, region freeze, seamless clone): REMOVED.
-    # The SCHP-only binary mask pipeline ensures identity preservation at
-    # inference time. No original-pixel overwrite occurs after inference.
-    logger.info(
-        "post_inference_restore: none (all disabled/removed) "
-        "face_restoration=disabled trace_id=%s",
-        trace_id,
-    )
+    # ── Face restoration — mild enhancement, no identity overwrite ────────
+    # enhanace_face() detects the face in the result and applies a mild
+    # unsharp-mask sharpening (or GFPGAN if available) ONLY to the face
+    # region, then blends it back with a Gaussian feather. It sources the
+    # face from the original person_original for identity preservation and
+    # never pastes original pixels over generated clothing.
+    if result is not None and _FACE_RESTORATION_AVAILABLE and _do_enhance_face is not None:
+        person_ref = person_img
+        if person_ref.size != result.size:
+            person_ref = person_ref.resize(result.size, Image.LANCZOS)
+        result, face_meta_out = _do_enhance_face(result, person_original=person_ref)
+        logger.info(
+            "face_restoration_applied face_detected=%s trace_id=%s",
+            face_meta_out.get("face_detected", "unknown"), trace_id,
+        )
+    else:
+        logger.info("face_restoration_skipped available=%s trace_id=%s",
+                     _FACE_RESTORATION_AVAILABLE, trace_id)
 
     # ── Upload ───────────────────────────────────────────────────────────
     upload_start = time.perf_counter()

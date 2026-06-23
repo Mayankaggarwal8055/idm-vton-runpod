@@ -1,17 +1,13 @@
 """
-Face Restoration — DEPRECATED / INACTIVE in the active try-on pipeline.
+Face Restoration — Active post-inference quality recovery.
 
-This file is NOT imported or called by handler.py or any active module.
-It exists only as a preserved utility for potential future use.
+enhance_face() is called by handler.py after every inference.
+It applies mild unsharp-mask sharpening (or GFPGAN if available) to the
+face region only, then blends it back with Gaussian feathering.
 
-Status:
-  - handler.py does not import or call enhance_face()
-  - run_inference() does not call enhance_face()
-  - The model output is uploaded directly with no post-processing
-
-To re-activate (not recommended in the current SCHP-only architecture):
-  1. Set ENABLE_FACE_RESTORATION=1
-  2. Import and call enhance_face() in run_inference() before upload
+The face is sourced from the original person image for identity preservation.
+Generated clothing pixels are never overwritten — only the face region is
+touched. Controlled by ENABLE_FACE_RESTORATION env var (default: 1).
 """
 
 from __future__ import annotations
@@ -54,11 +50,16 @@ def enhance_face(
             enhanced_image — the output with face region enhanced.
             meta_dict — keys: face_detected, restoration_time_ms, restoration_method.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "1":
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
     t0 = time.perf_counter()
+
+    # Ensure person_original matches result resolution so face bbox
+    # coordinates apply to both images.
+    if person_original is not None and person_original.size != result.size:
+        person_original = person_original.resize(result.size, Image.Resampling.LANCZOS)
 
     result_np = np.array(result.convert("RGB"))
 

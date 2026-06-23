@@ -47,7 +47,7 @@ _LABEL_RIGHT_SHOE = 19
 _CLOTHING_LABELS = {
     "upper_body": {_LABEL_UPPER_CLOTHES, _LABEL_COAT},
     "lower_body": {_LABEL_SOCKS, _LABEL_PANTS, _LABEL_SKIRT},
-    "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT, _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT},
+    "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT, _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
 }
 
 
@@ -105,6 +105,25 @@ def build_schp_protect_mask(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
     mask = cv2.dilate(mask, kernel, iterations=1)
     return mask
+
+
+def validate_mask_integrity(mask: np.ndarray, name: str = "mask") -> None:
+    """Validate mask is 2D, non-empty, binary-compatible, and non-trivial."""
+    if mask.ndim != 2:
+        raise ValueError(f"Mask '{name}': expected 2D, got {mask.ndim}D shape {mask.shape}")
+    h, w = mask.shape
+    if h < 10 or w < 10:
+        raise ValueError(f"Mask '{name}': degenerate shape {mask.shape}")
+    unique = set(int(v) for v in np.unique(mask))
+    allowed = [{0, 255}, {0, 1}, {0}, {255}]
+    if unique not in allowed:
+        raise ValueError(f"Mask '{name}': non-binary values {unique}")
+    nonzero = int(np.count_nonzero(mask > 127))
+    total = h * w
+    if nonzero == 0:
+        raise ValueError(f"Mask '{name}': completely empty — no editable pixels")
+    if nonzero == total:
+        raise ValueError(f"Mask '{name}': completely full — no protected pixels remain")
 
 
 def apply_protection_binary(inpaint_mask: np.ndarray, protect_mask: np.ndarray) -> np.ndarray:
@@ -167,7 +186,7 @@ def detect_inference_failures(
     inpaint_mask: Image.Image,
     protected: Image.Image | None = None,
     *,
-    identity_threshold: float = 28.0,
+    identity_threshold: float = 20.0,
 ) -> InferenceQualityReport:
     """
     Post-inference QA — triggers retry if identity drifted or garment unchanged.
@@ -185,18 +204,22 @@ def detect_inference_failures(
     reasons: list[str] = []
     h = orig.shape[0]
 
-    # Identity drift — use protected mask if available
+    # Identity drift — restrict to face/hair region (upper 30% of image)
+    # to avoid diluting the measurement with unchanged background or limbs.
+    face_zone_top = int(0.30 * h)
     if protected is not None:
         prot_arr = np.array(protected.convert("L"), dtype=np.uint8)
         if prot_arr.shape[:2] != orig.shape[:2]:
             prot_arr = np.array(protected.convert("L").resize(orig.shape[1::-1], Image.NEAREST), dtype=np.uint8)
-        prot_mask = prot_arr > 127
+        upper_mask = np.zeros_like(prot_arr, dtype=bool)
+        upper_mask[:face_zone_top, :] = True
+        prot_mask = (prot_arr > 127) & upper_mask
         if np.any(prot_mask):
             face_diff = float(np.mean(np.abs(orig[prot_mask] - out[prot_mask])))
         else:
-            face_diff = float(np.mean(np.abs(orig[:int(0.10 * h), :] - out[:int(0.10 * h), :])))
+            face_diff = float(np.mean(np.abs(orig[:face_zone_top, :] - out[:face_zone_top, :])))
     else:
-        face_diff = float(np.mean(np.abs(orig[:int(0.10 * h), :] - out[:int(0.10 * h), :])))
+        face_diff = float(np.mean(np.abs(orig[:face_zone_top, :] - out[:face_zone_top, :])))
     identity_drift = face_diff
     if identity_drift > identity_threshold:
         reasons.append(f"identity_drift:{identity_drift:.1f}")
