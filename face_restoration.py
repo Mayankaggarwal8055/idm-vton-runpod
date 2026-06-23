@@ -49,7 +49,7 @@ def enhance_face(
             enhanced_image — the output with face region enhanced.
             meta_dict — keys: face_detected, restoration_time_ms, restoration_method.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
@@ -156,9 +156,9 @@ def _detect_face_bbox_from_array(
         return None
 
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-    pad_x = int(fw * 0.28)        # ear coverage
-    pad_y_top = int(fh * 0.45)    # crown + hairline
-    pad_y_bottom = int(fh * 0.38) # neck buffer
+    pad_x = int(fw * 0.18)        # ear coverage
+    pad_y_top = int(fh * 0.40)    # crown + hairline
+    pad_y_bottom = int(fh * 0.25) # neck buffer
     return (
         max(0, fx - pad_x),
         max(0, fy - pad_y_top),
@@ -172,37 +172,14 @@ def _detect_face_bbox_from_array(
 
 def _apply_opencv_enhance(face_rgb: np.ndarray) -> np.ndarray:
     """
-    Enhance face region using OpenCV-only operations:
-      1. Denoise with non-local means (mild).
-      2. Unsharp mask for detail sharpening.
-      3. CLAHE on the L channel (Lab space) for local contrast.
-      4. Slight saturation boost.
-
-    All operations are intentionally conservative to avoid over-processing.
+    Mild enhancement — blur repair only, not identity reconstruction.
+    Avoids denoising (destroys skin texture), CLAHE (patchy contrast),
+    and saturation boost (painted look).  Just a subtle unsharp mask
+    to recover edge definition lost during diffusion.
     """
-    result = face_rgb.copy().astype(np.uint8)
-
-    # 1. Mild denoise
-    denoised = cv2.fastNlMeansDenoisingColored(result, None, h=6, hColor=6, templateWindowSize=7, searchWindowSize=21)
-
-    # 2. Unsharp mask
-    blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=1.0)
-    sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
-
-    # 3. CLAHE on L channel in Lab space
-    lab = cv2.cvtColor(sharpened, cv2.COLOR_RGB2Lab)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_enhanced = clahe.apply(l)
-    lab_enhanced = cv2.merge([l_enhanced, a, b])
-    contrast_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_Lab2RGB)
-
-    # 4. Very slight saturation boost
-    hsv = cv2.cvtColor(contrast_enhanced, cv2.COLOR_RGB2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.1, 0, 255)
-    saturated = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-    return saturated
+    blurred = cv2.GaussianBlur(face_rgb, (0, 0), sigmaX=0.8)
+    sharpened = cv2.addWeighted(face_rgb, 1.3, blurred, -0.3, 0)
+    return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
 # ── GFPGAN Integration (optional) ─────────────────────────────────────────
@@ -290,7 +267,7 @@ def _blend_face(
 
     # Create a feather mask: white center, Gaussian falloff at edges
     feather_mask = np.ones((fh, fw), dtype=np.float32)
-    feather_pixels = min(fh, fw) // 2  # ~50% feather border for invisible seam
+    feather_pixels = min(fh, fw) // 4  # ~25% feather border to prevent overlap with neck/chest
     if feather_pixels > 2:
         kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3)
         kernel_1d = kernel_1d[feather_pixels:-feather_pixels].flatten()

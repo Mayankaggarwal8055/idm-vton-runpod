@@ -1034,6 +1034,17 @@ def run_idm_vton_inference(
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
+        # Align masks to full-image coordinates so region freeze applies
+        # at the correct position. Without this, the TARGET_SIZE mask gets
+        # stretched to the full image size, misaligning with the pasted
+        # try-on area and restoring the garment back to original pixels.
+        for _mk in ("inpaint_mask_pil", "region_freeze_mask"):
+            _m = mask_meta.get(_mk)
+            if _m is not None:
+                _mr = _m.resize(crop_size, Image.NEAREST)
+                _mf = Image.new("L", human_img_orig.size, 0)
+                _mf.paste(_mr, (int(left), int(top)))
+                mask_meta[_mk] = _mf
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta
@@ -1582,7 +1593,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # Stage E: Face restoration (GFPGAN or OpenCV enhancement) — runs LAST
     # so it enhances the composited original face rather than the
     # diffusion-generated face that will be overwritten by Stage A.
-    if os.environ.get("ENABLE_FACE_RESTORATION", "1") == "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1":
         from face_restoration import enhance_face
         face_start = time.perf_counter()
         result, face_meta = enhance_face(
