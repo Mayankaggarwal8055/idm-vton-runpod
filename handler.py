@@ -774,9 +774,6 @@ def run_idm_vton_inference(
     # Build binary inpaint + protect masks from SCHP labels.
     keypoints = openpose_model(human_img.resize((384, 512)))
     model_parse, _ = parsing_model(human_img.resize((384, 512)))
-    automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
-    automasker_mask = automasker_mask.resize(TARGET_SIZE)
-
     # Build binary masks from SCHP labels
     schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
     if isinstance(model_parse, torch.Tensor):
@@ -789,7 +786,6 @@ def run_idm_vton_inference(
     protect_mask_np = build_schp_protect_mask(schp_np, cloth_type)
 
     # ── Contour-aware inpaint mask dilation ───────────────────────────
-    auto_np_pre = inpaint_mask_np.copy()
     if cloth_type in ("lower_body", "dresses", "full_body"):
         leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 29))
         inpaint_mask_np = cv2.dilate(inpaint_mask_np, leg_k, iterations=2)
@@ -797,15 +793,10 @@ def run_idm_vton_inference(
         mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 15))
         inpaint_mask_np = cv2.dilate(inpaint_mask_np, mild_k, iterations=1)
 
-    # ── Body boundary protection ─────────────────────────────────────
-    body_prot = _build_body_boundary_protection(model_parse, auto_np_pre, TARGET_SIZE)
-    if body_prot is not None:
-        protect_mask_np = np.maximum(protect_mask_np, body_prot).astype(np.uint8)
-
     # Binary protection — clip-subtract, no feathering
     final_mask_np = apply_protection_binary(inpaint_mask_np, protect_mask_np)
     assert_binary_mask(final_mask_np, "final_mask before inference")
-    final_mask = Image.fromarray(final_mask_np, mode="L")
+    final_mask = Image.fromarray(final_mask_np, mode="L").resize(TARGET_SIZE, Image.NEAREST)
 
     mask_meta: dict[str, object] = {
         "mask_type_used": "automasker",
@@ -971,69 +962,6 @@ def run_idm_vton_inference(
 # =============================================================================
 # Per-job
 # =============================================================================
-
-def _build_body_boundary_protection(
-    model_parse: torch.Tensor | np.ndarray,
-    garment_mask: np.ndarray | None,
-    target_size: tuple[int, int],
-) -> np.ndarray | None:
-    """Build body contour protection mask.
-
-    Protects the boundary between garment and visible body parts
-    (skin, face) so the diffusion model cannot change the body
-    silhouette. Garment-to-background boundaries are left open
-    for drawing space — this is where the model needs room to
-    render realistic folds, draping, and garment edges.
-
-    Uses SCHP model_parse to identify non-garment foreground
-    regions (face, arms, legs) that are adjacent to the garment.
-    These regions get a narrow protection band in the mask so
-    the diffusion model treats them as fixed context.
-    """
-    import cv2
-    from PIL import Image
-
-    if isinstance(model_parse, torch.Tensor):
-        parse = model_parse.cpu().numpy()
-        if parse.ndim == 3:
-            parse = parse.squeeze(0)
-    else:
-        parse = np.array(model_parse)
-
-    # Garment mask from automasker (pre-dilation) — tells us
-    # what the model identified as the garment region.
-    # Must be resized to model_parse resolution for pixel-wise ops.
-    h, w = parse.shape  # typically (384, 512)
-    if garment_mask is not None:
-        garment_pil = Image.fromarray(
-            (garment_mask > 127).astype(np.uint8) * 255, mode="L",
-        ).resize((w, h), Image.NEAREST)
-        garment_bin = (np.array(garment_pil) > 127).astype(np.uint8)
-    else:
-        # LIP garment classes: upper-clothes(5), dress(6), coat(7),
-        # pants(9), jumpsuits(10), skirt(12)
-        garment_bin = np.isin(parse, [5, 6, 7, 9, 10, 12]).astype(np.uint8)
-
-    foreground = (parse > 0).astype(np.uint8)
-    body = foreground - garment_bin  # non-garment foreground
-    body = np.clip(body, 0, 1).astype(np.uint8)
-
-    if body.sum() < 50:
-        return None
-
-    kernel = np.ones((5, 5), dtype=np.uint8)
-    garment_border = cv2.dilate(garment_bin, kernel, iterations=2)
-    body_near_garment = garment_border & body
-
-    if body_near_garment.sum() < 20:
-        return None
-
-    band = cv2.dilate(body_near_garment.astype(np.uint8), kernel, iterations=1)
-    band = (band * 255).astype(np.uint8)
-
-    band_pil = Image.fromarray(band, mode="L").resize(target_size, Image.NEAREST)
-    return np.array(band_pil, dtype=np.uint8)
-
 
 def _validate_person_quality(
     person_img: Image.Image,
