@@ -51,16 +51,16 @@ def apply_face_composite(
         mask_pil = protected_mask.convert("L").resize(result.size, Image.NEAREST)
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    # Dilate with same kernel/iterations as apply_protected_mask (3x9)
+    # Dilate with same kernel/iterations as apply_protected_mask (2x9)
     # so the composite zone exactly matches the protected zone.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask_dilated = cv2.dilate(mask_np, kernel, iterations=3)
+    mask_dilated = cv2.dilate(mask_np, kernel, iterations=2)
 
-    # Distance-transform feather matching mask_pipeline.py (DT/40).
-    # Linear falloff over 40px creates a smooth, seam-free transition.
+    # Distance-transform feather matching mask_pipeline.py (DT/30).
+    # Linear falloff over 30px — reduced from 40px to shrink restoration band.
     prot_binary = (mask_dilated > 127).astype(np.uint8)
     dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
-    feather = np.clip(dist.astype(np.float32) / 40.0, 0, 1)
+    feather = np.clip(dist.astype(np.float32) / 30.0, 0, 1)
     feather_3d = np.stack([feather] * 3, axis=-1)
 
     # Blend: original person where mask is high, result where mask is low
@@ -215,10 +215,10 @@ def apply_skin_tone_correction(
 
     # Feather the mask edges for seamless blend
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask_dilated = cv2.dilate(mask, kernel, iterations=3)
+    mask_dilated = cv2.dilate(mask, kernel, iterations=2)
     prot_binary = (mask_dilated > 127).astype(np.uint8)
     dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
-    feather = np.clip(dist.astype(np.float32) / 40.0, 0, 1)
+    feather = np.clip(dist.astype(np.float32) / 30.0, 0, 1)
     feather_3d = np.stack([feather] * 3, axis=-1)
 
     # Correct only within the feathered mask region

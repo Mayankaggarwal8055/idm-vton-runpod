@@ -1412,9 +1412,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         quality_report = best["qa_report"]
         best_agg = best["agg"]
 
-        # Extract region_freeze_mask cleanly before it leaks to serialisation
-        _region_freeze_mask = mask_meta.pop("region_freeze_mask", None)
-        mask_meta.pop("inpaint_mask_pil", None)
+        # Extract the pre-protection inpaint mask for region freeze.
+        # Using the post-protection feathered mask caused the ~15px feather
+        # gradient below <128 to be restored as original pixels, eating into
+        # the garment edge.  The feathered mask stays for diffusion; region
+        # freeze uses the pre-protection binary mask instead.
+        _rf_inpaint_mask = mask_meta.pop("inpaint_mask_pil", None)
+        mask_meta.pop("region_freeze_mask", None)
 
         last_inpaint_mask = external_mask if strategy == "external" else None
 
@@ -1569,7 +1573,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # copied from the original person image. Background, face, hair, hands,
     # and body silhouette are all preserved exactly as the original photo.
     rf_start = time.perf_counter()
-    rf_mask = _region_freeze_mask if _region_freeze_mask is not None else (last_inpaint_mask if last_inpaint_mask is not None else external_mask)
+    rf_mask = _rf_inpaint_mask if _rf_inpaint_mask is not None else (last_inpaint_mask if last_inpaint_mask is not None else external_mask)
     if rf_mask is not None:
         result = apply_region_freeze(result, person_img, rf_mask)
     rf_ms = (time.perf_counter() - rf_start) * 1000
