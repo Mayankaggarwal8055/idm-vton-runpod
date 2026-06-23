@@ -341,18 +341,20 @@ print(f"mask_pipeline.py exists at {_mp} ({os.path.getsize(_mp)} bytes)")
 
 try:
     from mask_pipeline import (
-        WorkerMaskStrategy,
-        apply_protected_mask,
-        fuse_hybrid_mask,
+        assert_binary_mask,
+        build_schp_inpaint_mask,
+        build_schp_protect_mask,
+        apply_protection_binary,
+        validate_mask_coverage,
         detect_inference_failures,
-        select_worker_mask_strategy,
     )
     print("import mask_pipeline OK")
-    print(f"  WorkerMaskStrategy: {list(WorkerMaskStrategy)}")
-    print(f"  apply_protected_mask: {callable(apply_protected_mask)}")
-    print(f"  fuse_hybrid_mask: {callable(fuse_hybrid_mask)}")
+    print(f"  assert_binary_mask: {callable(assert_binary_mask)}")
+    print(f"  build_schp_inpaint_mask: {callable(build_schp_inpaint_mask)}")
+    print(f"  build_schp_protect_mask: {callable(build_schp_protect_mask)}")
+    print(f"  apply_protection_binary: {callable(apply_protection_binary)}")
+    print(f"  validate_mask_coverage: {callable(validate_mask_coverage)}")
     print(f"  detect_inference_failures: {callable(detect_inference_failures)}")
-    print(f"  select_worker_mask_strategy: {callable(select_worker_mask_strategy)}")
 except Exception as exc:
     raise RuntimeError(f"Failed to import mask_pipeline: {exc}") from exc
 
