@@ -1,15 +1,17 @@
 """
-Face Restoration for TryLix — optional post-processing step on the GPU worker.
+Face Restoration — DEPRECATED / INACTIVE in the active try-on pipeline.
 
-Applies face enhancement to the output image AFTER diffusion inference and
-BEFORE Cloudinary upload. Only the face region is modified; the rest of the
-image passes through unchanged.
+This file is NOT imported or called by handler.py or any active module.
+It exists only as a preserved utility for potential future use.
 
-Two tiers:
-  1. (Preferred) GFPGAN / CodeFormer — loaded on first use, cached per worker.
-  2. (Fallback) OpenCV pipeline — always available, no additional deps.
+Status:
+  - handler.py does not import or call enhance_face()
+  - run_inference() does not call enhance_face()
+  - The model output is uploaded directly with no post-processing
 
-Controlled by env var:  ENABLE_FACE_RESTORATION=1  (default: 0 = disabled)
+To re-activate (not recommended in the current SCHP-only architecture):
+  1. Set ENABLE_FACE_RESTORATION=1
+  2. Import and call enhance_face() in run_inference() before upload
 """
 
 from __future__ import annotations
@@ -38,6 +40,9 @@ def enhance_face(
 ) -> tuple[Image.Image, dict[str, object]]:
     """
     Detect face in the result image and apply enhancement.
+
+    NOTE: This function is DEPRECATED and not called from the active pipeline.
+    handler.py does not import or invoke it. The model output is the final image.
 
     Args:
         result: The output image from diffusion (to be enhanced).

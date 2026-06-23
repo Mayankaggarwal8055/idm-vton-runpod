@@ -81,13 +81,13 @@ MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
 CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
 CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
 
-# Post-processing feature flags
-#   ENABLE_FACE_RESTORATION=1   — GFPGAN or OpenCV face enhancement
-#   ENABLE_FACE_COMPOSITE=1     — composite original face/accessories back (default: on)
-#   ENABLE_SEAMLESS_CLONE=1     — Poisson edge blending on garment boundary (default: off)
-#   ENABLE_SKIN_TONE_CORRECTION=1 — per-channel skin color correction (default: off)
-#   ENABLE_DEBUG_IMAGES=1       — save 5-stage debug images to /tmp/trylix_debug/
-# All are read at runtime (not startup), so they can be toggled per-job via env injection.
+# Post-processing — ALL REMOVED from active pipeline.
+#   face_restoration.py         — exists as file but is NOT imported or called.
+#   post_processing.py          — placeholder docstring only, all functions removed.
+#   None of: face composite, skin tone correction, region freeze, seamless clone,
+#   feather-mask restore, or original-pixel overwrite — exist in the active handler.
+# The model output is the final image. Identity preservation happens via SCHP
+# binary mask protection at inference time, never via post-inference restore.
 
 # Concurrency — single GPU SDXL typically needs ~16-20 GB VRAM.
 # On a 24 GB card keep max_workers=1; set to 2+ only if the GPU
@@ -685,10 +685,6 @@ def run_idm_vton_inference(
     steps: int = 30,
     seed: int = 42,
     auto_crop: bool = True,
-    external_mask: Image.Image | None = None,
-    protected_mask: Image.Image | None = None,
-    mask_strategy: str = "external",
-    mask_quality_score: float | None = None,
     guidance_scale: float | None = None,
     crop_preserve_lower: bool = True,
 ) -> tuple[Image.Image, dict[str, object]]:
@@ -706,11 +702,12 @@ def run_idm_vton_inference(
         pipe.unet_encoder.to(device)
 
     from mask_pipeline import (
-        WorkerMaskStrategy,
-        apply_protected_mask,
-        fuse_hybrid_mask,
-        select_worker_mask_strategy,
+        build_schp_inpaint_mask,
+        build_schp_protect_mask,
+        apply_protection_binary,
+        assert_binary_mask,
         validate_mask_coverage,
+        detect_inference_failures,
     )
 
     # Preserve garment aspect ratio — only pad to target, never stretch
@@ -773,123 +770,53 @@ def run_idm_vton_inference(
     else:
         human_img = human_img_orig.resize(TARGET_SIZE)
 
-    # Align protected_mask with auto-crop — the mask was computed from the
-    # full-image resize, but the inference image was cropped then resized.
-    # Without alignment, face protection is applied at wrong coordinates,
-    # exposing face boundary pixels to diffusion modification.
-    if auto_crop and crop_size is not None and protected_mask is not None:
-        t_left = int(left * TARGET_W / width)
-        t_top = int(top * TARGET_H / height)
-        t_right = int(right * TARGET_W / width)
-        t_bottom = int(bottom * TARGET_H / height)
-        prot_cropped = protected_mask.crop((t_left, t_top, t_right, t_bottom))
-        protected_mask = prot_cropped.resize(TARGET_SIZE, Image.NEAREST)
-
-    # Always compute AutoMasker mask (SCHP + OpenPose) for routing / hybrid
+    # SCHP is the single authoritative mask source.
+    # Build binary inpaint + protect masks from SCHP labels.
     keypoints = openpose_model(human_img.resize((384, 512)))
     model_parse, _ = parsing_model(human_img.resize((384, 512)))
     automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
     automasker_mask = automasker_mask.resize(TARGET_SIZE)
 
-    # ── Contour-aware AutoMasker enlargement ──────────────────────────
-    # Standard uniform dilation expands the mask in ALL directions equally,
-    # causing the inpaint area to bleed into background AND immovable body
-    # regions (shoulder, chest, torso outline). This makes the model
-    # regenerate the body silhouette and background — the opposite of try-on.
-    #
-    # Contour-aware dilation uses anisotropic kernels:
-    #   lower_body/dresses: VERTICAL ellipse (19×29) — leg room downward
-    #   upper_body:         HORIZONTAL ellipse (25×15) — shoulder room sideways
-    #
-    # Dilation iterations reduced from 3→2 (lower) and 2→1 (upper) to
-    # prevent the mask from swallowing the background. Combined with
-    # edge-reflect padding (image.py) and body-boundary protection
-    # (build_protected_region_mask), this keeps the mask near the garment
-    # contour while giving just enough drawing space for realistic draping.
-    auto_np = np.array(automasker_mask, dtype=np.uint8)
-    auto_np_pre = auto_np.copy()  # pre-dilation copy for body boundary detection
-    if cloth_type in ("lower_body", "dresses", "full_body"):
-        h_auto = auto_np.shape[0]
-        lower_zone = auto_np[h_auto * 3 // 5:, :]
-        leg_cov = float(np.mean(lower_zone > 127))
-        # Vertical ellipse: dilate downward for leg length, minimal sideways
-        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 29))
-        auto_np = cv2.dilate(auto_np, leg_k, iterations=2)
-        logger.info(
-            "automasker_boost lower_body leg_coverage=%.2f kernel=19x29 iterations=2",
-            leg_cov,
-        )
-    else:
-        cov = float(np.mean(auto_np > 127))
-        # Horizontal ellipse: dilate sideways for shoulder width, minimal downward
-        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 15))
-        auto_np = cv2.dilate(auto_np, mild_k, iterations=1)
-        logger.info(
-            "automasker_boost upper_body coverage=%.2f kernel=25x15 iterations=1",
-            cov,
-        )
-    automasker_mask = Image.fromarray(auto_np, mode="L")
+    # Build binary masks from SCHP labels
+    schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
+    if isinstance(model_parse, torch.Tensor):
+        schp_np = model_parse.cpu().numpy()
+    if schp_np.ndim == 3:
+        schp_np = schp_np.squeeze(0)
+    schp_np = schp_np.astype(np.uint8)
 
-    min_quality = float(os.environ.get("MASK_MIN_QUALITY_SCORE", "62.0"))
-    strategy = select_worker_mask_strategy(
-        external_mask,
-        mask_quality_score,
-        min_quality=min_quality,
-    )
-    if mask_strategy == "automasker":
-        strategy = WorkerMaskStrategy.AUTOMASKER
-    elif mask_strategy == "hybrid":
-        strategy = WorkerMaskStrategy.HYBRID
+    inpaint_mask_np = build_schp_inpaint_mask(schp_np, cloth_type)
+    protect_mask_np = build_schp_protect_mask(schp_np, cloth_type)
+
+    # ── Contour-aware inpaint mask dilation ───────────────────────────
+    auto_np_pre = inpaint_mask_np.copy()
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 29))
+        inpaint_mask_np = cv2.dilate(inpaint_mask_np, leg_k, iterations=2)
+    else:
+        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 15))
+        inpaint_mask_np = cv2.dilate(inpaint_mask_np, mild_k, iterations=1)
+
+    # ── Body boundary protection ─────────────────────────────────────
+    body_prot = _build_body_boundary_protection(model_parse, auto_np_pre, TARGET_SIZE)
+    if body_prot is not None:
+        protect_mask_np = np.maximum(protect_mask_np, body_prot).astype(np.uint8)
+
+    # Binary protection — clip-subtract, no feathering
+    final_mask_np = apply_protection_binary(inpaint_mask_np, protect_mask_np)
+    assert_binary_mask(final_mask_np, "final_mask before inference")
+    final_mask = Image.fromarray(final_mask_np, mode="L")
 
     mask_meta: dict[str, object] = {
-        "mask_type_used": strategy.value,
-        "mask_quality_score": mask_quality_score,
+        "mask_type_used": "automasker",
+        "coverage_valid": None,
+        "coverage_percent": None,
     }
 
-    if strategy == WorkerMaskStrategy.EXTERNAL and external_mask is not None:
-        mask = external_mask.convert("L").resize(TARGET_SIZE)
-    elif strategy == WorkerMaskStrategy.HYBRID:
-        mask = fuse_hybrid_mask(external_mask, automasker_mask, cloth_type)
-        mask_meta["mask_type_used"] = "hybrid"
-    else:
-        mask = automasker_mask
-        mask_meta["mask_type_used"] = "automasker"
-
-    # Snapshot the pre-protection mask so the outer retry loop can use
-    # it for multi-candidate quality scoring (texture / artifact analysis).
-    mask_meta["inpaint_mask_pil"] = mask.copy()
-
-    # ── Body boundary protection ───────────────────────────────────────
-    # Locks the body contour (skin/face near garment edge) so the
-    # diffusion model cannot change body silhouette. Computed from the
-    # pre-dilation automasker mask + SCHP model_parse. Only protects
-    # the garment-to-skin interface, NOT the garment-to-background
-    # boundary (which stays open for drawing space).
-    body_prot = _build_body_boundary_protection(
-        model_parse, auto_np_pre, TARGET_SIZE,
-    )
-    if body_prot is not None:
-        if protected_mask is None:
-            protected_mask = Image.fromarray(body_prot, mode="L")
-            logger.info("body_boundary_protection applied (new mask) band_size=~15px")
-        else:
-            prot_np = np.array(protected_mask.convert("L"), dtype=np.uint8)
-            prot_np = np.maximum(prot_np, body_prot).astype(np.uint8)
-            protected_mask = Image.fromarray(prot_np, mode="L")
-            logger.info("body_boundary_protection merged into existing protected_mask")
-
-    mask = apply_protected_mask(mask, protected_mask)
-    mask_meta["region_freeze_mask"] = mask.copy()
-    logger.info(
-        "mask_selected strategy=%s mask_size=%s quality_score=%s",
-        mask_meta["mask_type_used"],
-        mask.size,
-        mask_quality_score,
-    )
-
     # ── Pre-inference mask validation ──────────────────────────────────
-    # Catch pathological masks before they waste ~8s of GPU inference.
-    mask_v = validate_mask_coverage(mask, cloth_type, protected_mask=protected_mask)
+    mask_v = validate_mask_coverage(final_mask, cloth_type)
+    mask_meta["coverage_valid"] = mask_v["valid"]
+    mask_meta["coverage_percent"] = mask_v["coverage_percent"]
     logger.info(
         "mask_coverage coverage=%.1f%% valid=%s cloth_type=%s",
         mask_v["coverage_percent"], mask_v["valid"], cloth_type,
@@ -899,6 +826,8 @@ def run_idm_vton_inference(
             "pre_inference_mask_invalid reason=%s coverage=%.1f%% cloth_type=%s",
             mask_v["reason"], mask_v["coverage_percent"], cloth_type,
         )
+
+    mask = final_mask
 
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
@@ -1034,17 +963,6 @@ def run_idm_vton_inference(
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
-        # Align masks to full-image coordinates so region freeze applies
-        # at the correct position. Without this, the TARGET_SIZE mask gets
-        # stretched to the full image size, misaligning with the pasted
-        # try-on area and restoring the garment back to original pixels.
-        for _mk in ("inpaint_mask_pil", "region_freeze_mask"):
-            _m = mask_meta.get(_mk)
-            if _m is not None:
-                _mr = _m.resize(crop_size, Image.NEAREST)
-                _mf = Image.new("L", human_img_orig.size, 0)
-                _mf.paste(_mr, (int(left), int(top)))
-                mask_meta[_mk] = _mf
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta
@@ -1138,8 +1056,10 @@ def _validate_person_quality(
 
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     from mask_pipeline import (
-        WorkerMaskStrategy,
-        compute_aggregate_quality_score,
+        build_schp_inpaint_mask,
+        build_schp_protect_mask,
+        apply_protection_binary,
+        validate_mask_coverage,
         detect_inference_failures,
     )
 
@@ -1147,17 +1067,11 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     person_url = job_input.get("person_image_url") or job_input.get("person_image")
     garment_url = job_input.get("garment_image_url") or job_input.get("garment_image")
-    mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
-    protected_ref = job_input.get("protected_mask") or job_input.get("protected_mask_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     garment_subtype = job_input.get("garment_subtype") or ""
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
-    mask_quality_score = job_input.get("mask_quality_score")
-    if mask_quality_score is not None:
-        mask_quality_score = float(mask_quality_score)
-    mask_strategy_hint = str(job_input.get("mask_strategy", "auto"))
     trace_id = job_input.get("trace_id", "")
     # Forward preprocessing warnings through the output so the frontend
     # can display them to the user (body completeness, face, etc.)
@@ -1207,31 +1121,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     logger.info("person_image_quality_ok size=%s std=%.2f", person_img.size,
                 float(np.std(np.array(person_img.convert("L"), dtype=np.float32))))
 
-    external_mask = None
-    if mask_image_ref:
-        try:
-            external_mask_img = load_image_reference(str(mask_image_ref))
-            external_mask = external_mask_img.convert("L").resize(TARGET_SIZE)
-            logger.info(
-                "external_mask_loaded source=%s mask_size=%s quality_score=%s",
-                "url" if _is_url_reference(str(mask_image_ref)) else "base64",
-                external_mask.size,
-                mask_quality_score,
-            )
-        except Exception as exc:
-            logger.warning(
-                "external_mask_load_failed error=%s falling_back_to_automasker",
-                exc,
-            )
-
-    protected_mask = None
-    if protected_ref:
-        try:
-            protected_mask = load_image_reference(str(protected_ref)).convert("L")
-            logger.info("protected_mask_loaded size=%s", protected_mask.size)
-        except Exception as exc:
-            logger.warning("protected_mask_load_failed error=%s", exc)
-
     download_ms = (time.perf_counter() - download_start) * 1000
 
     # ── Garment foreground area check ──────────────────────────────────
@@ -1277,20 +1166,10 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         garm_w, garm_h, garm_aspect, target_aspect, vton_type, trace_id,
     )
 
-    # Retry strategies — mask_strategy_hint overrides the first attempt
-    retry_strategies: list[str] = []
-    if mask_strategy_hint == "hybrid" and external_mask:
-        retry_strategies = ["hybrid", "automasker"]
-    elif mask_strategy_hint == "automasker":
-        retry_strategies = ["automasker"]
-    else:
-        if external_mask:
-            retry_strategies.append("external")
-        retry_strategies.append("automasker")
-        if external_mask:
-            retry_strategies.append("hybrid")
-    if not retry_enabled:
-        retry_strategies = retry_strategies[:1]
+    # SCHP is the single authoritative mask source.
+    # No external/CPU masks. No hybrid fusion. No rembg.
+    # All masks are binary (0 or 255) enforced by assert_binary_mask().
+    retry_strategies: list[str] = ["automasker"]
 
     inference_start = time.perf_counter()
     result: Image.Image | None = None
@@ -1298,12 +1177,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     quality_report = None
     retry_count = 0
     failure_reasons: list[str] = []
-    last_inpaint_mask = external_mask
 
     # Dark garment handling — per-channel guidance adjustment.
-    # Dark garments (mean < 80) need HIGHER guidance so the model
-    # preserves their color against the diffusion prior's tendency
-    # toward mid-gray. Low guidance on dark garments washes them out.
     effective_guidance = GUIDANCE_SCALE
     if garm_mean_all < 80.0:
         effective_guidance = GUIDANCE_SCALE * 1.15
@@ -1316,331 +1191,72 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
         retry_count = attempt_idx
-        crop_preserve = True
 
-        # ── Multi-candidate generation ──────────────────────────────────
-        # On the first attempt, generate N candidates with different seeds
-        # and pick the one with the best aggregate quality score.  Retry
-        # attempts use a single candidate to minimise cost.
-        num_candidates = max(1, MULTI_CANDIDATE_COUNT) if attempt_idx == 0 else 1
+        result, raw_output, mask_meta = run_idm_vton_inference(
+            person_img=person_img,
+            garment_img=garment_img,
+            garment_desc=garment_desc,
+            garment_subtype=garment_subtype,
+            cloth_type=vton_type,
+            steps=steps,
+            seed=seed + attempt_idx * 1000,
+            auto_crop=True,
+            guidance_scale=effective_guidance,
+            crop_preserve_lower=True,
+        )
 
-        candidates: list[dict] = []
-        for c in range(num_candidates):
-            c_seed = seed + c * 1000 + attempt_idx
-
-            # ── Per-candidate guidance scale ────────────────────────────
-            # Vary guidance across candidates to explore the adherence-vs-creativity
-            # trade-off. Lower guidance = more natural wrinkles, folds, shadows.
-            # Higher guidance = sharper edges, better color adherence.
-            # 4-candidate spread: (0.90, 0.97, 1.03, 1.10) for wider diversity.
-            if num_candidates > 1 and CANDIDATE_GUIDANCE_VARY:
-                if num_candidates == 4:
-                    gmult = (0.90, 0.97, 1.03, 1.10)[c]
-                elif num_candidates == 3:
-                    gmult = (0.93, 1.0, 1.07)[c]
-                elif num_candidates == 2:
-                    gmult = (0.93, 1.07)[c]
-                else:
-                    gmult = 1.0
-                c_guidance = effective_guidance * gmult
-            else:
-                c_guidance = effective_guidance
-
-            # ── Per-candidate denoising steps ───────────────────────────
-            # Vary steps to give the scoring system a choice between
-            # faster/coarser and slower/finer outputs. More steps = more
-            # detail in wrinkles, folds, fabric texture.
-            if num_candidates > 1 and CANDIDATE_STEPS_VARY:
-                if num_candidates == 4:
-                    sdel = (-8, -3, 3, 8)[c]
-                elif num_candidates == 3:
-                    sdel = (-5, 0, 5)[c]
-                elif num_candidates == 2:
-                    sdel = (-5, 5)[c]
-                else:
-                    sdel = 0
-                c_steps = max(25, min(60, steps + sdel))
-            else:
-                c_steps = steps
-
-            c_result, c_raw, c_meta = run_idm_vton_inference(
-                person_img=person_img,
-                garment_img=garment_img,
-                garment_desc=garment_desc,
-                garment_subtype=garment_subtype,
-                cloth_type=vton_type,
-                steps=c_steps,
-                seed=c_seed,
-                auto_crop=True,
-                external_mask=external_mask,
-                protected_mask=protected_mask,
-                mask_strategy=strategy,
-                mask_quality_score=mask_quality_score,
-                guidance_scale=c_guidance,
-                crop_preserve_lower=crop_preserve,
+        # Build binary masks from SCHP for validation
+        schp_labels = mask_meta.get("schp_labels")
+        if schp_labels is not None:
+            inpaint_mask = build_schp_inpaint_mask(schp_labels, vton_type)
+            protect_mask = build_schp_protect_mask(schp_labels, vton_type)
+            final_mask = apply_protection_binary(inpaint_mask, protect_mask)
+            coverage = validate_mask_coverage(
+                Image.fromarray(final_mask, mode="L"), vton_type
             )
+            mask_meta["coverage_valid"] = coverage.get("valid")
+            mask_meta["coverage_percent"] = coverage.get("coverage_percent")
 
-            c_inpaint = c_meta.get("inpaint_mask_pil") or external_mask
-            if c_inpaint is not None:
-                c_qa_report = detect_inference_failures(
-                    person_img.resize(TARGET_SIZE),
-                    c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
-                    c_inpaint,
-                    protected_mask,
-                    garment_ref=garment_img,
-                )
-                c_agg = compute_aggregate_quality_score(
-                    c_qa_report,
-                    c_result,
-                    c_inpaint,
-                    garment_img,
-                )
-            else:
-                c_qa_report = None
-                c_agg = {"aggregate_score": 50.0}
-
-            candidates.append({
-                "agg_score": c_agg["aggregate_score"],
-                "result": c_result,
-                "raw_output": c_raw,
-                "meta": c_meta,
-                "seed": c_seed,
-                "steps": c_steps,
-                "guidance": c_guidance,
-                "qa_report": c_qa_report,
-                "agg": c_agg,
-            })
-
-        # Select the best candidate
-        candidates.sort(key=lambda x: x["agg_score"], reverse=True)
-        best = candidates[0]
-        result = best["result"]
-        raw_output = best["raw_output"]
-        mask_meta = best["meta"]
-        best_seed = best["seed"]
-        best_steps: int = best["steps"]
-        best_guidance: float = best["guidance"]
-        quality_report = best["qa_report"]
-        best_agg = best["agg"]
-
-        # Extract the pre-protection inpaint mask for region freeze.
-        # Using the post-protection feathered mask caused the ~15px feather
-        # gradient below <128 to be restored as original pixels, eating into
-        # the garment edge.  The feathered mask stays for diffusion; region
-        # freeze uses the pre-protection binary mask instead.
-        _rf_inpaint_mask = mask_meta.pop("inpaint_mask_pil", None)
-        mask_meta.pop("region_freeze_mask", None)
-
-        last_inpaint_mask = external_mask if strategy == "external" else None
+        quality_report = detect_inference_failures(
+            person_img.resize(TARGET_SIZE),
+            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+            Image.fromarray(final_mask, mode="L") if schp_labels is not None else Image.new("L", TARGET_SIZE, 0),
+            Image.fromarray(protect_mask, mode="L") if schp_labels is not None else None,
+        )
 
         logger.info(
-            "attempt_%d strategy=%s candidates=%d best_seed=%d "
-            "best_guidance=%.3f best_steps=%d "
-            "aggregate=%.1f identity=%.1f color=%.1f texture=%.1f artifact=%.1f "
-            "trace_id=%s",
-            attempt_idx, strategy, num_candidates, best_seed,
-            best_guidance, best_steps,
-            best_agg.get("aggregate_score", -1),
-            best_agg.get("identity_score", -1),
-            best_agg.get("color_fidelity_score", -1),
-            best_agg.get("texture_score", -1),
-            best_agg.get("artifact_score", -1),
+            "attempt_%d strategy=%s identity_drift=%.1f trace_id=%s",
+            attempt_idx, strategy,
+            quality_report.identity_drift_score if quality_report else -1,
             trace_id,
         )
 
-        if attempt_idx == 0 and num_candidates > 1:
-            spread = best_agg.get("aggregate_score", 0) - candidates[-1]["agg_score"]
-            params = ", ".join(
-                f"c{i}:s={c['seed']},g={c.get('guidance', 0):.2f},st={c.get('steps', 0)}"
-                for i, c in enumerate(candidates)
-            )
-            logger.info(
-                "multi_candidate_summary candidates=%d best=%.1f worst=%.1f "
-                "spread=%.1f params=[%s]",
-                num_candidates,
-                best_agg.get("aggregate_score", -1),
-                candidates[-1]["agg_score"],
-                spread,
-                params,
-            )
-
-        # ── Retry decision (same logic as before) ──────────────────────
         if not retry_enabled or attempt_idx >= len(retry_strategies) - 1:
             break
 
-        inpaint_for_qa = external_mask if strategy == "external" else None
-        if inpaint_for_qa is None:
+        if quality_report is not None and quality_report.passed:
             break
 
-        if quality_report is None:
-            quality_report = detect_inference_failures(
-                person_img.resize(TARGET_SIZE),
-                result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-                inpaint_for_qa,
-                protected_mask,
-                garment_ref=garment_img,
-            )
-
-        color_passed = True
-        if quality_report.color_fidelity_score < 50.0:
-            color_passed = False
-            logger.warning(
-                "color_fidelity_low attempt=%s score=%.1f garm_mean=%.1f retrying",
-                attempt_idx, quality_report.color_fidelity_score, garm_mean_all,
-            )
-
-        if quality_report.passed and color_passed:
-            break
-
-        failure_reasons = list(quality_report.failure_reasons)
-        if not color_passed:
-            failure_reasons.append(f"color_fidelity:{quality_report.color_fidelity_score:.0f}")
+        failure_reasons = list(quality_report.failure_reasons) if quality_report else []
         logger.warning(
             "inference_qa_failed attempt=%s strategy=%s reasons=%s retrying",
-            attempt_idx,
-            strategy,
-            failure_reasons,
+            attempt_idx, strategy, failure_reasons,
         )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
-    # ── Color fidelity: computed via detect_inference_failures with garment_ref ──
-    # CRITICAL: We pass garment_img as garment_ref so the metric compares the
-    #           SOURCE GARMENT against the OUTPUT, not the original person's
-    #           clothing against the output (which would be backwards).
-    result_color_fidelity = quality_report.color_fidelity_score if quality_report else None
-    result_color_drift = quality_report.color_drift_mean_rgb if quality_report else None
-    if result_color_fidelity is None and result is not None and external_mask is not None:
-        qa = detect_inference_failures(
-            person_img.resize(TARGET_SIZE),
-            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-            external_mask,
-            protected_mask,
-            garment_ref=garment_img,
-        )
-        result_color_fidelity = qa.color_fidelity_score
-        result_color_drift = qa.color_drift_mean_rgb
-
-    # ── Post-processing pipeline ────────────────────────────────────────
-    # Each stage is independently disableable and logs its own timing.
-    from post_processing import (
-        apply_face_composite,
-        apply_region_freeze,
-        apply_seamless_clone,
-        apply_skin_tone_correction,
+    # ── No post-processing — model output is final ───────────────────────
+    # Face restoration: DISABLED (face_restoration.py is not imported or called).
+    # Post-processing (composite, skin tone, region freeze, seamless clone): REMOVED.
+    # The SCHP-only binary mask pipeline ensures identity preservation at
+    # inference time. No original-pixel overwrite occurs after inference.
+    logger.info(
+        "post_inference_restore: none (all disabled/removed) "
+        "face_restoration=disabled trace_id=%s",
+        trace_id,
     )
-    pp_meta: dict[str, object] = {}
-
-    face_meta: dict[str, object] = {}
-
-    # ── Face bbox detection for skin-tone correction ───────────────────
-    import cv2
-    # Detect face bounding box from the ORIGINAL person image so that
-    # skin-tone correction samples from the actual face region (which was
-    # composited from the original), not the diffusion-modified neck area.
-    # When face_bbox is provided, gain ≈ 1.0 (face matches original),
-    # correction is skipped, and face color is preserved intact.
-    person_cv = cv2.cvtColor(np.array(person_img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    face_cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-    face_cascade = cv2.CascadeClassifier(face_cascade_path)
-    if not face_cascade.empty():
-        gray = cv2.cvtColor(person_cv, cv2.COLOR_BGR2GRAY)
-        h_i, w_i = gray.shape
-        min_dim = max(30, int(min(w_i, h_i) * 0.04))
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(min_dim, min_dim))
-        if len(faces) > 0:
-            (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-            face_bbox = (fx, fy, fx + fw, fy + fh)
-            logger.info("skin_tone_face_bbox_detected bbox=(%d,%d,%d,%d)", fx, fy, fx + fw, fy + fh)
-        else:
-            face_bbox = None
-    else:
-        face_bbox = None
-
-    # Stage A: Face composite — preserve original face/accessory pixels
-    fc_start = time.perf_counter()
-    result = apply_face_composite(result, person_img, protected_mask)
-    fc_ms = (time.perf_counter() - fc_start) * 1000
-    pp_meta["face_composite_ms"] = round(fc_ms, 1)
-
-    # Stage B: Seamless clone — Poisson edge blending
-    sc_start = time.perf_counter()
-    seam_mask = last_inpaint_mask if last_inpaint_mask is not None else external_mask
-    if seam_mask is not None:
-        result = apply_seamless_clone(result, person_img, seam_mask)
-    sc_ms = (time.perf_counter() - sc_start) * 1000
-    pp_meta["seamless_clone_ms"] = round(sc_ms, 1)
-
-    # Stage C: Skin tone correction
-    st_start = time.perf_counter()
-    result = apply_skin_tone_correction(result, person_img, face_bbox=face_bbox)
-    st_ms = (time.perf_counter() - st_start) * 1000
-    pp_meta["skin_tone_ms"] = round(st_ms, 1)
-
-    # Stage D: Region freezing — restore ALL original pixels outside inpaint mask
-    # This is the final safety net: every pixel not in the inpaint mask is
-    # copied from the original person image. Background, face, hair, hands,
-    # and body silhouette are all preserved exactly as the original photo.
-    rf_start = time.perf_counter()
-    rf_mask = _rf_inpaint_mask if _rf_inpaint_mask is not None else (last_inpaint_mask if last_inpaint_mask is not None else external_mask)
-    if rf_mask is not None:
-        result = apply_region_freeze(result, person_img, rf_mask)
-    rf_ms = (time.perf_counter() - rf_start) * 1000
-    pp_meta["region_freeze_ms"] = round(rf_ms, 1)
-
-    # Stage E: Face restoration (GFPGAN or OpenCV enhancement) — runs LAST
-    # so it enhances the composited original face rather than the
-    # diffusion-generated face that will be overwritten by Stage A.
-    if os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1":
-        from face_restoration import enhance_face
-        face_start = time.perf_counter()
-        result, face_meta = enhance_face(
-            result,
-            person_original=person_img,
-            trace_id=trace_id,
-        )
-        face_ms = (time.perf_counter() - face_start) * 1000
-        if face_meta.get("face_detected") is True:
-            logger.info(
-                "face_restoration_completed method=%s time_ms=%.0f trace_id=%s",
-                face_meta.get("restoration_method", "unknown"),
-                face_ms,
-                trace_id,
-            )
-        else:
-            logger.info(
-                "face_restoration_skipped reason=no_face_detected time_ms=%.0f trace_id=%s",
-                face_ms,
-                trace_id,
-            )
-    pp_meta["face_restoration"] = face_meta
-
-    # ── Debug: save all pipeline images ────────────────────────────────────
-    if os.environ.get("ENABLE_DEBUG_IMAGES") == "1":
-        debug_dir = f"/tmp/trylix_debug/{job_id}"
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-            person_img.convert("RGB").save(f"{debug_dir}/01_person.jpg", quality=90)
-            garment_img.convert("RGB").save(f"{debug_dir}/02_garment.jpg", quality=90)
-            if external_mask is not None:
-                external_mask.convert("L").save(f"{debug_dir}/03_external_mask.png")
-            else:
-                logger.warning("debug_no_external_mask trace_id=%s", trace_id)
-            if protected_mask is not None:
-                protected_mask.convert("L").save(f"{debug_dir}/04_protected_mask.png")
-            inpaint_debug = last_inpaint_mask or external_mask
-            if inpaint_debug is not None:
-                inpaint_debug.convert("L").save(f"{debug_dir}/05_inpaint_mask.png")
-            raw_output.convert("RGB").save(f"{debug_dir}/06_raw_output.jpg", quality=95)
-            result.convert("RGB").save(f"{debug_dir}/07_final_output.jpg", quality=95)
-            logger.info(
-                "debug_images_saved dir=%s files=6 trace_id=%s",
-                debug_dir, trace_id,
-            )
-        except Exception as exc:
-            logger.warning("debug_images_save_failed dir=%s error=%s trace_id=%s", debug_dir, exc, trace_id)
 
     # ── Upload ───────────────────────────────────────────────────────────
     upload_start = time.perf_counter()
@@ -1651,9 +1267,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     logger.info(
         "job_complete total_ms=%.0f download_ms=%.0f inference_ms=%.0f upload_ms=%.0f "
-        "mask_type=%s retry_count=%s trace_id=%s",
+        "retry_count=%s trace_id=%s",
         total_ms, download_ms, inference_ms, upload_ms,
-        mask_meta.get("mask_type_used"),
         retry_count,
         trace_id,
     )
@@ -1662,24 +1277,19 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "status": "success",
         "result_url": result_url,
         "cloth_type_used": vton_type,
-        "steps_used": best_steps,
-        "seed": best_seed,
         "inference_ms": round(inference_ms, 2),
         "upload_ms": round(upload_ms, 2),
         "download_ms": round(download_ms, 2),
         "total_ms": round(total_ms, 2),
-        "mask_type_used": mask_meta.get("mask_type_used"),
-        "mask_quality_score": mask_quality_score,
+        "mask_coverage_percent": mask_meta.get("coverage_percent"),
+        "mask_coverage_valid": mask_meta.get("coverage_valid"),
         "retry_count": retry_count,
         "failure_reasons": failure_reasons or None,
         "identity_drift_score": (
             quality_report.identity_drift_score if quality_report else None
         ),
-        "color_fidelity_score": result_color_fidelity,
-        "color_drift_mean_rgb": result_color_drift,
         "garment_mean_rgb": round(garm_mean_all, 1),
-        "guidance_scale_used": round(best_guidance, 2),
-        "pp_meta": pp_meta,
+        "guidance_scale_used": round(effective_guidance, 2),
         "trace_id": trace_id,
         "warnings": input_warnings,
     }
@@ -1771,11 +1381,12 @@ def _startup_diagnostics():
     # Actual import test — catches ModuleNotFoundError at startup, not during a job
     try:
         from mask_pipeline import (
-            WorkerMaskStrategy,
-            apply_protected_mask,
-            fuse_hybrid_mask,
+            build_schp_inpaint_mask,
+            build_schp_protect_mask,
+            apply_protection_binary,
+            assert_binary_mask,
+            validate_mask_coverage,
             detect_inference_failures,
-            select_worker_mask_strategy,
         )
         logger.info("STARTUP_DIAG: import mask_pipeline OK")
         return True
