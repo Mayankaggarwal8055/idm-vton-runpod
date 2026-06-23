@@ -156,9 +156,9 @@ def _detect_face_bbox_from_array(
         return None
 
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-    pad_x = int(fw * 0.30)        # ear coverage
+    pad_x = int(fw * 0.28)        # ear coverage
     pad_y_top = int(fh * 0.45)    # crown + hairline
-    pad_y_bottom = int(fh * 0.40) # neck buffer
+    pad_y_bottom = int(fh * 0.38) # neck buffer
     return (
         max(0, fx - pad_x),
         max(0, fy - pad_y_top),
