@@ -32,8 +32,10 @@ def apply_face_composite(
     Uses the protected mask (face + hands + accessories) to determine which
     pixels should be preserved from the original person photo.
 
-    This is more reliable than face detection — it preserves whatever the
-    preprocessing pipeline marked as protected (face, phone, clutch, watch).
+    The dilation and feather profile MUST match `apply_protected_mask` in
+    mask_pipeline.py (3x9 dilation + DT/40 feather) so the composite zone
+    exactly aligns with the zone that was protected during diffusion.
+    This prevents visible rectangular seams at face/hand boundaries.
     """
     if os.environ.get("ENABLE_FACE_COMPOSITE", "1") != "1":
         return result
@@ -49,18 +51,17 @@ def apply_face_composite(
         mask_pil = protected_mask.convert("L").resize(result.size, Image.NEAREST)
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    # Dilate protected region more aggressively to ensure full coverage
-    # with wide, soft falloff. Larger kernel (9 vs 7) and more iterations
-    # (4 vs 3) create a wider transition band, making the original face
-    # composite invisible against the diffusion output.
+    # Dilate with same kernel/iterations as apply_protected_mask (3x9)
+    # so the composite zone exactly matches the protected zone.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask_dilated = cv2.dilate(mask_np, kernel, iterations=4)
+    mask_dilated = cv2.dilate(mask_np, kernel, iterations=3)
 
-    # Feather the edges with a wider Gaussian for smooth blending.
-    # Larger sigma=15 spreads the blend over ~40px, hiding lighting/color
-    # mismatches and preventing visible rectangular face seams.
-    feather = cv2.GaussianBlur(mask_dilated.astype(np.float32), (35, 35), 15)
-    feather_3d = np.stack([feather / 255.0] * 3, axis=-1)
+    # Distance-transform feather matching mask_pipeline.py (DT/40).
+    # Linear falloff over 40px creates a smooth, seam-free transition.
+    prot_binary = (mask_dilated > 127).astype(np.uint8)
+    dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
+    feather = np.clip(dist.astype(np.float32) / 40.0, 0, 1)
+    feather_3d = np.stack([feather] * 3, axis=-1)
 
     # Blend: original person where mask is high, result where mask is low
     blended = (
@@ -129,10 +130,12 @@ def apply_skin_tone_correction(
     face_bbox: tuple[int, int, int, int] | None = None,
 ) -> Image.Image:
     """
-    Correct skin tone in the result to match the original person.
+    Correct skin tone in the FACE REGION ONLY to match the original person.
 
-    Computes per-channel gain in skin regions (face if detected, otherwise
-    full image) and applies to the entire result.
+    Computes per-channel gain from the face region, then applies it ONLY
+    within a generously padded face+neck mask with feathered edges.
+    Hands, garment, background, and hair are NOT modified — preventing
+    the "hand skin tone changes" and "global color shift" failure modes.
     """
     if os.environ.get("ENABLE_SKIN_TONE_CORRECTION", "1") != "1":
         return result
@@ -147,6 +150,8 @@ def apply_skin_tone_correction(
             dtype=np.float32,
         )
 
+    h_img, w_img = result_np.shape[:2]
+
     # Define the skin reference region
     if face_bbox is not None:
         x1, y1, x2, y2 = face_bbox
@@ -154,8 +159,6 @@ def apply_skin_tone_correction(
         skin_ref_result = result_np[y1:y2, x1:x2]
     else:
         # Fallback: use upper-center region of image (expected face area).
-        # Center shifted to 20% height (was 25%) to capture faces in
-        # full-body shots where the face is at ~10-15% of image height.
         h, w = person_np.shape[:2]
         cx, cy = w // 2, h // 5
         roi_w, roi_h = w // 2, h // 5
@@ -185,8 +188,43 @@ def apply_skin_tone_correction(
         gain[0], gain[1], gain[2], drift,
     )
 
-    corrected = result_np * gain.reshape(1, 1, 3)
-    return Image.fromarray(np.clip(corrected, 0, 255).astype(np.uint8))
+    # ── LOCAL correction: only apply gain within a padded face+neck mask ──
+    # Create a generously padded face mask so correction covers face + jawline
+    # + upper neck while leaving hands, garment, hair, and background untouched.
+    if face_bbox is not None:
+        x1, y1, x2, y2 = face_bbox
+        fw = x2 - x1
+        fh = y2 - y1
+        pad = int(min(fw, fh) * 0.5)  # 50% padding for neck buffer
+        mx1 = max(0, x1 - pad)
+        my1 = max(0, y1 - pad)
+        mx2 = min(w_img, x2 + pad)
+        my2 = min(h_img, y2 + pad)
+    else:
+        h, w = h_img, w_img
+        cx, cy = w // 2, h // 5
+        roi_w, roi_h = w // 2, h // 5
+        pad = int(min(roi_w, roi_h) * 0.5)
+        mx1 = max(0, cx - roi_w // 2 - pad)
+        my1 = max(0, cy - roi_h // 2 - pad)
+        mx2 = min(w, cx + roi_w // 2 + pad)
+        my2 = min(h, cy + roi_h // 2 + pad)
+
+    mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    mask[my1:my2, mx1:mx2] = 255
+
+    # Feather the mask edges for seamless blend
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask_dilated = cv2.dilate(mask, kernel, iterations=3)
+    prot_binary = (mask_dilated > 127).astype(np.uint8)
+    dist = cv2.distanceTransform(prot_binary, cv2.DIST_L2, 5)
+    feather = np.clip(dist.astype(np.float32) / 40.0, 0, 1)
+    feather_3d = np.stack([feather] * 3, axis=-1)
+
+    # Correct only within the feathered mask region
+    corrected_rgb = result_np * gain.reshape(1, 1, 3)
+    blended = corrected_rgb * feather_3d + result_np * (1.0 - feather_3d)
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
 
 def apply_region_freeze(

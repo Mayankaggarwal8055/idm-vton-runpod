@@ -156,9 +156,9 @@ def _detect_face_bbox_from_array(
         return None
 
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-    pad_x = int(fw * 0.18)
-    pad_y_top = int(fh * 0.40)
-    pad_y_bottom = int(fh * 0.30)
+    pad_x = int(fw * 0.30)        # ear coverage
+    pad_y_top = int(fh * 0.45)    # crown + hairline
+    pad_y_bottom = int(fh * 0.40) # neck buffer
     return (
         max(0, fx - pad_x),
         max(0, fy - pad_y_top),
@@ -228,7 +228,7 @@ def _apply_gfpgan(
         # GFPGAN expects BGR uint8
         face_bgr = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR)
         _, _, restored_bgr = _restoration_model.enhance(
-            face_bgr, has_aligned=False, only_center_face=False, paste_back=True,
+            face_bgr, has_aligned=False, only_center_face=True, paste_back=True,
         )
         if restored_bgr is not None:
             return cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
@@ -290,7 +290,7 @@ def _blend_face(
 
     # Create a feather mask: white center, Gaussian falloff at edges
     feather_mask = np.ones((fh, fw), dtype=np.float32)
-    feather_pixels = min(fh, fw) // 3  # ~33% feather border (was ~17% — too narrow, caused visible seam)
+    feather_pixels = min(fh, fw) // 2  # ~50% feather border for invisible seam
     if feather_pixels > 2:
         kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3)
         kernel_1d = kernel_1d[feather_pixels:-feather_pixels].flatten()
