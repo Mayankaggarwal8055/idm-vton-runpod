@@ -1,13 +1,13 @@
 """
-Face Restoration — Active post-inference quality recovery.
+Face Restoration — optional post-inference sharpening.
 
-enhance_face() is called by handler.py after every inference.
-It applies mild unsharp-mask sharpening (or GFPGAN if available) to the
-face region only, then blends it back with Gaussian feathering.
+Default: DISABLED (ENABLE_FACE_RESTORATION=0).
 
-The face is sourced from the original person image for identity preservation.
-Generated clothing pixels are never overwritten — only the face region is
-touched. Controlled by ENABLE_FACE_RESTORATION env var (default: 1).
+When enabled, sharpens the face region IN the diffusion output only —
+does NOT paste original person pixels (which caused halos, identity mismatch,
+and visible seams on ethnic skin tones).
+
+Optional GFPGAN tier if packages are installed.
 """
 
 from __future__ import annotations
@@ -22,11 +22,8 @@ from PIL import Image
 
 logger = logging.getLogger("idm-vton.worker.face_restoration")
 
-# Whether the GFPGAN/CodeFormer model was loaded successfully
 _restoration_model = None
-
-
-# ── Public API ────────────────────────────────────────────────────────────
+_GFPGAN_LOADED = False
 
 
 def enhance_face(
@@ -35,116 +32,64 @@ def enhance_face(
     trace_id: str = "",
 ) -> tuple[Image.Image, dict[str, object]]:
     """
-    Detect face in the result image and apply enhancement.
+    Detect face in the result and apply mild in-place enhancement.
 
-    NOTE: This function is DEPRECATED and not called from the active pipeline.
-    handler.py does not import or invoke it. The model output is the final image.
-
-    Args:
-        result: The output image from diffusion (to be enhanced).
-        person_original: The original person image (for color reference).
-        trace_id: Trace ID for logging.
-
-    Returns:
-        (enhanced_image, meta_dict):
-            enhanced_image — the output with face region enhanced.
-            meta_dict — keys: face_detected, restoration_time_ms, restoration_method.
+    person_original is ignored for blending — kept for API compatibility.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
     t0 = time.perf_counter()
 
-    # Ensure person_original matches result resolution so face bbox
-    # coordinates apply to both images.
-    if person_original is not None and person_original.size != result.size:
-        person_original = person_original.resize(result.size, Image.Resampling.LANCZOS)
-
     result_np = np.array(result.convert("RGB"))
-
-    # ── Step 1: Detect face ────────────────────────────────────────────
     face_bbox = _detect_face_bbox_from_array(result_np)
     if face_bbox is None:
         elapsed = (time.perf_counter() - t0) * 1000
-        logger.info("face_restoration no_face_detected time_ms=%.0f trace_id=%s", elapsed, trace_id)
-        meta["face_detected"] = False
-        meta["restoration_time_ms"] = round(elapsed, 1)
-        meta["restoration_method"] = "none"
+        meta.update({
+            "face_detected": False,
+            "restoration_time_ms": round(elapsed, 1),
+            "restoration_method": "none",
+        })
         return result, meta
 
     meta["face_detected"] = True
     x1, y1, x2, y2 = face_bbox
     meta["face_bbox"] = [int(x1), int(y1), int(x2), int(y2)]
-    logger.info(
-        "face_restoration detected bbox=(%d,%d,%d,%d) trace_id=%s",
-        x1, y1, x2, y2, trace_id,
-    )
 
-    # ── Step 2: Extract face region from ORIGINAL person photo ─────────
-    # Using person_original instead of result_np ensures the enhanced face
-    # shares the same identity/skin tone as the blend background, making
-    # the feathered transition nearly invisible.  Extracting from result_np
-    # (diffusion output) causes a visible rectangular seam because the
-    # diffusion may alter face appearance.
-    if person_original is not None:
-        person_np = np.array(person_original.convert("RGB"))
-        face_source = person_np
-    else:
-        face_source = result_np
-    face_region = face_source[y1:y2, x1:x2]
-    if face_region.size == 0:
-        elapsed = (time.perf_counter() - t0) * 1000
-        meta["restoration_time_ms"] = round(elapsed, 1)
-        meta["restoration_method"] = "none"
-        return result, meta
-
-    h, w = face_region.shape[:2]
-    if h < 20 or w < 20:
+    face_region = result_np[y1:y2, x1:x2]
+    if face_region.size == 0 or face_region.shape[0] < 20 or face_region.shape[1] < 20:
         meta["restoration_time_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         meta["restoration_method"] = "none"
         return result, meta
 
-    # ── Step 3: Apply restoration ───────────────────────────────────────
-    method = "opencv_fallback"
+    method = "opencv_sharpen"
     try:
-        enhanced_face = _apply_gfpgan(face_region, person_original, trace_id)
-        if enhanced_face is not None:
+        gfpgan_face = _apply_gfpgan(face_region, trace_id)
+        if gfpgan_face is not None:
             method = "gfpgan"
-            face_region_enhanced = enhanced_face
+            enhanced_face = gfpgan_face
         else:
-            face_region_enhanced = _apply_opencv_enhance(face_region)
+            enhanced_face = _apply_opencv_enhance(face_region)
     except Exception:
-        face_region_enhanced = _apply_opencv_enhance(face_region)
+        enhanced_face = _apply_opencv_enhance(face_region)
 
     meta["restoration_method"] = method
-
-    # ── Step 4: Blend back with feathering ─────────────────────────────
-    result_np = _blend_face(result_np, face_region_enhanced, x1, y1, x2, y2)
+    result_np = _blend_face(result_np, enhanced_face, x1, y1, x2, y2, feather_fraction=0.12)
 
     elapsed = (time.perf_counter() - t0) * 1000
     meta["restoration_time_ms"] = round(elapsed, 1)
-
     logger.info(
-        "face_restoration done method=%s time_ms=%.0f face_size=%dx%d trace_id=%s",
-        method, elapsed, w, h, trace_id,
+        "face_restoration done method=%s time_ms=%.0f trace_id=%s",
+        method, elapsed, trace_id,
     )
-
     return Image.fromarray(result_np), meta
-
-
-# ── Face Detection ────────────────────────────────────────────────────────
 
 
 def _detect_face_bbox_from_array(
     img_np: np.ndarray,
     min_face_ratio: float = 0.03,
 ) -> tuple[int, int, int, int] | None:
-    """
-    Detect the largest face using OpenCV Haar cascade.
-
-    Returns (x1, y1, x2, y2) or None.
-    """
     h_img, w_img = img_np.shape[:2]
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     cascade_path = os.path.join(
@@ -162,9 +107,9 @@ def _detect_face_bbox_from_array(
         return None
 
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
-    pad_x = int(fw * 0.18)        # ear coverage
-    pad_y_top = int(fh * 0.40)    # crown + hairline
-    pad_y_bottom = int(fh * 0.25) # neck buffer
+    pad_x = int(fw * 0.12)
+    pad_y_top = int(fh * 0.22)
+    pad_y_bottom = int(fh * 0.12)
     return (
         max(0, fx - pad_x),
         max(0, fy - pad_y_top),
@@ -173,42 +118,20 @@ def _detect_face_bbox_from_array(
     )
 
 
-# ── OpenCV Fallback Pipeline ──────────────────────────────────────────────
-
-
 def _apply_opencv_enhance(face_rgb: np.ndarray) -> np.ndarray:
-    """
-    Mild enhancement — blur repair only, not identity reconstruction.
-    Avoids denoising (destroys skin texture), CLAHE (patchy contrast),
-    and saturation boost (painted look).  Just a subtle unsharp mask
-    to recover edge definition lost during diffusion.
-    """
-    blurred = cv2.GaussianBlur(face_rgb, (0, 0), sigmaX=0.8)
-    sharpened = cv2.addWeighted(face_rgb, 1.3, blurred, -0.3, 0)
+    """Mild unsharp mask on diffusion output — no denoise/CLAHE/saturation."""
+    blurred = cv2.GaussianBlur(face_rgb, (0, 0), sigmaX=0.6)
+    sharpened = cv2.addWeighted(face_rgb, 1.25, blurred, -0.25, 0)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
-# ── GFPGAN Integration (optional) ─────────────────────────────────────────
-
-
-def _apply_gfpgan(
-    face_rgb: np.ndarray,
-    person_original: Image.Image | None,
-    trace_id: str,
-) -> np.ndarray | None:
-    """
-    Apply GFPGAN restoration if the model is available.
-
-    Returns enhanced face region or None (fall back to OpenCV).
-    """
-    global _restoration_model
-    if _restoration_model is None:
+def _apply_gfpgan(face_rgb: np.ndarray, trace_id: str) -> np.ndarray | None:
+    global _restoration_model, _GFPGAN_LOADED
+    if _restoration_model is None and not _GFPGAN_LOADED:
         _restoration_model = _load_gfpgan()
     if _restoration_model is None:
         return None
-
     try:
-        # GFPGAN expects BGR uint8
         face_bgr = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR)
         _, _, restored_bgr = _restoration_model.enhance(
             face_bgr, has_aligned=False, only_center_face=True, paste_back=True,
@@ -217,23 +140,15 @@ def _apply_gfpgan(
             return cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
     except Exception as exc:
         logger.warning("gfpgan_enhance_failed error=%s trace_id=%s", exc, trace_id)
-
     return None
 
 
-_GFPGAN_LOADED = False
-
-
 def _load_gfpgan():
-    """Lazy-load GFPGAN model. Returns None if unavailable."""
-    global _GFPGAN_LOADED
-    if _GFPGAN_LOADED:
-        return _restoration_model
-
+    global _GFPGAN_LOADED, _restoration_model
     try:
         from gfpgan import GFPGANer  # type: ignore[import-untyped]
         model = GFPGANer(
-            model_path=None,  # downloads default if not found
+            model_path=None,
             upscale=1,
             arch="clean",
             channel_multiplier=2,
@@ -243,7 +158,7 @@ def _load_gfpgan():
         logger.info("face_restoration gfpgan_loaded")
         return model
     except ImportError:
-        logger.info("face_restoration gfpgan_not_available (using OpenCV fallback)")
+        logger.info("face_restoration gfpgan_not_available")
         _GFPGAN_LOADED = True
         return None
     except Exception as exc:
@@ -252,46 +167,33 @@ def _load_gfpgan():
         return None
 
 
-# ── Blending ──────────────────────────────────────────────────────────────
-
-
 def _blend_face(
     image: np.ndarray,
     enhanced_face: np.ndarray,
     x1: int, y1: int, x2: int, y2: int,
+    feather_fraction: float = 0.12,
 ) -> np.ndarray:
-    """
-    Blend the enhanced face back into the image with a Gaussian falloff
-    at the edges to prevent visible seams.
-    """
+    """Blend enhanced face with tight feather to avoid neck/chest halos."""
     result = image.copy()
     fh = y2 - y1
     fw = x2 - x1
-
-    # Ensure enhanced face matches the extracted region size
     enhanced_resized = cv2.resize(enhanced_face, (fw, fh))
 
-    # Create a feather mask: white center, Gaussian falloff at edges
+    feather_pixels = max(2, int(min(fh, fw) * feather_fraction))
     feather_mask = np.ones((fh, fw), dtype=np.float32)
-    feather_pixels = min(fh, fw) // 4  # ~25% feather border to prevent overlap with neck/chest
     if feather_pixels > 2:
         kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3)
         kernel_1d = kernel_1d[feather_pixels:-feather_pixels].flatten()
-        # horizontal gradient
         h_grad = np.ones(fw, dtype=np.float32)
         h_grad[:feather_pixels] = kernel_1d[:min(feather_pixels, len(kernel_1d))]
         h_grad[-feather_pixels:] = kernel_1d[-min(feather_pixels, len(kernel_1d)):][::-1]
-        # vertical gradient
         v_grad = np.ones(fh, dtype=np.float32)
         v_grad[:feather_pixels] = kernel_1d[:min(feather_pixels, len(kernel_1d))]
         v_grad[-feather_pixels:] = kernel_1d[-min(feather_pixels, len(kernel_1d)):][::-1]
         feather_mask = np.outer(v_grad, h_grad)
 
     feather_mask_3d = np.stack([feather_mask] * 3, axis=-1)
-
-    # Blend
     roi = result[y1:y2, x1:x2].astype(np.float32)
     blended = roi * (1.0 - feather_mask_3d) + enhanced_resized.astype(np.float32) * feather_mask_3d
     result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-
     return result

@@ -4,10 +4,13 @@ GPU worker mask pipeline — SCHP-only binary masks.
 SCHP is the single authoritative mask source. All masks are binary.
 No feathering, no fusing, no hybrid strategies. The model output is final.
 
-Binary enforcement:
-  assert_binary_mask() verifies every mask contains only {0,255} or {0,1}
-  before it reaches the diffusion model. Called automatically by
-  apply_protection_binary() and at the handler level.
+Design principles (quality-first):
+  - Inpaint mask = SCHP clothing labels for cloth_type, aggressively dilated.
+  - Protect mask = identity-critical regions only (face, hair, hands, shoes),
+    NOT the inverted clothing mask (which shrinks editable area and blocks
+    saree/dupatta drape over arms).
+  - Draped garments (saree, dupatta, lehenga) include arm regions in inpaint
+    but protect hand endpoints so mehndi / phones stay intact.
 """
 
 from __future__ import annotations
@@ -44,11 +47,37 @@ _LABEL_LEFT_SHOE = 18
 _LABEL_RIGHT_SHOE = 19
 
 # Clothing label sets per cloth_type
+_DRESSES_LABELS = {
+    _LABEL_UPPER_CLOTHES,
+    _LABEL_DRESS,
+    _LABEL_COAT,
+    _LABEL_PANTS,
+    _LABEL_JUMPSUITS,
+    _LABEL_SKIRT,
+    _LABEL_SCARF,
+}
 _CLOTHING_LABELS = {
     "upper_body": {_LABEL_UPPER_CLOTHES, _LABEL_COAT},
     "lower_body": {_LABEL_SOCKS, _LABEL_PANTS, _LABEL_SKIRT},
-    "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT, _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
+    "dresses": _DRESSES_LABELS,
+    "full_body": _DRESSES_LABELS,
 }
+
+_IDENTITY_PROTECT_LABELS = {
+    _LABEL_HAIR,
+    _LABEL_FACE,
+    _LABEL_HAT,
+    _LABEL_GLOVE,
+    _LABEL_SUNGLASSES,
+    _LABEL_LEFT_SHOE,
+    _LABEL_RIGHT_SHOE,
+}
+
+_DRAPE_ARM_LABELS = (_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM)
+_DRAPE_KEYWORDS = (
+    "saree", "sari", "dupatta", "lehenga", "drape", "draped",
+    "pallu", "shawl", "wrap", "anarkali", "ethnic",
+)
 
 
 @dataclass(frozen=True)
@@ -58,14 +87,20 @@ class InferenceQualityReport:
     failure_reasons: tuple[str, ...]
 
 
-def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
-    """
-    Assert that a mask is binary — values are only {0,255} or {0,1}.
+def is_draped_garment(cloth_type: str, garment_subtype: str = "") -> bool:
+    """True when the garment needs arm-span inpaint (saree pallu, dupatta, etc.)."""
+    ct = (cloth_type or "").strip().lower()
+    if ct not in ("dresses", "full_body"):
+        return False
+    subtype = (garment_subtype or "").strip().lower()
+    if any(kw in subtype for kw in _DRAPE_KEYWORDS):
+        return True
+    # Full-body dress category without subtype — allow drape expansion (safer for ethnic wear).
+    return ct in ("dresses", "full_body")
 
-    Raises ValueError if non-binary values are found. This is the
-    hard enforcement point that prevents any soft/feathered mask
-    from reaching the diffusion model.
-    """
+
+def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
+    """Assert mask values are only {0,255} or {0,1}."""
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
     unique = set(int(v) for v in np.unique(mask))
@@ -73,38 +108,145 @@ def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
     if unique not in allowed:
         raise ValueError(
             f"Non-binary mask detected: {name} has values {unique}. "
-            f"Expected only {{0,255}} or {{0,1}}. "
-            f"This means a soft/feathered/float mask is in the pipeline."
+            f"Expected only {{0,255}} or {{0,1}}."
         )
+
+
+def _hand_zones_from_arms(
+    schp_labels: np.ndarray,
+    arm_labels: tuple[int, ...] = _DRAPE_ARM_LABELS,
+    hand_fraction: float = 0.38,
+) -> np.ndarray:
+    """
+    Protect only the distal portion of each arm (hands/wrists), not the full arm.
+    Enables sheer dupatta/saree drape over forearms while keeping hands intact.
+    """
+    h, w = schp_labels.shape
+    protect = np.zeros((h, w), dtype=np.uint8)
+    y_idx = np.arange(h)[:, None]
+
+    for label in arm_labels:
+        arm_mask = schp_labels == label
+        if not np.any(arm_mask):
+            continue
+        ys = np.where(arm_mask)[0]
+        y_min, y_max = int(ys.min()), int(ys.max())
+        span = max(1, y_max - y_min)
+        hand_y_start = y_max - int(span * hand_fraction)
+        hand_zone = arm_mask & (y_idx >= hand_y_start)
+        protect[hand_zone] = 255
+
+    return protect
+
+
+def _dilate_mask(mask: np.ndarray, kernel_size: int, iterations: int = 1) -> np.ndarray:
+    k = max(3, kernel_size)
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(mask, kernel, iterations=iterations)
 
 
 def build_schp_inpaint_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
+    garment_subtype: str = "",
 ) -> np.ndarray:
     """
     Build binary inpaint mask from SCHP labels.
     255 = editable garment region, 0 = protected.
     """
     labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
-    return (np.isin(schp_labels, list(labels)).astype(np.uint8) * 255)
+    mask = (np.isin(schp_labels, list(labels)).astype(np.uint8) * 255)
+
+    draped = is_draped_garment(cloth_type, garment_subtype)
+    if draped:
+        arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
+        mask = np.maximum(mask, arm_mask)
+
+    return mask
 
 
 def build_schp_protect_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
-    dilate_px: int = 15,
+    garment_subtype: str = "",
+    dilate_px: int = 13,
 ) -> np.ndarray:
     """
     Build binary protect mask from SCHP labels.
     255 = protected (identity-critical), 0 = editable.
-    Dilated by dilate_px to prevent edge artifacts.
+
+    Uses explicit identity labels — NOT inverted clothing — so inpaint coverage
+    stays large enough for full outfit replacement and draped overlays.
     """
-    labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
-    mask = (~np.isin(schp_labels, list(labels))).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    draped = is_draped_garment(cloth_type, garment_subtype)
+    mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
+
+    if cloth_type == "upper_body":
+        # Block lower-body replacement when only swapping tops.
+        lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+        mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
+        # Full arms protected for upper_body (short sleeves replace arm clothing only inside torso mask).
+        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+    elif cloth_type == "lower_body":
+        upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT, _LABEL_DRESS, _LABEL_SCARF}
+        mask = np.maximum(mask, np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255)
+        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+    elif draped:
+        # Drape over forearms — protect hands only.
+        mask = np.maximum(mask, _hand_zones_from_arms(schp_labels))
+    else:
+        # Standard full-body dress: protect full arms (no drape over arms).
+        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+
+    if draped:
+        dilate_px = max(9, dilate_px - 4)
+
+    mask = _dilate_mask(mask, dilate_px, iterations=1)
     return mask
+
+
+def dilate_inpaint_mask(
+    inpaint_mask: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str = "",
+    schp_height: int = 512,
+) -> np.ndarray:
+    """
+    Contour-aware dilation scaled to SCHP resolution.
+    Dresses/draped garments get extra expansion for full replacement.
+    """
+    scale = schp_height / 512.0
+    draped = is_draped_garment(cloth_type, garment_subtype)
+
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        leg_ks = (max(3, int(19 * scale)), max(3, int(29 * scale)))
+        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
+        iterations = 3 if draped else 2
+        return cv2.dilate(inpaint_mask, leg_k, iterations=iterations)
+
+    mild_ks = (max(3, int(25 * scale)), max(3, int(15 * scale)))
+    mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
+    return cv2.dilate(inpaint_mask, mild_k, iterations=1)
+
+
+def build_final_inpaint_mask(
+    schp_labels: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str = "",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Full mask pipeline: inpaint → dilate → subtract identity protect.
+    Returns (final_mask, inpaint_dilated, protect_mask).
+    """
+    inpaint_raw = build_schp_inpaint_mask(schp_labels, cloth_type, garment_subtype)
+    protect = build_schp_protect_mask(schp_labels, cloth_type, garment_subtype)
+    inpaint_dilated = dilate_inpaint_mask(
+        inpaint_raw, cloth_type, garment_subtype, schp_height=schp_labels.shape[0],
+    )
+    final = apply_protection_binary(inpaint_dilated, protect)
+    return final, inpaint_dilated, protect
 
 
 def validate_mask_integrity(mask: np.ndarray, name: str = "mask") -> None:
@@ -127,16 +269,11 @@ def validate_mask_integrity(mask: np.ndarray, name: str = "mask") -> None:
 
 
 def apply_protection_binary(inpaint_mask: np.ndarray, protect_mask: np.ndarray) -> np.ndarray:
-    """
-    Subtract protect mask from inpaint mask. Both uint8, 0 or 255.
-    Result is binary — no feathering, no gradients.
-
-    Enforces binary input and output via assert_binary_mask.
-    """
+    """Subtract protect mask from inpaint mask. Both uint8, 0 or 255."""
     assert_binary_mask(inpaint_mask, "inpaint_mask")
     assert_binary_mask(protect_mask, "protect_mask")
-    inp = (inpaint_mask > 127).astype(np.uint8)
-    prot = (protect_mask > 127).astype(np.uint8)
+    inp = (inpaint_mask > 127).astype(np.int16)
+    prot = (protect_mask > 127).astype(np.int16)
     result = np.clip(inp - prot, 0, 1).astype(np.uint8) * 255
     assert_binary_mask(result, "final_mask (post apply_protection_binary)")
     return result
@@ -147,10 +284,7 @@ def validate_mask_coverage(
     cloth_type: str,
     min_coverage: float = 0.04,
 ) -> dict[str, object]:
-    """
-    Pre-inference mask sanity check.
-    Returns valid=True/False, coverage_percent, reason.
-    """
+    """Pre-inference mask sanity check."""
     mask_np = np.array(mask.convert("L"), dtype=np.uint8)
     h, w = mask_np.shape[:2]
     binary = (mask_np > 127).astype(np.uint8)
@@ -163,7 +297,7 @@ def validate_mask_coverage(
             "reason": f"mask_too_small:{coverage*100:.1f}%",
         }
 
-    if cloth_type in ("lower_body", "dresses"):
+    if cloth_type in ("lower_body", "dresses", "full_body"):
         lower_zone = binary[h * 3 // 5:, :]
         lower_coverage = float(np.sum(lower_zone)) / lower_zone.size
         if lower_coverage < 0.03:
@@ -188,10 +322,7 @@ def detect_inference_failures(
     *,
     identity_threshold: float = 20.0,
 ) -> InferenceQualityReport:
-    """
-    Post-inference QA — triggers retry if identity drifted or garment unchanged.
-    Only checks identity drift (face/hair) and missing inpaint.
-    """
+    """Post-inference QA — triggers retry if identity drifted or garment unchanged."""
     orig = np.array(original.convert("RGB"), dtype=np.float32)
     out = np.array(result.convert("RGB"), dtype=np.float32)
     if orig.shape != out.shape:
@@ -203,14 +334,15 @@ def detect_inference_failures(
 
     reasons: list[str] = []
     h = orig.shape[0]
-
-    # Identity drift — restrict to face/hair region (upper 30% of image)
-    # to avoid diluting the measurement with unchanged background or limbs.
     face_zone_top = int(0.30 * h)
+
     if protected is not None:
         prot_arr = np.array(protected.convert("L"), dtype=np.uint8)
         if prot_arr.shape[:2] != orig.shape[:2]:
-            prot_arr = np.array(protected.convert("L").resize(orig.shape[1::-1], Image.NEAREST), dtype=np.uint8)
+            prot_arr = np.array(
+                protected.convert("L").resize(orig.shape[1::-1], Image.NEAREST),
+                dtype=np.uint8,
+            )
         upper_mask = np.zeros_like(prot_arr, dtype=bool)
         upper_mask[:face_zone_top, :] = True
         prot_mask = (prot_arr > 127) & upper_mask
@@ -224,7 +356,6 @@ def detect_inference_failures(
     if identity_drift > identity_threshold:
         reasons.append(f"identity_drift:{identity_drift:.1f}")
 
-    # Missing inpaint — garment region barely changed
     inpaint_region = mask_np > 127
     if np.any(inpaint_region):
         diff_inpaint = np.mean(np.abs(orig - out), axis=2)

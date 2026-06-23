@@ -33,6 +33,14 @@ except ImportError:
     _FACE_RESTORATION_AVAILABLE = False
     _do_enhance_face = None
 
+# Post-inference quality validation and candidate scoring
+_QUALITY_VALIDATION_AVAILABLE = True
+try:
+    from quality_validation import score_candidate as _score_candidate
+except ImportError:
+    _QUALITY_VALIDATION_AVAILABLE = False
+    _score_candidate = None
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -71,6 +79,15 @@ CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "45"))
 GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.75"))
 
+# Retry / candidate scoring thresholds
+MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
+CANDIDATE_MIN_SCORE = float(os.environ.get("CANDIDATE_MIN_SCORE", "0.55"))
+CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
+CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
+RETRY_GUIDANCE_BOOST = float(os.environ.get("RETRY_GUIDANCE_BOOST", "0.15"))
+RETRY_STEPS_BOOST = int(os.environ.get("RETRY_STEPS_BOOST", "5"))
+FACE_RESTORATION_DEFAULT = os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1"
+
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16
 
@@ -80,28 +97,10 @@ ENABLE_TORCH_COMPILE = os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
 ENABLE_MODEL_CPU_OFFLOAD = os.environ.get("ENABLE_MODEL_CPU_OFFLOAD", "0") == "1"
 ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
 
-# Multi-candidate generation — generate N candidates with different
-# seeds on the first mask strategy, pick the one with the best aggregate
-# quality score.  Set to 1 for original single-candidate behaviour.
-MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
-
-# Candidate diversity — vary guidance scale and denoising steps across
-# candidates so the scoring system can choose from structurally different
-# outputs rather than pure seed-noise variants.  Set to 0 to use the same
-# parameters for all candidates (original behaviour).
-CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
-CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
-
 # Post-processing:
-#   face_restoration.py         — RE-ENABLED: enhance_face() runs after inference.
-#                                 Mild unsharp mask (or GFPGAN if available) on the
-#                                 face region only, blended with Gaussian feather.
-#                                 Sources face from original person image for
-#                                 identity preservation, never overwrites clothing.
-#   post_processing.py          — placeholder docstring only, all functions removed.
-# None of: skin tone correction, region freeze, seamless clone, or original-pixel
-# overwrite — exist in the active handler. Identity preservation happens via SCHP
-# binary mask protection at inference time, never via post-inference restore.
+#   face_restoration.py — opt-in only (ENABLE_FACE_RESTORATION=1, default off).
+#                         Sharpens diffusion output face in-place; does not paste
+#                         original person pixels (avoids halos / identity clash).
 
 # Concurrency — single GPU SDXL typically needs ~16-20 GB VRAM.
 # On a 24 GB card keep max_workers=1; set to 2+ only if the GPU
@@ -716,16 +715,15 @@ def run_idm_vton_inference(
         pipe.unet_encoder.to(device)
 
     from mask_pipeline import (
-        build_schp_inpaint_mask,
-        build_schp_protect_mask,
-        apply_protection_binary,
+        build_final_inpaint_mask,
         assert_binary_mask,
+        is_draped_garment,
         validate_mask_coverage,
         validate_mask_integrity,
         detect_inference_failures,
     )
 
-    # Preserve garment aspect ratio — only pad to target, never stretch
+    # Trust preprocessing canvas when garment is already at target resolution.
     garm_img = garment_img.convert("RGB")
     if garm_img.size != TARGET_SIZE:
         gw, gh = garm_img.size
@@ -742,8 +740,9 @@ def run_idm_vton_inference(
 
     width, height = human_img_orig.size
     left, top, crop_size = 0.0, 0.0, None
+    already_target = human_img_orig.size == TARGET_SIZE
 
-    if auto_crop:
+    if auto_crop and not already_target:
         target_width = int(min(width, height * (TARGET_W / TARGET_H)))
         target_height = int(min(height, width * (TARGET_H / TARGET_W)))
 
@@ -782,11 +781,13 @@ def run_idm_vton_inference(
         cropped_img = human_img_orig.crop((left, top, right, bottom))
         crop_size = cropped_img.size
         human_img = cropped_img.resize(TARGET_SIZE)
+    elif already_target:
+        human_img = human_img_orig.copy()
+        logger.info("auto_crop_skipped image_already_target_size=%s", TARGET_SIZE)
     else:
         human_img = human_img_orig.resize(TARGET_SIZE)
 
     # SCHP is the single authoritative mask source.
-    # Build binary inpaint + protect masks from SCHP labels.
     keypoints = openpose_model(human_img.resize((384, 512)))
     # SCHP at full TARGET_SIZE resolution so mask boundaries are native-res,
     # not interpolated from 384x512. The ONNX models internally affine-warp
@@ -801,25 +802,10 @@ def run_idm_vton_inference(
         schp_np = schp_np.squeeze(0)
     schp_np = schp_np.astype(np.uint8)
 
-    inpaint_mask_np = build_schp_inpaint_mask(schp_np, cloth_type)
-    protect_mask_np = build_schp_protect_mask(schp_np, cloth_type)
-
-    # ── Contour-aware inpaint mask dilation ───────────────────────────
-    # Kernel sizes scale with SCHP resolution so coverage is consistent
-    # regardless of whether SCHP ran at 384x512 or 768x1024.
-    mask_h = schp_np.shape[0]
-    scale = mask_h / 512.0
-    if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_ks = (max(3, int(19 * scale)), max(3, int(29 * scale)))
-        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
-        inpaint_mask_np = cv2.dilate(inpaint_mask_np, leg_k, iterations=2)
-    else:
-        mild_ks = (max(3, int(25 * scale)), max(3, int(15 * scale)))
-        mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
-        inpaint_mask_np = cv2.dilate(inpaint_mask_np, mild_k, iterations=1)
-
-    # Binary protection — clip-subtract, no feathering
-    final_mask_np = apply_protection_binary(inpaint_mask_np, protect_mask_np)
+    final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
+        schp_np, cloth_type, garment_subtype,
+    )
+    draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
     validate_mask_integrity(final_mask_np, "final_mask")
     # Smooth upscale: LANCZOS + threshold to 255/0 gives anti-aliased
@@ -834,6 +820,12 @@ def run_idm_vton_inference(
         "mask_type_used": "automasker",
         "coverage_valid": None,
         "coverage_percent": None,
+        "schp_labels": schp_np,
+        "protect_mask_np": protect_mask_np,
+        "inpaint_mask_np": inpaint_mask_np,
+        "final_mask_np": final_mask_np,
+        "is_draped_garment": draped,
+        "garment_subtype": garment_subtype,
     }
 
     # ── Pre-inference mask validation ──────────────────────────────────
@@ -904,6 +896,7 @@ def run_idm_vton_inference(
         "gown": "flowing fabric, floor-length drape, elegant folds, natural wrinkles, bodice seam, skirt gathers, hem stitch",
         "jumpsuit": "structured fabric, tailored fit, sharp seams, natural folds, waist seam detail, leg hem, pocket stitching",
         "saree": "draped silk fabric, flowing silhouette, realistic saree folds, natural pleats, decorative border detail, pallu drape, fabric sheen",
+        "dupatta": "sheer draped fabric, flowing dupatta, soft translucent textile, natural folds, pallu drape, delicate fabric sheen",
         "lehenga": "structured waistband, flowing skirt, realistic pleats, natural folds, embroidered border detail, waist seam",
         "tracksuit": "cotton fabric, sporty fit, soft folds, natural wrinkles, ribbed cuffs, drawstring waistband, leg zip detail",
         "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles, waist seam detail, hem finishing",
@@ -913,7 +906,9 @@ def run_idm_vton_inference(
         "model is wearing " + garment_desc + ", " + fabric_desc
         + ", photorealistic, sharp focus, fashion photography, "
         + "soft studio lighting, high quality, detailed fabric texture, "
-        + "natural skin, professional photo, no accessories"
+        + "natural skin, professional photo, no accessories, "
+        + "detailed face, natural facial features, symmetric face, "
+        + "natural body proportions, natural hands, natural fingers"
     )
     negative_prompt = (
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
@@ -923,6 +918,11 @@ def run_idm_vton_inference(
         "ugly, blurry, watermark, signature, text, logo, "
         "smooth plastic, airbrushed, cg render, 3d render, "
         "flat lighting, "
+        "watercolor, smudged, washed out, overlaid, transparent, "
+        "see-through, ghost, double exposure, translucent, "
+        "poorly sewn, unfinished edges, loose threads, "
+        "fabric tearing, fabric distortion, fabric wrinkling, "
+        "pattern mismatch, texture seam, visible seam, "
         "bag, purse, handbag, clutch, tote, backpack, "
         "headphones, earphones, headset, "
         "necklace, chain, pendant, choker, "
@@ -1040,11 +1040,9 @@ def _validate_person_quality(
 
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     from mask_pipeline import (
-        build_schp_inpaint_mask,
-        build_schp_protect_mask,
-        apply_protection_binary,
+        is_draped_garment,
         validate_mask_coverage,
-        detect_inference_failures,
+        InferenceQualityReport,
     )
 
     job_start = time.perf_counter()
@@ -1077,6 +1075,20 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "dresses": "dresses",
         "overall": "dresses",
         "full_body": "dresses",
+        "draped": "dresses",
+        "saree": "dresses",
+        "sari": "dresses",
+        "dupatta": "dresses",
+        "lehenga": "dresses",
+        "lehanga": "dresses",
+        "anarkali": "dresses",
+        "ethnic": "dresses",
+        "gown": "dresses",
+        "gowns": "dresses",
+        "jumpsuit": "dresses",
+        "jumpsuits": "dresses",
+        "kurta": "dresses",
+        "kurti": "dresses",
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
 
@@ -1150,20 +1162,22 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         garm_w, garm_h, garm_aspect, target_aspect, vton_type, trace_id,
     )
 
-    # SCHP is the single authoritative mask source.
-    # No external/CPU masks. No hybrid fusion. No rembg.
-    # All masks are binary (0 or 255) enforced by assert_binary_mask().
-    retry_strategies: list[str] = ["automasker"]
-
     inference_start = time.perf_counter()
     result: Image.Image | None = None
+    raw_output: Image.Image | None = None
     mask_meta: dict[str, object] = {}
     quality_report = None
     retry_count = 0
     failure_reasons: list[str] = []
+    best_candidate_score: float = -1.0
 
-    # Dark garment handling — per-channel guidance adjustment.
+    # Dark garment + draped/full-body: stronger diffusion for full replacement.
     effective_guidance = GUIDANCE_SCALE
+    effective_steps = steps
+    draped_request = is_draped_garment(vton_type, garment_subtype)
+    if draped_request or vton_type in ("dresses", "full_body"):
+        effective_steps = max(steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
+        effective_guidance = max(effective_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
     if garm_mean_all < 80.0:
         effective_guidance = GUIDANCE_SCALE * 1.15
         logger.info(
@@ -1173,71 +1187,138 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             GUIDANCE_SCALE, effective_guidance,
         )
 
-    for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
-        retry_count = attempt_idx
+    min_candidate_score = CANDIDATE_MIN_SCORE
+    candidate_count = max(1, MULTI_CANDIDATE_COUNT)
+    max_retry_rounds = max(0, max_retries) if retry_enabled else 0
 
-        result, raw_output, mask_meta = run_idm_vton_inference(
-            person_img=person_img,
-            garment_img=garment_img,
-            garment_desc=garment_desc,
-            garment_subtype=garment_subtype,
-            cloth_type=vton_type,
-            steps=steps,
-            seed=seed + attempt_idx * 1000,
-            auto_crop=True,
-            guidance_scale=effective_guidance,
-            crop_preserve_lower=True,
-        )
+    retry_round = 0
+    while retry_round <= max_retry_rounds:
+        candidates: list[tuple[Image.Image, Image.Image | None, dict[str, object], object | None]] = []
+        for ci in range(candidate_count):
+            c_seed = seed + retry_round * 10000 + ci * 1000
 
-        # Build binary masks from SCHP for validation
-        schp_labels = mask_meta.get("schp_labels")
-        if schp_labels is not None:
-            inpaint_mask = build_schp_inpaint_mask(schp_labels, vton_type)
-            protect_mask = build_schp_protect_mask(schp_labels, vton_type)
-            final_mask = apply_protection_binary(inpaint_mask, protect_mask)
-            coverage = validate_mask_coverage(
-                Image.fromarray(final_mask, mode="L"), vton_type
+            # Base params for this retry round (escalates guidance/steps on retry)
+            c_guidance = effective_guidance * max(1.0, 1.0 + RETRY_GUIDANCE_BOOST * retry_round)
+            c_steps = effective_steps + RETRY_STEPS_BOOST * retry_round
+
+            # Candidate diversity: vary guidance/steps around the retry-round base
+            if CANDIDATE_GUIDANCE_VARY and candidate_count > 1:
+                variation = 1.0 + 0.08 * (ci - (candidate_count - 1) / 2.0)
+                c_guidance *= variation
+            if CANDIDATE_STEPS_VARY and candidate_count > 1:
+                c_steps += int(5 * (ci - (candidate_count - 1) / 2.0))
+                c_steps = max(10, c_steps)
+
+            c_result, c_raw, c_meta = run_idm_vton_inference(
+                person_img=person_img,
+                garment_img=garment_img,
+                garment_desc=garment_desc,
+                garment_subtype=garment_subtype,
+                cloth_type=vton_type,
+                steps=c_steps,
+                seed=c_seed,
+                auto_crop=True,
+                guidance_scale=c_guidance,
+                crop_preserve_lower=True,
             )
+
+            # Validate + score candidate
+            c_final_mask_np = c_meta.get("final_mask_np")
+            c_protect_np = c_meta.get("protect_mask_np")
+            c_schp_labels = c_meta.get("schp_labels")
+            c_vresult = None
+            if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
+                c_vresult = _score_candidate(
+                    person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                    c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
+                    garment_img,
+                    mask_np=c_final_mask_np,
+                    protect_np=c_protect_np,
+                    schp_labels=c_schp_labels,
+                )
+                logger.info(
+                    "candidate_ci=%d score=%.4f face=%.4f garment=%.4f "
+                    "sharpness=%.2f drift=%.1f replacement=%.4f trace_id=%s",
+                    ci,
+                    c_vresult.score, c_vresult.face_quality, c_vresult.garment_quality,
+                    c_vresult.sharpness, c_vresult.identity_drift,
+                    c_vresult.garment_replacement, trace_id,
+                )
+            candidates.append((c_result, c_raw, c_meta, c_vresult))
+
+        # ── Pick best candidate ────────────────────────────────────────
+        scored = [(r, ro, m, v) for r, ro, m, v in candidates if v is not None]
+        if scored:
+            best = max(scored, key=lambda x: x[3].score)
+            result, raw_output, mask_meta, vresult = best
+            quality_report = InferenceQualityReport(
+                passed=vresult.passed,
+                identity_drift_score=vresult.identity_drift,
+                failure_reasons=tuple(vresult.failure_reasons),
+            )
+            best_candidate_score = vresult.score
+            failure_reasons = vresult.failure_reasons
+        elif candidates:
+            # Fallback: first candidate if scoring unavailable
+            result, raw_output, mask_meta = candidates[0][:3]
+            vresult = None
+            quality_report = InferenceQualityReport(
+                passed=True, identity_drift_score=0.0, failure_reasons=(),
+            )
+            best_candidate_score = 0.0
+        else:
+            raise RuntimeError("No candidates generated — inference produced no output")
+
+        retry_count = retry_round
+
+        # ── Mask coverage validation (for output metadata) ─────────────
+        final_mask_np = mask_meta.get("final_mask_np")
+        protect_mask_np = mask_meta.get("protect_mask_np")
+        if final_mask_np is not None:
+            final_mask_img = Image.fromarray(final_mask_np, mode="L")
+            if final_mask_img.size != TARGET_SIZE:
+                final_mask_img = final_mask_img.resize(TARGET_SIZE, Image.NEAREST)
+            coverage = validate_mask_coverage(final_mask_img, vton_type)
             mask_meta["coverage_valid"] = coverage.get("valid")
             mask_meta["coverage_percent"] = coverage.get("coverage_percent")
 
-        quality_report = detect_inference_failures(
-            person_img.resize(TARGET_SIZE),
-            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-            Image.fromarray(final_mask, mode="L") if schp_labels is not None else Image.new("L", TARGET_SIZE, 0),
-            Image.fromarray(protect_mask, mode="L") if schp_labels is not None else None,
-        )
-
         logger.info(
-            "attempt_%d strategy=%s identity_drift=%.1f trace_id=%s",
-            attempt_idx, strategy,
-            quality_report.identity_drift_score if quality_report else -1,
+            "candidate_selection round=%d candidates=%d best_score=%.4f "
+            "passed=%s trace_id=%s",
+            retry_round, len(candidates), best_candidate_score,
+            quality_report.passed if quality_report else False,
             trace_id,
         )
 
-        if not retry_enabled or attempt_idx >= len(retry_strategies) - 1:
+        # ── Decide whether to retry ───────────────────────────────────
+        if vresult is None or (vresult.passed and vresult.score >= min_candidate_score):
+            break
+        if retry_round >= max_retry_rounds:
             break
 
-        if quality_report is not None and quality_report.passed:
-            break
-
-        failure_reasons = list(quality_report.failure_reasons) if quality_report else []
         logger.warning(
-            "inference_qa_failed attempt=%s strategy=%s reasons=%s retrying",
-            attempt_idx, strategy, failure_reasons,
+            "retry_round=%d score=%.4f reasons=%s next_guidance=%.2f next_steps=%d",
+            retry_round, best_candidate_score, failure_reasons,
+            effective_guidance * (1.0 + RETRY_GUIDANCE_BOOST * (retry_round + 1)),
+            effective_steps + RETRY_STEPS_BOOST * (retry_round + 1),
         )
+        retry_round += 1
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
     # ── Face restoration — mild enhancement, no identity overwrite ────────
-    # enhanace_face() detects the face in the result and applies a mild
-    # unsharp-mask sharpening (or GFPGAN if available) ONLY to the face
-    # region, then blends it back with a Gaussian feather. It sources the
-    # face from the original person_original for identity preservation and
-    # never pastes original pixels over generated clothing.
-    if result is not None and _FACE_RESTORATION_AVAILABLE and _do_enhance_face is not None:
+    # Enahnces the face region in the diffusion output using mild sharpening
+    # or GFPGAN.  Sources the face from the original person image and never
+    # pastes original pixels over generated clothing.
+    face_restore_enabled = os.environ.get("ENABLE_FACE_RESTORATION", "1") == "1"
+    if (
+        face_restore_enabled
+        and result is not None
+        and _FACE_RESTORATION_AVAILABLE
+        and _do_enhance_face is not None
+    ):
         person_ref = person_img
         if person_ref.size != result.size:
             person_ref = person_ref.resize(result.size, Image.LANCZOS)
@@ -1282,6 +1363,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         ),
         "garment_mean_rgb": round(garm_mean_all, 1),
         "guidance_scale_used": round(effective_guidance, 2),
+        "best_candidate_score": round(best_candidate_score, 4),
+        "candidate_count": candidate_count,
         "trace_id": trace_id,
         "warnings": input_warnings,
     }
