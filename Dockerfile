@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.4
+# syntax=docker/dockerfile:1.7
 
 # =============================================================================
 # IDM-VTON RunPod Inference Image
@@ -79,7 +79,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Layer 4 — Clone IDM-VTON repo + download ALL binary checkpoints
 # =============================================================================
 
-# 4a — Clone the repository and download OpenPose checkpoint
+# 4a — Clone the repository, download OpenPose checkpoint, and verify
 # The GIT_REVISION build arg acts as a cache buster — pass the latest commit SHA
 # at build time to invalidate this layer when the repo changes.
 #   docker build --build-arg GIT_REVISION=$(git rev-parse HEAD) ...
@@ -93,7 +93,8 @@ RUN git lfs install && \
         https://huggingface.co/spaces/yisol/IDM-VTON/resolve/main/ckpt/openpose/ckpts/body_pose_model.pth && \
     ln -sf \
         $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
-        $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth
+        $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth && \
+    python -c "import os,sys; p='$IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth'; sz=os.path.getsize(p)/1024/1024; print(f'body_pose_model.pth = {sz:.1f} MB'); sys.exit(0 if sz>=10 else 1)"
 
 # 4b — Download ONNX humanparsing models (bypasses git LFS issues)
 RUN python - <<'PY'
@@ -149,26 +150,15 @@ shutil.rmtree("/tmp/hf_densepose_cache", ignore_errors=True)
 print("DensePose download complete")
 PY
 
-# 4d — Verify OpenPose checkpoint size
-RUN python - <<'PY'
-import os, sys
-p = "/workspace/IDM-VTON/ckpt/openpose/ckpts/body_pose_model.pth"
-if not os.path.exists(p):
-    sys.exit(f"Missing: {p}")
-size_mb = os.path.getsize(p) / 1024 / 1024
-print("body_pose_model.pth size_mb =", size_mb)
-if size_mb < 10:
-    sys.exit("body_pose_model.pth looks corrupted or incomplete")
-PY
-
 # =============================================================================
-# Layer 5 — Download full IDM-VTON SDXL weights
+# Layer 5 — Download full IDM-VTON SDXL weights + cleanup + verify
 # =============================================================================
 
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
-import os
+import os, sys, shutil
 
+# --- Download ---
 target_dir = "/workspace/models/yisol/IDM-VTON"
 os.makedirs(target_dir, exist_ok=True)
 
@@ -181,23 +171,19 @@ snapshot_download(
 )
 
 print("Download complete")
-PY
 
-# 5a — Clean up HuggingFace cache (~7-10 GB) to avoid image bloat
-RUN rm -rf /root/.cache/huggingface
+# --- Cleanup HuggingFace cache (~7-10 GB) to avoid image bloat ---
+import shutil as _shutil
+_shutil.rmtree("/root/.cache/huggingface", ignore_errors=True)
+print("HuggingFace cache cleaned")
 
-# 5b — Verify required weight files exist (not just directories)
-RUN python - <<'PY'
-import os, sys, shutil
+# --- Verify required weight files exist (not just directories) ---
+target = target_dir
 
-target = "/workspace/models/yisol/IDM-VTON"
-
-# Files with minimum size thresholds (MB) — only large weight files
 size_checked = {
     "unet/diffusion_pytorch_model.bin": 1000,
     "vae/diffusion_pytorch_model.safetensors": 50,
 }
-# Config files — existence only, no size enforcement
 config_files = [
     "scheduler/scheduler_config.json",
     "tokenizer/tokenizer_config.json",
@@ -236,7 +222,6 @@ for rel_path in config_files:
         size_kb = os.path.getsize(full) / 1024
         print(f"  OK: {rel_path} = {size_kb:.1f} KB")
 
-# Also verify model subdirectories exist
 for sub in ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
             "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder"]:
     path = os.path.join(target, sub)
@@ -246,7 +231,6 @@ for sub in ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
     else:
         print(f"  OK: {sub}/")
 
-# Log disk usage
 total, used, free = shutil.disk_usage("/workspace")
 print(f"DISK: total_gb={total / (1024**3):.1f} used_gb={used / (1024**3):.1f} free_gb={free / (1024**3):.1f}")
 
@@ -257,7 +241,6 @@ PY
 
 # =============================================================================
 # Layer 6 — Build validation (IDM-VTON pipeline)
-# =============================================================================
 # =============================================================================
 
 RUN python - <<'PY'
@@ -315,7 +298,6 @@ COPY handler.py /workspace/handler.py
 COPY mask_pipeline.py /workspace/mask_pipeline.py
 COPY post_processing.py /workspace/post_processing.py
 COPY face_restoration.py /workspace/face_restoration.py
-COPY test_bare_skin.py /workspace/test_bare_skin.py
 
 # =============================================================================
 # Layer 7 — Validate worker module (mask_pipeline.py)

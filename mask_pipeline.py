@@ -93,21 +93,6 @@ _DRAPE_KEYWORDS = (
     "pallu", "shawl", "wrap", "anarkali", "ethnic",
 )
 
-# Full-body mask labels for bare-skin inpaint (Stage 0).
-# Covers ALL garment labels + arms — everything that could be clothing.
-_FULL_BODY_INPAINT_LABELS = {
-    _LABEL_UPPER_CLOTHES,  # 5
-    _LABEL_DRESS,          # 6
-    _LABEL_COAT,           # 7
-    _LABEL_SOCKS,          # 8
-    _LABEL_PANTS,          # 9
-    _LABEL_JUMPSUITS,      # 10
-    _LABEL_SCARF,          # 11
-    _LABEL_SKIRT,          # 12
-    _LABEL_LEFT_ARM,       # 14
-    _LABEL_RIGHT_ARM,      # 15
-}
-
 
 @dataclass(frozen=True)
 class InferenceQualityReport:
@@ -227,21 +212,6 @@ def build_schp_inpaint_mask(
     return mask
 
 
-def build_full_body_inpaint_mask(schp_labels: np.ndarray) -> np.ndarray:
-    """
-    Full-body mask for bare-skin inpaint (Stage 0 of cross-category pipeline).
-
-    Covers ALL garment labels + arms — everything that could be clothing.
-    Unlike build_schp_inpaint_mask which is category-specific, this is
-    category-agnostic: it marks every pixel that could be garment as editable.
-
-    The protect mask for identity (face, hair, shoes) is applied separately
-    in build_final_inpaint_mask.
-    """
-    mask = np.isin(schp_labels, list(_FULL_BODY_INPAINT_LABELS)).astype(np.uint8) * 255
-    return mask
-
-
 def build_schp_protect_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
@@ -304,33 +274,6 @@ def dilate_inpaint_mask(
     mild_ks = (max(3, int(17 * scale)), max(3, int(11 * scale)))
     mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
     return cv2.dilate(inpaint_mask, mild_k, iterations=1)
-
-
-def build_final_full_body_mask(
-    schp_labels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Full-body mask pipeline for bare-skin inpaint.
-
-    Inpaint = all garment labels + arms (full body coverage).
-    Protect = identity only (face, hair, hat, gloves, sunglasses, shoes).
-    Final = inpaint − protect.
-
-    Returns (final_mask, inpaint_dilated, protect_mask).
-    """
-    inpaint_raw = build_full_body_inpaint_mask(schp_labels)
-
-    # Identity-only protect: no lower body, no arm blocking — just face/hair/accessories
-    protect = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
-
-    # Dilate inpaint aggressively for full-body coverage
-    scale = schp_labels.shape[0] / 512.0
-    ks = (max(3, int(15 * scale)), max(3, int(19 * scale)))
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ks)
-    inpaint_dilated = cv2.dilate(inpaint_raw, k, iterations=2)
-
-    final = apply_protection_binary(inpaint_dilated, protect)
-    return final, inpaint_dilated, protect
 
 
 def build_final_inpaint_mask(
