@@ -95,8 +95,7 @@ def is_draped_garment(cloth_type: str, garment_subtype: str = "") -> bool:
     subtype = (garment_subtype or "").strip().lower()
     if any(kw in subtype for kw in _DRAPE_KEYWORDS):
         return True
-    # Full-body dress category without subtype — allow drape expansion (safer for ethnic wear).
-    return ct in ("dresses", "full_body")
+    return False
 
 
 def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
@@ -221,12 +220,12 @@ def dilate_inpaint_mask(
     draped = is_draped_garment(cloth_type, garment_subtype)
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_ks = (max(3, int(19 * scale)), max(3, int(29 * scale)))
+        leg_ks = (max(3, int(13 * scale)), max(3, int(19 * scale)))
         leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
-        iterations = 3 if draped else 2
+        iterations = 2 if draped else 1
         return cv2.dilate(inpaint_mask, leg_k, iterations=iterations)
 
-    mild_ks = (max(3, int(25 * scale)), max(3, int(15 * scale)))
+    mild_ks = (max(3, int(17 * scale)), max(3, int(11 * scale)))
     mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
     return cv2.dilate(inpaint_mask, mild_k, iterations=1)
 

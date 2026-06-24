@@ -874,39 +874,12 @@ def run_idm_vton_inference(
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    _SUBTYPE_FABRIC = {
-        "jeans": "denim fabric, realistic denim texture, natural denim folds, faded whiskers, authentic seams, coin pocket, rivet details, worn fabric texture",
-        "hoodie": "cotton fleece fabric, relaxed fit, natural wrinkles, soft folds, ribbed cuffs, drawstring hood, pouch pocket seams",
-        "sweatshirt": "cotton fleece fabric, relaxed fit, natural wrinkles, soft folds, ribbed hem and cuffs",
-        "t-shirt": "cotton jersey fabric, natural fit, soft folds, realistic drape, ribbed neckline seam, hem stitch detail",
-        "shirt": "woven cotton fabric, tailored fit, sharp creases, natural wrinkles, button placket seam, collar stand, cuffed sleeves",
-        "blazer": "structured woven fabric, tailored fit, sharp seams, natural folds, notch lapel, chest pocket seam, vent detail",
-        "jacket": "structured fabric, fitted shoulders, realistic seams, natural folds, zipper detail, pocket flaps, hem band",
-        "sweater": "knit fabric, relaxed fit, knit texture, natural wrinkles, ribbed crew neck, cable knit detail, hem ribbing",
-        "cardigan": "knit fabric, relaxed fit, knit texture, natural wrinkles, button placket, ribbed edges",
-        "blouse": "flowing fabric, natural drape, soft wrinkles, realistic folds, collar detail, pleated shoulder seam",
-        "top": "soft fabric, natural fit, realistic folds, soft drape, neckline seam, hem detail",
-        "vest": "structured fabric, fitted, sharp seams, natural folds, armhole binding, button front seam",
-        "kurta": "flowing fabric, straight cut, natural drape, soft folds, neckline embroidery detail, side slits",
-        "pants": "woven fabric, natural fabric folds, realistic wrinkles, tailored crease, belt loop seams, hem stitch, pocket outline",
-        "trousers": "woven fabric, tailored fit, sharp crease, natural wrinkles, pleated front seam, hem detail",
-        "shorts": "cotton fabric, relaxed fit, soft folds, natural wrinkles, hem seam, pocket stitching",
-        "skirt": "flowing fabric, natural drape, realistic folds, soft wrinkles, waistband seam, hemline detail",
-        "dress": "flowing fabric, natural drape, realistic wrinkles, soft folds, waist seam, neckline binding, hem detail",
-        "gown": "flowing fabric, floor-length drape, elegant folds, natural wrinkles, bodice seam, skirt gathers, hem stitch",
-        "jumpsuit": "structured fabric, tailored fit, sharp seams, natural folds, waist seam detail, leg hem, pocket stitching",
-        "saree": "draped silk fabric, flowing silhouette, realistic saree folds, natural pleats, decorative border detail, pallu drape, fabric sheen",
-        "dupatta": "sheer draped fabric, flowing dupatta, soft translucent textile, natural folds, pallu drape, delicate fabric sheen",
-        "lehenga": "structured waistband, flowing skirt, realistic pleats, natural folds, embroidered border detail, waist seam",
-        "tracksuit": "cotton fabric, sporty fit, soft folds, natural wrinkles, ribbed cuffs, drawstring waistband, leg zip detail",
-        "co-ord": "matching fabric, coordinated fit, natural folds, realistic wrinkles, waist seam detail, hem finishing",
-    }
-    fabric_desc = _SUBTYPE_FABRIC.get(garment_subtype, "structured fabric, natural folds, realistic texture, sharp details, visible seams, natural shadows, fabric grain visible")
+    fabric_desc = "realistic fabric texture, natural folds, soft wrinkles, quality material, detailed texture"
     prompt = (
         "model is wearing " + garment_desc + ", " + fabric_desc
         + ", photorealistic, sharp focus, fashion photography, "
         + "soft studio lighting, high quality, detailed fabric texture, "
-        + "natural skin, professional photo, no accessories, "
+        + "natural skin, professional photo, "
         + "detailed face, natural facial features, symmetric face, "
         + "natural body proportions, natural hands, natural fingers"
     )
@@ -1308,11 +1281,20 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
+    # ── DEBUG SAVE: raw output before face restoration ─────────────────────
+    _debug_dir = Path("/tmp/idm-vton-debug")
+    _debug_dir.mkdir(parents=True, exist_ok=True)
+    if raw_output is not None:
+        raw_output.save(str(_debug_dir / f"raw_output_before_face_restoration_{trace_id}.png"))
+    else:
+        logger.warning("debug_save_raw_output raw_output_is_None trace_id=%s", trace_id)
+
     # ── Face restoration — mild enhancement, no identity overwrite ────────
     # Enahnces the face region in the diffusion output using mild sharpening
     # or GFPGAN.  Sources the face from the original person image and never
     # pastes original pixels over generated clothing.
     face_restore_enabled = os.environ.get("ENABLE_FACE_RESTORATION", "1") == "1"
+    logger.info("ENABLE_FACE_RESTORATION=%s trace_id=%s", face_restore_enabled, trace_id)
     if (
         face_restore_enabled
         and result is not None
@@ -1327,9 +1309,18 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             "face_restoration_applied face_detected=%s trace_id=%s",
             face_meta_out.get("face_detected", "unknown"), trace_id,
         )
+        # ── DEBUG SAVE: output after face restoration ────────────────────
+        result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
     else:
         logger.info("face_restoration_skipped available=%s trace_id=%s",
                      _FACE_RESTORATION_AVAILABLE, trace_id)
+        # ── DEBUG SAVE: output with face restoration skipped ─────────────
+        if result is not None:
+            result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
+
+    # ── DEBUG SAVE: final returned output ─────────────────────────────────
+    if result is not None:
+        result.save(str(_debug_dir / f"final_returned_output_{trace_id}.png"))
 
     # ── Upload ───────────────────────────────────────────────────────────
     upload_start = time.perf_counter()
