@@ -76,8 +76,8 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "45"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.75"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "50"))
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "3.0"))
 
 # Cross-category two-stage pipeline constants
 NEUTRAL_GARMENT_PATH = os.path.join(
@@ -410,20 +410,23 @@ def run_cross_category_inference(
 
     Stage 1 — Erase:  broad full-body inpaint that removes the old garment
                        and replaces it with a neutral plain underlayer.
-                       Uses fewer steps (20) + higher guidance (3.5) so the
-                       erase is fast and decisive without creating detailed
-                       garment features.
+                       Uses 30 steps + guidance 4.0 for complete erasing.
+                       The positive prompt is overridden to remove face/body
+                       terms that cause identity drift during erase.
 
     Stage 2 — Apply:   normal try-on inference using the actual target garment
                        on the Stage-1 erased body.  Standard steps/guidance.
 
     Returns (final_result, raw_output, mask_meta_from_stage2).
     """
+    erase_steps = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "40"))
+    erase_guidance = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "4.5"))
+
     logger.info(
         "cross_category_stage1_erase_start cloth_type=%s "
         "steps=%d guidance=%.2f trace_id=%s",
-        cloth_type, CROSS_CATEGORY_ERASE_STEPS,
-        CROSS_CATEGORY_ERASE_GUIDANCE, trace_id,
+        cloth_type, erase_steps,
+        erase_guidance, trace_id,
     )
 
     # ── Stage 1: erase old garment ────────────────────────────────────
@@ -433,15 +436,20 @@ def run_cross_category_inference(
         "simple neutral undergarments, solid fabric, "
         "minimal basic clothing"
     )
+    stage1_positive = (
+        "model wearing plain simple beige tank top and shorts, "
+        "solid neutral undergarments, photorealistic, high quality"
+    )
     stage1_negative = (
+        "saree, drape, pallu, dupatta, scarf, shawl, lehenga, "
         "pattern, print, design, logo, text, embroidery, lace, trim, "
+        "original clothing, old garment, previous outfit, residual fabric, "
         "detailed fabric, textured, woven, striped, plaid, floral, "
-        "monochrome, lowres, bad anatomy, worst quality, low quality, "
-        "deformed, distorted, disfigured, bad proportions, "
-        "extra limbs, missing limbs, cloned head, body out of frame, "
-        "poorly drawn face, mutation, mutated, extra fingers, "
+        "worst quality, low quality, deformed, distorted, "
+        "bad anatomy, bad proportions, extra limbs, missing limbs, "
         "ugly, blurry, watermark, signature, "
-        "smooth plastic, airbrushed, cg render, 3d render"
+        "smooth plastic, airbrushed, cg render, "
+        "recoloring, double garment, layered clothing"
     )
 
     erased_person, erased_raw, stage1_meta = run_idm_vton_inference(
@@ -450,11 +458,12 @@ def run_cross_category_inference(
         garment_desc=stage1_desc,
         cloth_type="dresses",
         garment_subtype="saree",  # triggers draped mode → arm labels in mask
-        steps=CROSS_CATEGORY_ERASE_STEPS,
+        steps=erase_steps,
         seed=seed,
-        guidance_scale=CROSS_CATEGORY_ERASE_GUIDANCE,
+        guidance_scale=erase_guidance,
         auto_crop=True,
         crop_preserve_lower=True,
+        override_prompt=stage1_positive,
         override_negative_prompt=stage1_negative,
     )
 
@@ -465,7 +474,11 @@ def run_cross_category_inference(
     )
 
     # ── Stage 2: apply target garment ─────────────────────────────────
-    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+    # Use slightly higher guidance on erased body for stronger commitment
+    stage2_guidance = max(
+        guidance_scale if guidance_scale is not None else GUIDANCE_SCALE,
+        3.25,
+    )
 
     result, raw_output, mask_meta = run_idm_vton_inference(
         person_img=erased_person,
@@ -475,7 +488,7 @@ def run_cross_category_inference(
         garment_subtype=garment_subtype,
         steps=steps,
         seed=seed + 1,  # different seed for diversity from erase stage
-        guidance_scale=effective_guidance,
+        guidance_scale=stage2_guidance,
         auto_crop=True,
         crop_preserve_lower=True,
     )
@@ -511,6 +524,205 @@ def run_cross_category_inference(
             logger.warning("cross_category_debug_save_failed error=%s trace_id=%s", exc, trace_id)
 
     return result, raw_output, mask_meta
+
+
+# =============================================================================
+# EXPERIMENTAL: Bare-skin inpaint (Stage 0 prototype)
+# =============================================================================
+
+
+def run_bare_skin_inpaint(
+    person_img: Image.Image,
+    steps: int = 40,
+    seed: int = 42,
+    guidance_scale: float = 4.5,
+    trace_id: str = "",
+) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
+    """
+    EXPERIMENTAL: Test whether IDM-VTON can reconstruct a believable body
+    underneath a garment using only the visible person image as reference.
+
+    Hypothesis: If we set ip_adapter_image = person_img (not a garment),
+    the model uses the person's own body texture to fill the masked region.
+
+    This function:
+    1. Builds a full-body mask (all garment labels + arms)
+    2. Uses person_img as IP-Adapter reference (not a garment)
+    3. Uses person_img as the cloth tensor (not a garment)
+    4. Uses a minimal prompt (no face/body terms)
+    5. Runs inference with high guidance for strong commitment
+
+    Returns (final_output, raw_output, mask_meta).
+    """
+    from mask_pipeline import (
+        build_final_full_body_mask,
+        assert_binary_mask,
+        validate_mask_integrity,
+        validate_mask_coverage,
+    )
+
+    global pipe, parsing_model, openpose_model
+    global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
+
+    device = DEVICE
+
+    if torch.cuda.is_available():
+        openpose_model.preprocessor.body_estimation.model.to(device)
+        pipe.to(device)
+        pipe.unet_encoder.to(device)
+
+    human_img_orig = person_img.convert("RGB")
+    human_img = human_img_orig.resize(TARGET_SIZE)
+
+    # ── Build full-body mask ──────────────────────────────────────────
+    model_parse, _ = parsing_model(human_img)
+    schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
+    if isinstance(model_parse, torch.Tensor):
+        schp_np = model_parse.cpu().numpy()
+    if schp_np.ndim == 3:
+        schp_np = schp_np.squeeze(0)
+    schp_np = schp_np.astype(np.uint8)
+
+    final_mask_np, inpaint_mask_np, protect_mask_np = build_final_full_body_mask(schp_np)
+
+    assert_binary_mask(final_mask_np, "bare_skin_final_mask")
+    validate_mask_integrity(final_mask_np, "bare_skin_final_mask")
+
+    final_mask = Image.fromarray(final_mask_np, mode="L")
+    if final_mask.size != TARGET_SIZE:
+        final_mask = final_mask.resize(TARGET_SIZE, Image.LANCZOS)
+        final_mask = final_mask.point(lambda x: 255 if x > 127 else 0)
+
+    mask_v = validate_mask_coverage(final_mask, "dresses")
+    logger.info(
+        "bare_skin_mask coverage=%.1f%% valid=%s",
+        mask_v["coverage_percent"], mask_v["valid"],
+    )
+
+    mask_meta: dict[str, object] = {
+        "mask_type_used": "full_body_bare_skin",
+        "coverage_valid": mask_v["valid"],
+        "coverage_percent": mask_v["coverage_percent"],
+        "schp_labels": schp_np,
+        "protect_mask_np": protect_mask_np,
+        "inpaint_mask_np": inpaint_mask_np,
+        "final_mask_np": final_mask_np,
+        "is_draped_garment": False,
+        "garment_subtype": "bare_skin_experiment",
+    }
+
+    # ── DensePose for body geometry ───────────────────────────────────
+    from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
+    human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
+    human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
+
+    with torch.no_grad():
+        densepose_pred = densepose_predictor(human_img_arg)
+        if "instances" not in densepose_pred or len(densepose_pred["instances"]) == 0:
+            logger.warning("bare_skin_densepose_no_instances")
+            pose_img = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
+        else:
+            densepose_outputs = densepose_pred["instances"]
+            from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
+            from densepose.vis.extractor import create_extractor
+            vis = DensePoseResultsFineSegmentationVisualizer(cfg=densepose_cfg)
+            extractor = create_extractor(vis)
+            data = extractor(densepose_outputs)
+            gray_img = cv2.cvtColor(human_img_arg, cv2.COLOR_BGR2GRAY)
+            gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
+            pose_img = vis.visualize(gray_img, data)
+            pose_img = pose_img[:, :, ::-1]
+            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
+
+    # ── KEY CHANGE: Use person as IP-Adapter reference ────────────────
+    # Instead of a garment, we use the person image itself.
+    # The model should use the person's own body texture to fill the mask.
+    ip_adapter_ref = human_img  # person, not garment
+
+    # ── KEY CHANGE: Use person as cloth tensor ────────────────────────
+    # Instead of a garment tensor, we use the person image.
+    cloth_tensor_src = human_img  # person, not garment
+
+    # ── KEY CHANGE: Minimal prompt, no face/body terms ────────────────
+    prompt = "person wearing no clothing, bare skin, photorealistic"
+    negative_prompt = (
+        "worst quality, low quality, deformed, distorted, disfigured, "
+        "bad anatomy, bad proportions, extra limbs, missing limbs, "
+        "ugly, blurry, watermark, signature, text, logo, "
+        "smooth plastic, airbrushed, cg render, "
+        "original clothing, old garment, previous outfit, "
+        "residual fabric, double garment, layered clothing"
+    )
+
+    # ── Encode prompts ────────────────────────────────────────────────
+    with torch.inference_mode():
+        with _maybe_autocast():
+            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = pipe.encode_prompt(
+                prompt,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt=negative_prompt,
+            )
+
+            # Garment conditioning: use person description (not garment)
+            prompt_c = "a photo of a person, high quality"
+            prompt_embeds_c, _, _, _ = pipe.encode_prompt(
+                prompt_c,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+                negative_prompt=negative_prompt,
+            )
+
+    # ── Prepare tensors ───────────────────────────────────────────────
+    pose_tensor = tensor_transform(pose_img).unsqueeze(0).to(device, TORCH_DTYPE)
+    # Use person image as cloth tensor (not garment)
+    cloth_tensor = tensor_transform(cloth_tensor_src).unsqueeze(0).to(device, TORCH_DTYPE)
+    generator = torch.Generator(device).manual_seed(seed) if seed is not None and torch.cuda.is_available() else None
+
+    # ── Run pipeline ──────────────────────────────────────────────────
+    with torch.inference_mode():
+        with _maybe_autocast():
+            logger.info(
+                "bare_skin_inference_start steps=%d guidance=%.2f seed=%d",
+                steps, guidance_scale, seed,
+            )
+            pipe_output = pipe(
+                prompt_embeds=prompt_embeds.to(device, TORCH_DTYPE),
+                negative_prompt_embeds=negative_prompt_embeds.to(device, TORCH_DTYPE),
+                pooled_prompt_embeds=pooled_prompt_embeds.to(device, TORCH_DTYPE),
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(device, TORCH_DTYPE),
+                num_inference_steps=steps,
+                generator=generator,
+                strength=1.0,
+                pose_img=pose_tensor.to(device, TORCH_DTYPE),
+                text_embeds_cloth=prompt_embeds_c.to(device, TORCH_DTYPE),
+                cloth=cloth_tensor.to(device, TORCH_DTYPE),
+                mask_image=final_mask,
+                image=human_img,
+                height=TARGET_H,
+                width=TARGET_W,
+                ip_adapter_image=ip_adapter_ref,  # KEY: person, not garment
+                guidance_scale=guidance_scale,
+            )
+            images = pipe_output[0]
+            if not images:
+                raise RuntimeError("Bare-skin inpaint returned empty images")
+
+    raw_output = images[0].copy()
+
+    # ── Save debug artifacts ──────────────────────────────────────────
+    debug_dir = Path("/tmp/bare-skin-experiment")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        Image.fromarray(final_mask_np, mode="L").save(
+            str(debug_dir / f"mask_{trace_id}.png")
+        )
+        raw_output.save(str(debug_dir / f"raw_{trace_id}.png"))
+        logger.info("bare_skin_debug_saved trace_id=%s", trace_id)
+    except Exception as exc:
+        logger.warning("bare_skin_debug_save_failed error=%s", exc)
+
+    return raw_output, raw_output, mask_meta
 
 
 # =============================================================================
@@ -1099,46 +1311,32 @@ def run_idm_vton_inference(
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    fabric_desc = "realistic fabric texture, natural folds, soft wrinkles, quality material, detailed texture"
-
     if override_prompt is not None:
         prompt = override_prompt
     else:
         prompt = (
-            "model is wearing " + garment_desc + ", " + fabric_desc
-            + ", photorealistic, sharp focus, fashion photography, "
-            + "soft studio lighting, high quality, detailed fabric texture, "
-            + "natural skin, professional photo, "
-            + "detailed face, natural facial features, symmetric face, "
-            + "natural body proportions, natural hands, natural fingers"
+            "model is wearing " + garment_desc
+            + ", photorealistic, high quality, sharp focus"
         )
 
     if override_negative_prompt is not None:
         negative_prompt = override_negative_prompt
     else:
         negative_prompt = (
-            "monochrome, lowres, bad anatomy, worst quality, low quality, "
-            "deformed, distorted, disfigured, bad proportions, "
-            "extra limbs, missing limbs, cloned head, body out of frame, "
-            "poorly drawn face, mutation, mutated, extra fingers, "
+            "worst quality, low quality, deformed, distorted, disfigured, "
+            "bad anatomy, bad proportions, extra limbs, missing limbs, "
+            "cloned head, body out of frame, mutation, mutated, extra fingers, "
             "ugly, blurry, watermark, signature, text, logo, "
             "smooth plastic, airbrushed, cg render, 3d render, "
-            "flat lighting, "
             "watercolor, smudged, washed out, overlaid, transparent, "
             "see-through, ghost, double exposure, translucent, "
-            "poorly sewn, unfinished edges, loose threads, "
-            "fabric tearing, fabric distortion, fabric wrinkling, "
-            "pattern mismatch, texture seam, visible seam, "
-        "bag, purse, handbag, clutch, tote, backpack, "
-        "headphones, earphones, headset, "
-        "necklace, chain, pendant, choker, "
-        "watch, wristwatch, bracelet, "
-        "sunglasses, eyewear, glasses, "
-        "phone, smartphone, mobile, "
-        "strap, belt, waist belt, "
-        "accessory, accessories, "
-        "extra object, held item, carrying"
-    )
+            "original clothing, old garment, previous outfit, "
+            "residual fabric, recoloring, double garment, layered clothing, "
+            "poorly sewn, fabric tearing, pattern mismatch, "
+            "bag, purse, handbag, backpack, "
+            "necklace, chain, pendant, choker, "
+            "sunglasses, glasses, phone, belt, accessory, accessories"
+        )
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -1149,7 +1347,7 @@ def run_idm_vton_inference(
                 negative_prompt=negative_prompt,
             )
 
-            prompt_c = "a photo of " + garment_desc + ", " + fabric_desc
+            prompt_c = "a photo of " + garment_desc + ", high quality"
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
@@ -1260,6 +1458,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
+    guidance_scale_input = job_input.get("guidance_scale")
+    guidance_scale = float(guidance_scale_input) if guidance_scale_input is not None else None
     trace_id = job_input.get("trace_id", "")
     # Forward preprocessing warnings through the output so the frontend
     # can display them to the user (body completeness, face, etc.)
@@ -1397,7 +1597,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             garment_subtype=garment_subtype,
             steps=steps,
             seed=seed,
-            guidance_scale=GUIDANCE_SCALE,
+            guidance_scale=guidance_scale,
             trace_id=trace_id,
         )
         if torch.cuda.is_available():
@@ -1412,7 +1612,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         best_candidate_score = 0.0
         candidate_count = 1
         failure_reasons = []
-        effective_guidance = GUIDANCE_SCALE
+        effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
         draped_request = False
 
         logger.info(
@@ -1429,8 +1629,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     if not cross_category_needed:
         inference_start = time.perf_counter()
 
-        # Guidance/step tuning
-        effective_guidance = GUIDANCE_SCALE
+        # Guidance/step tuning — use frontend preset if provided, else env default
+        effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
         effective_steps = steps
         draped_request = is_draped_garment(vton_type, garment_subtype)
         if draped_request or vton_type in ("dresses", "full_body"):

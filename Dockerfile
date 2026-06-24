@@ -315,6 +315,7 @@ COPY handler.py /workspace/handler.py
 COPY mask_pipeline.py /workspace/mask_pipeline.py
 COPY post_processing.py /workspace/post_processing.py
 COPY face_restoration.py /workspace/face_restoration.py
+COPY test_bare_skin.py /workspace/test_bare_skin.py
 
 # =============================================================================
 # Layer 7 — Validate worker module (mask_pipeline.py)

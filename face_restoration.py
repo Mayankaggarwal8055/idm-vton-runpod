@@ -75,7 +75,7 @@ def enhance_face(
         enhanced_face = _apply_opencv_enhance(face_region)
 
     meta["restoration_method"] = method
-    result_np = _blend_face(result_np, enhanced_face, x1, y1, x2, y2, feather_fraction=0.12)
+    result_np = _blend_face(result_np, enhanced_face, x1, y1, x2, y2, feather_fraction=0.20)
 
     elapsed = (time.perf_counter() - t0) * 1000
     meta["restoration_time_ms"] = round(elapsed, 1)
@@ -120,8 +120,8 @@ def _detect_face_bbox_from_array(
 
 def _apply_opencv_enhance(face_rgb: np.ndarray) -> np.ndarray:
     """Mild unsharp mask on diffusion output — no denoise/CLAHE/saturation."""
-    blurred = cv2.GaussianBlur(face_rgb, (0, 0), sigmaX=0.6)
-    sharpened = cv2.addWeighted(face_rgb, 1.25, blurred, -0.25, 0)
+    blurred = cv2.GaussianBlur(face_rgb, (0, 0), sigmaX=0.8)
+    sharpened = cv2.addWeighted(face_rgb, 1.15, blurred, -0.15, 0)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
@@ -133,11 +133,13 @@ def _apply_gfpgan(face_rgb: np.ndarray, trace_id: str) -> np.ndarray | None:
         return None
     try:
         face_bgr = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR)
-        _, _, restored_bgr = _restoration_model.enhance(
-            face_bgr, has_aligned=False, only_center_face=True, paste_back=True,
+        # Use paste_back=False to get raw restored face, then we blend ourselves
+        # to avoid double-blending artifacts
+        cropped, restored, _ = _restoration_model.enhance(
+            face_bgr, has_aligned=False, only_center_face=True, paste_back=False,
         )
-        if restored_bgr is not None:
-            return cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
+        if restored is not None:
+            return cv2.cvtColor(restored, cv2.COLOR_BGR2RGB)
     except Exception as exc:
         logger.warning("gfpgan_enhance_failed error=%s trace_id=%s", exc, trace_id)
     return None

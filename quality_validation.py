@@ -143,13 +143,14 @@ def validate_garment_region(
     result: Image.Image,
     garment_img: Image.Image,
     mask_np: np.ndarray | None,
-) -> tuple[float, float, list[str]]:
+) -> tuple[float, float, float, list[str]]:
     """
     Check garment-region quality in the result image.
 
-    Returns (garment_quality, garment_replacement, failure_reasons) where:
+    Returns (garment_quality, garment_replacement, color_coherence, failure_reasons) where:
       - garment_quality = 0..1 (1 = perfect texture/color match)
       - garment_replacement = 0..1 fraction of mask region changed from orig
+      - color_coherence = 0..1 (1 = perfect color match with garment)
       - failure_reasons = list of issues found
 
     Measures:
@@ -200,14 +201,15 @@ def validate_garment_region(
     if texture_detail < 0.2:
         reasons.append("garment_over_smooth")
 
-    # ── 3. Colour coherence with input garment (global histogram) ───────
-    garm_h, garm_w = garm.shape[:2]
-    garm_flat = garm.reshape(-1, 3).astype(np.float32)
-    out_flat = out.reshape(-1, 3).astype(np.float32)
-    # Mean colour difference
-    garm_mean = np.mean(garm_flat, axis=0)
-    out_mean = np.mean(out_flat, axis=0)
-    color_diff = float(np.linalg.norm(garm_mean - out_mean))
+    # ── 3. Colour coherence with input garment (mask region only) ───────
+    if np.any(inpaint_region):
+        garm_region = garm[inpaint_region]
+        out_region = out[inpaint_region]
+        garm_mean = np.mean(garm_region, axis=0)
+        out_mean = np.mean(out_region, axis=0)
+        color_diff = float(np.linalg.norm(garm_mean - out_mean))
+    else:
+        color_diff = 0.0
     color_coherence = max(0.0, min(1.0, 1.0 - color_diff / 150.0))
 
     if color_coherence < 0.4:
@@ -216,7 +218,7 @@ def validate_garment_region(
     # ── Aggregate garment quality ───────────────────────────────────────
     garment_quality = 0.35 * replacement + 0.35 * texture_detail + 0.30 * color_coherence
 
-    return garment_quality, replacement, reasons
+    return garment_quality, replacement, color_coherence, reasons
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -278,7 +280,7 @@ def score_candidate(
     all_reasons.extend(face_reasons)
 
     # Garment validation
-    garment_quality, replacement, garm_reasons = validate_garment_region(
+    garment_quality, replacement, color_coherence, garm_reasons = validate_garment_region(
         original, result, garment_img, mask_np,
     )
     all_reasons.extend(garm_reasons)
@@ -295,9 +297,15 @@ def score_candidate(
         w["face_quality"] * face_quality
         + w["garment_quality"] * garment_quality
         + w["sharpness"] * sharpness_score_val
+        + w["color_coherence"] * color_coherence
     )
 
-    passed = len(all_reasons) == 0
+    # Only hard-fail on severe issues (identity drift, garment unchanged, blurry)
+    # Soft warnings (ghosting, over_smooth, color_drift) reduce score but don't fail
+    severe_reasons = [r for r in all_reasons if any(
+        kw in r for kw in ("face_severe_distortion", "garment_unchanged", "image_blurry", "face_identity_drift")
+    )]
+    passed = len(severe_reasons) == 0
 
     return ValidationResult(
         passed=passed,
