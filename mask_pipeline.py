@@ -63,6 +63,20 @@ _CLOTHING_LABELS = {
     "full_body": _DRESSES_LABELS,
 }
 
+# All garment labels for cross-category mismatch detection.
+# Used to detect when the person's current garment has labels that fall
+# outside the target cloth_type's editable mask.
+_ALL_GARMENT_LABELS = {
+    _LABEL_UPPER_CLOTHES,
+    _LABEL_DRESS,
+    _LABEL_COAT,
+    _LABEL_SOCKS,
+    _LABEL_PANTS,
+    _LABEL_JUMPSUITS,
+    _LABEL_SCARF,
+    _LABEL_SKIRT,
+}
+
 _IDENTITY_PROTECT_LABELS = {
     _LABEL_HAIR,
     _LABEL_FACE,
@@ -96,6 +110,38 @@ def is_draped_garment(cloth_type: str, garment_subtype: str = "") -> bool:
     if any(kw in subtype for kw in _DRAPE_KEYWORDS):
         return True
     return False
+
+
+def needs_two_stage(
+    schp_np: np.ndarray,
+    cloth_type: str,
+    uncovered_threshold: float = 0.08,
+) -> bool:
+    """
+    Detect whether the person's current garment spans garment-label categories
+    that the target cloth_type's mask would NOT cover.
+
+    This is the root-cause check for cross-category failure.
+
+    Example: person is wearing a saree (SCHP labels 6=DRESS, 11=SCARF) but
+    target is upper_body (mask labels {5=UPPER_CLOTHES, 7=COAT}).
+    The saree body (6) and pallu (11) are outside the upper_body mask,
+    so they would survive the try-on → two-stage is needed.
+
+    Returns True when uncovered garment-label area exceeds threshold
+    fraction of the image.  False for same-category swaps that the
+    single-stage mask already covers.
+    """
+    target_labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
+    present = set(int(v) for v in np.unique(schp_np)) & _ALL_GARMENT_LABELS
+    uncovered = present - target_labels
+    if not uncovered:
+        return False
+
+    h, w = schp_np.shape
+    uncovered_px = sum(int(np.sum(schp_np == lbl)) for lbl in uncovered)
+    uncovered_frac = uncovered_px / max(h * w, 1)
+    return uncovered_frac > uncovered_threshold
 
 
 def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:

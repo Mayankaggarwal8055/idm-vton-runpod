@@ -16,7 +16,7 @@ import runpod
 import requests
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 import cloudinary
 import cloudinary.uploader
 from requests.adapters import HTTPAdapter
@@ -78,6 +78,13 @@ CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
 DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "45"))
 GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.75"))
+
+# Cross-category two-stage pipeline constants
+NEUTRAL_GARMENT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "neutral_garment.png"
+)
+CROSS_CATEGORY_ERASE_STEPS = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "20"))
+CROSS_CATEGORY_ERASE_GUIDANCE = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "3.5"))
 
 # Retry / candidate scoring thresholds
 MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
@@ -288,6 +295,222 @@ def _set_torch_perf_flags():
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+
+
+# =============================================================================
+# Cross-category two-stage pipeline
+# =============================================================================
+
+
+def _generate_neutral_garment(target_size: tuple[int, int] = TARGET_SIZE) -> Image.Image:
+    """Generate a plain neutral undergarment reference image for erase stage.
+
+    Creates a simple beige/cream tank top + shorts silhouette on white canvas
+    using only PIL primitives.  The image is deliberately low-detail — the
+    IP-Adapter receives a colour-and-shape reference with no texture, so the
+    text prompt (high guidance) dominates the erase generation.
+
+    Result is cached to disk so it only renders once per worker lifetime.
+    """
+    cached = Path(NEUTRAL_GARMENT_PATH)
+    if cached.exists():
+        return Image.open(cached).convert("RGB")
+
+    w, h = target_size
+    cx = w // 2  # 384
+
+    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    pixels = canvas.load()
+
+    # Neutral beige/cream — visually reads as "plain undergarment"
+    nr, ng, nb = 226, 210, 190
+
+    for y in range(h):
+        for x in range(w):
+            dx = abs(x - cx)
+            # Tank top: ~shoulder to waist
+            if 90 <= y <= 500:
+                # Shoulders wider, tapers to waist
+                half_w = int(200 - (y - 90) * 0.15)
+                if dx <= half_w:
+                    pixels[x, y] = (nr, ng, nb)
+            # Shorts: ~hips to mid-thigh
+            if 470 <= y <= 760:
+                half_w = 155
+                if dx <= half_w:
+                    pixels[x, y] = (nr, ng, nb)
+
+    # Soften edges so IP-Adapter doesn't try to reproduce hard polygon boundaries
+    result = canvas.filter(ImageFilter.GaussianBlur(radius=6))
+
+    try:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        result.save(cached, format="PNG")
+        logger.info("neutral_garment_cached path=%s", cached)
+    except Exception as exc:
+        logger.warning("neutral_garment_cache_failed error=%s", exc)
+
+    return result
+
+
+def detect_cross_category(
+    person_img: Image.Image,
+    vton_type: str,
+    trace_id: str = "",
+) -> bool:
+    """Check whether two-stage inference is needed for this person+garment pair.
+
+    Runs a quick SCHP parse on the person image at target resolution, then
+    compares the detected garment labels against the target cloth_type's
+    editable label set.
+
+    Returns True when significant garment-label area falls outside the target
+    mask — i.e. the old garment would survive a single-stage try-on.
+    """
+    from mask_pipeline import needs_two_stage
+
+    try:
+        if parsing_model is None:
+            logger.info("cross_category_skip parsing_model_not_loaded trace_id=%s", trace_id)
+            return False
+
+        det_img = person_img.resize(TARGET_SIZE)
+        det_parse, _ = parsing_model(det_img)
+        det_schp = np.array(det_parse, dtype=np.uint8)
+        if det_schp.ndim == 3:
+            det_schp = det_schp.squeeze(0)
+        det_schp = det_schp.astype(np.uint8)
+
+        needed = needs_two_stage(det_schp, vton_type)
+
+        present_labels = sorted(int(x) for x in np.unique(det_schp) if x > 0)
+        logger.info(
+            "cross_category_detection needed=%s vton_type=%s "
+            "person_garment_labels=%s trace_id=%s",
+            needed, vton_type, present_labels, trace_id,
+        )
+        return needed
+    except Exception as exc:
+        logger.warning("cross_category_detection_failed error=%s trace_id=%s", exc, trace_id)
+        return False
+
+
+def run_cross_category_inference(
+    person_img: Image.Image,
+    garment_img: Image.Image,
+    garment_desc: str,
+    cloth_type: str,
+    garment_subtype: str = "",
+    steps: int = 30,
+    seed: int = 42,
+    guidance_scale: float | None = None,
+    trace_id: str = "",
+) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
+    """Two-stage cross-category try-on.
+
+    Stage 1 — Erase:  broad full-body inpaint that removes the old garment
+                       and replaces it with a neutral plain underlayer.
+                       Uses fewer steps (20) + higher guidance (3.5) so the
+                       erase is fast and decisive without creating detailed
+                       garment features.
+
+    Stage 2 — Apply:   normal try-on inference using the actual target garment
+                       on the Stage-1 erased body.  Standard steps/guidance.
+
+    Returns (final_result, raw_output, mask_meta_from_stage2).
+    """
+    logger.info(
+        "cross_category_stage1_erase_start cloth_type=%s "
+        "steps=%d guidance=%.2f trace_id=%s",
+        cloth_type, CROSS_CATEGORY_ERASE_STEPS,
+        CROSS_CATEGORY_ERASE_GUIDANCE, trace_id,
+    )
+
+    # ── Stage 1: erase old garment ────────────────────────────────────
+    neutral = _generate_neutral_garment()
+    stage1_desc = (
+        "plain beige seamless tank top and shorts, "
+        "simple neutral undergarments, solid fabric, "
+        "minimal basic clothing"
+    )
+    stage1_negative = (
+        "pattern, print, design, logo, text, embroidery, lace, trim, "
+        "detailed fabric, textured, woven, striped, plaid, floral, "
+        "monochrome, lowres, bad anatomy, worst quality, low quality, "
+        "deformed, distorted, disfigured, bad proportions, "
+        "extra limbs, missing limbs, cloned head, body out of frame, "
+        "poorly drawn face, mutation, mutated, extra fingers, "
+        "ugly, blurry, watermark, signature, "
+        "smooth plastic, airbrushed, cg render, 3d render"
+    )
+
+    erased_person, erased_raw, stage1_meta = run_idm_vton_inference(
+        person_img=person_img,
+        garment_img=neutral,
+        garment_desc=stage1_desc,
+        cloth_type="dresses",
+        garment_subtype="saree",  # triggers draped mode → arm labels in mask
+        steps=CROSS_CATEGORY_ERASE_STEPS,
+        seed=seed,
+        guidance_scale=CROSS_CATEGORY_ERASE_GUIDANCE,
+        auto_crop=True,
+        crop_preserve_lower=True,
+        override_negative_prompt=stage1_negative,
+    )
+
+    logger.info(
+        "cross_category_stage1_complete trace_id=%s "
+        "erased_person_size=%s",
+        trace_id, erased_person.size,
+    )
+
+    # ── Stage 2: apply target garment ─────────────────────────────────
+    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+
+    result, raw_output, mask_meta = run_idm_vton_inference(
+        person_img=erased_person,
+        garment_img=garment_img,
+        garment_desc=garment_desc,
+        cloth_type=cloth_type,
+        garment_subtype=garment_subtype,
+        steps=steps,
+        seed=seed + 1,  # different seed for diversity from erase stage
+        guidance_scale=effective_guidance,
+        auto_crop=True,
+        crop_preserve_lower=True,
+    )
+
+    logger.info(
+        "cross_category_stage2_complete trace_id=%s",
+        trace_id,
+    )
+
+    # ── Debug saves ───────────────────────────────────────────────────
+    if trace_id:
+        _debug_dir = Path("/tmp/idm-vton-debug")
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            erased_person.save(str(_debug_dir / f"cross_cat_stage1_person_{trace_id}.png"))
+            if erased_raw is not None:
+                erased_raw.save(str(_debug_dir / f"cross_cat_stage1_raw_{trace_id}.png"))
+            s1_final = stage1_meta.get("final_mask_np")
+            if s1_final is not None:
+                Image.fromarray(s1_final, mode="L").save(
+                    str(_debug_dir / f"cross_cat_stage1_mask_{trace_id}.png")
+                )
+            if raw_output is not None:
+                raw_output.save(str(_debug_dir / f"cross_cat_stage2_raw_{trace_id}.png"))
+            s2_final = mask_meta.get("final_mask_np")
+            if s2_final is not None:
+                Image.fromarray(s2_final, mode="L").save(
+                    str(_debug_dir / f"cross_cat_stage2_mask_{trace_id}.png")
+                )
+            result.save(str(_debug_dir / f"cross_cat_final_{trace_id}.png"))
+            logger.info("cross_category_debug_saved trace_id=%s", trace_id)
+        except Exception as exc:
+            logger.warning("cross_category_debug_save_failed error=%s trace_id=%s", exc, trace_id)
+
+    return result, raw_output, mask_meta
 
 
 # =============================================================================
@@ -700,7 +923,9 @@ def run_idm_vton_inference(
     auto_crop: bool = True,
     guidance_scale: float | None = None,
     crop_preserve_lower: bool = True,
-) -> tuple[Image.Image, dict[str, object]]:
+    override_prompt: str | None = None,
+    override_negative_prompt: str | None = None,
+) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
 
@@ -875,27 +1100,35 @@ def run_idm_vton_inference(
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
     fabric_desc = "realistic fabric texture, natural folds, soft wrinkles, quality material, detailed texture"
-    prompt = (
-        "model is wearing " + garment_desc + ", " + fabric_desc
-        + ", photorealistic, sharp focus, fashion photography, "
-        + "soft studio lighting, high quality, detailed fabric texture, "
-        + "natural skin, professional photo, "
-        + "detailed face, natural facial features, symmetric face, "
-        + "natural body proportions, natural hands, natural fingers"
-    )
-    negative_prompt = (
-        "monochrome, lowres, bad anatomy, worst quality, low quality, "
-        "deformed, distorted, disfigured, bad proportions, "
-        "extra limbs, missing limbs, cloned head, body out of frame, "
-        "poorly drawn face, mutation, mutated, extra fingers, "
-        "ugly, blurry, watermark, signature, text, logo, "
-        "smooth plastic, airbrushed, cg render, 3d render, "
-        "flat lighting, "
-        "watercolor, smudged, washed out, overlaid, transparent, "
-        "see-through, ghost, double exposure, translucent, "
-        "poorly sewn, unfinished edges, loose threads, "
-        "fabric tearing, fabric distortion, fabric wrinkling, "
-        "pattern mismatch, texture seam, visible seam, "
+
+    if override_prompt is not None:
+        prompt = override_prompt
+    else:
+        prompt = (
+            "model is wearing " + garment_desc + ", " + fabric_desc
+            + ", photorealistic, sharp focus, fashion photography, "
+            + "soft studio lighting, high quality, detailed fabric texture, "
+            + "natural skin, professional photo, "
+            + "detailed face, natural facial features, symmetric face, "
+            + "natural body proportions, natural hands, natural fingers"
+        )
+
+    if override_negative_prompt is not None:
+        negative_prompt = override_negative_prompt
+    else:
+        negative_prompt = (
+            "monochrome, lowres, bad anatomy, worst quality, low quality, "
+            "deformed, distorted, disfigured, bad proportions, "
+            "extra limbs, missing limbs, cloned head, body out of frame, "
+            "poorly drawn face, mutation, mutated, extra fingers, "
+            "ugly, blurry, watermark, signature, text, logo, "
+            "smooth plastic, airbrushed, cg render, 3d render, "
+            "flat lighting, "
+            "watercolor, smudged, washed out, overlaid, transparent, "
+            "see-through, ghost, double exposure, translucent, "
+            "poorly sewn, unfinished edges, loose threads, "
+            "fabric tearing, fabric distortion, fabric wrinkling, "
+            "pattern mismatch, texture seam, visible seam, "
         "bag, purse, handbag, clutch, tote, backpack, "
         "headphones, earphones, headset, "
         "necklace, chain, pendant, choker, "
@@ -1135,7 +1368,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         garm_w, garm_h, garm_aspect, target_aspect, vton_type, trace_id,
     )
 
-    inference_start = time.perf_counter()
     result: Image.Image | None = None
     raw_output: Image.Image | None = None
     mask_meta: dict[str, object] = {}
@@ -1144,142 +1376,195 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     failure_reasons: list[str] = []
     best_candidate_score: float = -1.0
 
-    # Dark garment + draped/full-body: stronger diffusion for full replacement.
-    effective_guidance = GUIDANCE_SCALE
-    effective_steps = steps
-    draped_request = is_draped_garment(vton_type, garment_subtype)
-    if draped_request or vton_type in ("dresses", "full_body"):
-        effective_steps = max(steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
-        effective_guidance = max(effective_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
-    if garm_mean_all < 80.0:
-        effective_guidance = GUIDANCE_SCALE * 1.15
+    # ── Cross-category detection —───────────────────────────────────────
+    # If the person's current garment covers label categories outside the
+    # target cloth_type's editable mask, two-stage erase+apply is needed.
+    # Same-category swaps (shirt→shirt, dress→dress) skip this path entirely.
+    cross_category_needed = detect_cross_category(person_img, vton_type, trace_id)
+
+    if cross_category_needed:
         logger.info(
-            "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
-            "increasing_guidance from %.1f to %.1f",
-            garm_mean_r, garm_mean_g, garm_mean_b,
-            GUIDANCE_SCALE, effective_guidance,
+            "cross_category_routing_two_stage vton_type=%s "
+            "person_img_size=%s garment_desc=%s trace_id=%s",
+            vton_type, person_img.size, garment_desc, trace_id,
         )
+        inference_start = time.perf_counter()
+        result, raw_output, mask_meta = run_cross_category_inference(
+            person_img=person_img,
+            garment_img=garment_img,
+            garment_desc=garment_desc,
+            cloth_type=vton_type,
+            garment_subtype=garment_subtype,
+            steps=steps,
+            seed=seed,
+            guidance_scale=GUIDANCE_SCALE,
+            trace_id=trace_id,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_ms = (time.perf_counter() - inference_start) * 1000
 
-    min_candidate_score = CANDIDATE_MIN_SCORE
-    candidate_count = max(1, MULTI_CANDIDATE_COUNT)
-    max_retry_rounds = max(0, max_retries) if retry_enabled else 0
-
-    retry_round = 0
-    while retry_round <= max_retry_rounds:
-        candidates: list[tuple[Image.Image, Image.Image | None, dict[str, object], object | None]] = []
-        for ci in range(candidate_count):
-            c_seed = seed + retry_round * 10000 + ci * 1000
-
-            # Base params for this retry round (escalates guidance/steps on retry)
-            c_guidance = effective_guidance * max(1.0, 1.0 + RETRY_GUIDANCE_BOOST * retry_round)
-            c_steps = effective_steps + RETRY_STEPS_BOOST * retry_round
-
-            # Candidate diversity: vary guidance/steps around the retry-round base
-            if CANDIDATE_GUIDANCE_VARY and candidate_count > 1:
-                variation = 1.0 + 0.08 * (ci - (candidate_count - 1) / 2.0)
-                c_guidance *= variation
-            if CANDIDATE_STEPS_VARY and candidate_count > 1:
-                c_steps += int(5 * (ci - (candidate_count - 1) / 2.0))
-                c_steps = max(10, c_steps)
-
-            c_result, c_raw, c_meta = run_idm_vton_inference(
-                person_img=person_img,
-                garment_img=garment_img,
-                garment_desc=garment_desc,
-                garment_subtype=garment_subtype,
-                cloth_type=vton_type,
-                steps=c_steps,
-                seed=c_seed,
-                auto_crop=True,
-                guidance_scale=c_guidance,
-                crop_preserve_lower=True,
-            )
-
-            # Validate + score candidate
-            c_final_mask_np = c_meta.get("final_mask_np")
-            c_protect_np = c_meta.get("protect_mask_np")
-            c_schp_labels = c_meta.get("schp_labels")
-            c_vresult = None
-            if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
-                c_vresult = _score_candidate(
-                    person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
-                    c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
-                    garment_img,
-                    mask_np=c_final_mask_np,
-                    protect_np=c_protect_np,
-                    schp_labels=c_schp_labels,
-                )
-                logger.info(
-                    "candidate_ci=%d score=%.4f face=%.4f garment=%.4f "
-                    "sharpness=%.2f drift=%.1f replacement=%.4f trace_id=%s",
-                    ci,
-                    c_vresult.score, c_vresult.face_quality, c_vresult.garment_quality,
-                    c_vresult.sharpness, c_vresult.identity_drift,
-                    c_vresult.garment_replacement, trace_id,
-                )
-            candidates.append((c_result, c_raw, c_meta, c_vresult))
-
-        # ── Pick best candidate ────────────────────────────────────────
-        scored = [(r, ro, m, v) for r, ro, m, v in candidates if v is not None]
-        if scored:
-            best = max(scored, key=lambda x: x[3].score)
-            result, raw_output, mask_meta, vresult = best
-            quality_report = InferenceQualityReport(
-                passed=vresult.passed,
-                identity_drift_score=vresult.identity_drift,
-                failure_reasons=tuple(vresult.failure_reasons),
-            )
-            best_candidate_score = vresult.score
-            failure_reasons = vresult.failure_reasons
-        elif candidates:
-            # Fallback: first candidate if scoring unavailable
-            result, raw_output, mask_meta = candidates[0][:3]
-            vresult = None
-            quality_report = InferenceQualityReport(
-                passed=True, identity_drift_score=0.0, failure_reasons=(),
-            )
-            best_candidate_score = 0.0
-        else:
-            raise RuntimeError("No candidates generated — inference produced no output")
-
-        retry_count = retry_round
-
-        # ── Mask coverage validation (for output metadata) ─────────────
-        final_mask_np = mask_meta.get("final_mask_np")
-        protect_mask_np = mask_meta.get("protect_mask_np")
-        if final_mask_np is not None:
-            final_mask_img = Image.fromarray(final_mask_np, mode="L")
-            if final_mask_img.size != TARGET_SIZE:
-                final_mask_img = final_mask_img.resize(TARGET_SIZE, Image.NEAREST)
-            coverage = validate_mask_coverage(final_mask_img, vton_type)
-            mask_meta["coverage_valid"] = coverage.get("valid")
-            mask_meta["coverage_percent"] = coverage.get("coverage_percent")
+        # Dummy quality report  — no candidate scoring for cross-category path
+        quality_report = InferenceQualityReport(
+            passed=True, identity_drift_score=0.0, failure_reasons=(),
+        )
+        retry_count = 0
+        best_candidate_score = 0.0
+        candidate_count = 1
+        failure_reasons = []
+        effective_guidance = GUIDANCE_SCALE
+        draped_request = False
 
         logger.info(
-            "candidate_selection round=%d candidates=%d best_score=%.4f "
-            "passed=%s trace_id=%s",
-            retry_round, len(candidates), best_candidate_score,
-            quality_report.passed if quality_report else False,
-            trace_id,
+            "cross_category_inference_complete inference_ms=%.0f trace_id=%s",
+            inference_ms, trace_id,
+        )
+    else:
+        logger.info(
+            "cross_category_not_needed single_stage vton_type=%s trace_id=%s",
+            vton_type, trace_id,
         )
 
-        # ── Decide whether to retry ───────────────────────────────────
-        if vresult is None or (vresult.passed and vresult.score >= min_candidate_score):
-            break
-        if retry_round >= max_retry_rounds:
-            break
+    # ── Single-stage path ─────────────────────────────────────────────────
+    if not cross_category_needed:
+        inference_start = time.perf_counter()
 
-        logger.warning(
-            "retry_round=%d score=%.4f reasons=%s next_guidance=%.2f next_steps=%d",
-            retry_round, best_candidate_score, failure_reasons,
-            effective_guidance * (1.0 + RETRY_GUIDANCE_BOOST * (retry_round + 1)),
-            effective_steps + RETRY_STEPS_BOOST * (retry_round + 1),
-        )
-        retry_round += 1
+        # Guidance/step tuning
+        effective_guidance = GUIDANCE_SCALE
+        effective_steps = steps
+        draped_request = is_draped_garment(vton_type, garment_subtype)
+        if draped_request or vton_type in ("dresses", "full_body"):
+            effective_steps = max(steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
+            effective_guidance = max(effective_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
+        if garm_mean_all < 80.0:
+            effective_guidance = GUIDANCE_SCALE * 1.15
+            logger.info(
+                "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
+                "increasing_guidance from %.1f to %.1f",
+                garm_mean_r, garm_mean_g, garm_mean_b,
+                GUIDANCE_SCALE, effective_guidance,
+            )
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    inference_ms = (time.perf_counter() - inference_start) * 1000
+        min_candidate_score = CANDIDATE_MIN_SCORE
+        candidate_count = max(1, MULTI_CANDIDATE_COUNT)
+        max_retry_rounds = max(0, max_retries) if retry_enabled else 0
+
+        retry_round = 0
+        while retry_round <= max_retry_rounds:
+            candidates: list[tuple[Image.Image, Image.Image | None, dict[str, object], object | None]] = []
+            for ci in range(candidate_count):
+                c_seed = seed + retry_round * 10000 + ci * 1000
+
+                # Base params for this retry round (escalates guidance/steps on retry)
+                c_guidance = effective_guidance * max(1.0, 1.0 + RETRY_GUIDANCE_BOOST * retry_round)
+                c_steps = effective_steps + RETRY_STEPS_BOOST * retry_round
+
+                # Candidate diversity: vary guidance/steps around the retry-round base
+                if CANDIDATE_GUIDANCE_VARY and candidate_count > 1:
+                    variation = 1.0 + 0.08 * (ci - (candidate_count - 1) / 2.0)
+                    c_guidance *= variation
+                if CANDIDATE_STEPS_VARY and candidate_count > 1:
+                    c_steps += int(5 * (ci - (candidate_count - 1) / 2.0))
+                    c_steps = max(10, c_steps)
+
+                c_result, c_raw, c_meta = run_idm_vton_inference(
+                    person_img=person_img,
+                    garment_img=garment_img,
+                    garment_desc=garment_desc,
+                    garment_subtype=garment_subtype,
+                    cloth_type=vton_type,
+                    steps=c_steps,
+                    seed=c_seed,
+                    auto_crop=True,
+                    guidance_scale=c_guidance,
+                    crop_preserve_lower=True,
+                )
+
+                # Validate + score candidate
+                c_final_mask_np = c_meta.get("final_mask_np")
+                c_protect_np = c_meta.get("protect_mask_np")
+                c_schp_labels = c_meta.get("schp_labels")
+                c_vresult = None
+                if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
+                    c_vresult = _score_candidate(
+                        person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                        c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
+                        garment_img,
+                        mask_np=c_final_mask_np,
+                        protect_np=c_protect_np,
+                        schp_labels=c_schp_labels,
+                    )
+                    logger.info(
+                        "candidate_ci=%d score=%.4f face=%.4f garment=%.4f "
+                        "sharpness=%.2f drift=%.1f replacement=%.4f trace_id=%s",
+                        ci,
+                        c_vresult.score, c_vresult.face_quality, c_vresult.garment_quality,
+                        c_vresult.sharpness, c_vresult.identity_drift,
+                        c_vresult.garment_replacement, trace_id,
+                    )
+                candidates.append((c_result, c_raw, c_meta, c_vresult))
+
+            # ── Pick best candidate ────────────────────────────────────────
+            scored = [(r, ro, m, v) for r, ro, m, v in candidates if v is not None]
+            if scored:
+                best = max(scored, key=lambda x: x[3].score)
+                result, raw_output, mask_meta, vresult = best
+                quality_report = InferenceQualityReport(
+                    passed=vresult.passed,
+                    identity_drift_score=vresult.identity_drift,
+                    failure_reasons=tuple(vresult.failure_reasons),
+                )
+                best_candidate_score = vresult.score
+                failure_reasons = vresult.failure_reasons
+            elif candidates:
+                # Fallback: first candidate if scoring unavailable
+                result, raw_output, mask_meta = candidates[0][:3]
+                vresult = None
+                quality_report = InferenceQualityReport(
+                    passed=True, identity_drift_score=0.0, failure_reasons=(),
+                )
+                best_candidate_score = 0.0
+            else:
+                raise RuntimeError("No candidates generated — inference produced no output")
+
+            retry_count = retry_round
+
+            # ── Mask coverage validation (for output metadata) ─────────────
+            final_mask_np = mask_meta.get("final_mask_np")
+            protect_mask_np = mask_meta.get("protect_mask_np")
+            if final_mask_np is not None:
+                final_mask_img = Image.fromarray(final_mask_np, mode="L")
+                if final_mask_img.size != TARGET_SIZE:
+                    final_mask_img = final_mask_img.resize(TARGET_SIZE, Image.NEAREST)
+                coverage = validate_mask_coverage(final_mask_img, vton_type)
+                mask_meta["coverage_valid"] = coverage.get("valid")
+                mask_meta["coverage_percent"] = coverage.get("coverage_percent")
+
+            logger.info(
+                "candidate_selection round=%d candidates=%d best_score=%.4f "
+                "passed=%s trace_id=%s",
+                retry_round, len(candidates), best_candidate_score,
+                quality_report.passed if quality_report else False,
+                trace_id,
+            )
+
+            # ── Decide whether to retry ───────────────────────────────────
+            if vresult is None or (vresult.passed and vresult.score >= min_candidate_score):
+                break
+            if retry_round >= max_retry_rounds:
+                break
+
+            logger.warning(
+                "retry_round=%d score=%.4f reasons=%s next_guidance=%.2f next_steps=%d",
+                retry_round, best_candidate_score, failure_reasons,
+                effective_guidance * (1.0 + RETRY_GUIDANCE_BOOST * (retry_round + 1)),
+                effective_steps + RETRY_STEPS_BOOST * (retry_round + 1),
+            )
+            retry_round += 1
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_ms = (time.perf_counter() - inference_start) * 1000
 
     # ── DEBUG SAVE: raw output before face restoration ─────────────────────
     _debug_dir = Path("/tmp/idm-vton-debug")
