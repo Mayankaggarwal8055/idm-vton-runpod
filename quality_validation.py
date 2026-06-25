@@ -308,6 +308,8 @@ def score_candidate(
     schp_labels: np.ndarray | None = None,
     weights: dict[str, float] | None = None,
     garment_subtype: str = "",
+    source_cloth_type: str = "",
+    trace_id: str = "",
 ) -> ValidationResult:
     """
     Run all validations and compute an aggregate quality score.
@@ -342,17 +344,28 @@ def score_candidate(
     if sharpness < 10.0:
         all_reasons.append("image_blurry")
 
+    # ── Garment leakage detection ────────────────────────────────────────
+    # If cross-category, detect if old garment residual persists in output
+    leakage_penalty = 0.0
+    if source_cloth_type and mask_np is not None:
+        leakage_penalty, leakage_reasons = _detect_garment_leakage(
+            original, result, mask_np, source_cloth_type, schp_labels,
+        )
+        all_reasons.extend(leakage_reasons)
+
     aggregate = (
         w["face_quality"] * face_quality
         + w["garment_quality"] * garment_quality
         + w["sharpness"] * sharpness_score_val
         + w["color_coherence"] * color_coherence
     )
+    # Apply leakage penalty (reduces score, doesn't add to weight sum)
+    aggregate = max(0.0, aggregate - leakage_penalty)
 
     # Only hard-fail on severe issues (identity drift, garment unchanged, blurry)
     # Soft warnings (ghosting, over_smooth, color_drift) reduce score but don't fail
     severe_reasons = [r for r in all_reasons if any(
-        kw in r for kw in ("face_severe_distortion", "garment_unchanged", "image_blurry", "face_identity_drift")
+        kw in r for kw in ("face_severe_distortion", "garment_unchanged", "image_blurry", "face_identity_drift", "garment_leakage_severe")
     )]
     passed = len(severe_reasons) == 0
 
@@ -366,3 +379,67 @@ def score_candidate(
         failure_reasons=all_reasons,
         score=round(aggregate, 4),
     )
+
+
+def _detect_garment_leakage(
+    original: Image.Image,
+    result: Image.Image,
+    mask_np: np.ndarray,
+    source_cloth_type: str,
+    schp_labels: np.ndarray | None = None,
+) -> tuple[float, list[str]]:
+    """Detect if old garment residuals persist in the output.
+
+    Compares color histograms of the original and result within the inpaint
+    region. High similarity means the old garment leaked through.
+
+    Returns (penalty, reasons).
+    """
+    reasons: list[str] = []
+    penalty = 0.0
+
+    orig = np.array(original.convert("RGB"), dtype=np.uint8)
+    out = np.array(result.convert("RGB"), dtype=np.uint8)
+    if orig.shape != out.shape:
+        out = np.array(result.convert("RGB").resize(original.size, Image.LANCZOS), dtype=np.uint8)
+
+    h, w = orig.shape[:2]
+    if mask_np.shape[:2] != (h, w):
+        return penalty, reasons
+
+    inpaint = mask_np > 127
+    if not np.any(inpaint):
+        return penalty, reasons
+
+    # Compare color histograms in inpaint region using chi-squared distance
+    import cv2
+    orig_hist = cv2.calcHist([orig], [0, 1, 2], inpaint.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    out_hist = cv2.calcHist([out], [0, 1, 2], inpaint.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    cv2.normalize(orig_hist, orig_hist)
+    cv2.normalize(out_hist, out_hist)
+    hist_similarity = float(cv2.compareHist(orig_hist, out_hist, cv2.HISTCMP_CORREL))
+
+    # High correlation = old garment leaked (colors are too similar)
+    if hist_similarity > 0.85:
+        penalty += 0.10
+        reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
+    if hist_similarity > 0.92:
+        penalty += 0.05
+        reasons.append("garment_leakage_severe")
+    elif hist_similarity > 0.75:
+        # Mild penalty for moderate similarity
+        penalty += 0.03
+
+    # Check for duplicate garment regions (repeated pattern = hallucination)
+    if schp_labels is not None:
+        # Count connected components of garment label in output
+        # If more than 2x the number in original, likely duplicated
+        orig_garment_px = int(np.sum(np.isin(schp_labels, [5, 6, 7])))
+        if orig_garment_px > 0:
+            # Simple heuristic: check if garment region expanded significantly
+            out_garment_area = int(np.sum(inpaint))
+            if out_garment_area > orig_garment_px * 2.5:
+                penalty += 0.05
+                reasons.append("garment_region_duplicated")
+
+    return penalty, reasons

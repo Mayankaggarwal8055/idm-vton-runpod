@@ -7,6 +7,7 @@ on:
     paths:
       - "idm-vton-runpod/**"
       - ".github/workflows/**"
+  workflow_dispatch:
 
 jobs:
   build-and-push:
@@ -15,6 +16,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -27,4 +31,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: mayankaggarwal8055/idm-vton-runpod:v20
+          tags: mayankaggarwal8055/idm-vton-runpod:v21
+          build-args: GIT_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

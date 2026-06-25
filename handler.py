@@ -409,13 +409,12 @@ def run_cross_category_inference(
 ) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
     """Two-stage cross-category try-on.
 
-    Stage 1 — Erase:  broad full-body inpaint that removes the old garment
-                       and replaces it with a neutral plain underlayer.
-                       Uses 30 steps + guidance 4.0 for complete erasing.
-                       The positive prompt is overridden to remove face/body
-                       terms that cause identity drift during erase.
+    Stage 1 — Erase:  source-garment-aware inpaint that removes the old garment.
+                       Uses source_cloth_type to build a mask covering the source
+                       garment's body region plus buffer.  The prompt and negatives
+                       are tailored to the source garment family.
 
-    Stage 2 — Apply:   normal try-on inference using the actual target garment
+    Stage 2 — Apply:  normal try-on inference using the actual target garment
                        on the Stage-1 erased body.  Standard steps/guidance.
 
     Returns (final_result, raw_output, mask_meta_from_stage2).
@@ -425,40 +424,54 @@ def run_cross_category_inference(
 
     logger.info(
         "cross_category_stage1_erase_start cloth_type=%s "
-        "steps=%d guidance=%.2f trace_id=%s",
-        cloth_type, erase_steps,
+        "source_cloth_type=%s steps=%d guidance=%.2f trace_id=%s",
+        cloth_type, source_cloth_type, erase_steps,
         erase_guidance, trace_id,
     )
 
     # ── Stage 1: erase old garment ────────────────────────────────────
+    # Use source_cloth_type for the erase mask so the mask covers the
+    # source garment's body region (not the target's).
+    erase_cloth_type = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else "dresses"
     neutral = _generate_neutral_garment()
-    stage1_desc = (
-        "plain beige seamless tank top and shorts, "
-        "simple neutral undergarments, solid fabric, "
-        "minimal basic clothing"
-    )
-    stage1_positive = (
-        "model wearing plain simple beige tank top and shorts, "
-        "solid neutral undergarments"
-    )
-    stage1_negative = (
-        "saree, drape, pallu, dupatta, scarf, shawl, lehenga, "
-        "pattern, print, design, logo, text, embroidery, lace, trim, "
-        "original clothing, old garment, previous outfit, residual fabric, "
-        "detailed fabric, textured, woven, striped, plaid, floral, "
-        "worst quality, low quality, deformed, distorted, "
-        "bad anatomy, bad proportions, extra limbs, missing limbs, "
-        "ugly, blurry, watermark, signature, "
-        "smooth plastic, airbrushed, cg render, "
-        "recoloring, double garment, layered clothing"
+
+    # Source-garment-specific erase prompt
+    src_stripped = (source_cloth_type or "").lower()
+    _ERASE_PROMPTS: dict[str, tuple[str, str]] = {
+        "dresses": (
+            "model wearing plain simple beige tank top and shorts, "
+            "solid neutral undergarments, bare torso, visible skin",
+            "saree, drape, pallu, dupatta, scarf, shawl, lehenga, "
+            "dress, gown, skirt, wrap, embroidery, border, "
+            "original clothing, old garment, residual fabric, "
+            "worst quality, low quality, deformed, extra limbs",
+        ),
+        "upper_body": (
+            "model wearing plain simple beige tank top and shorts, "
+            "solid neutral undergarments, bare torso, visible skin",
+            "jacket, blazer, coat, hoodie, sweater, shirt, "
+            "collar, lapels, zipper, buttons, hood, "
+            "original clothing, old garment, residual fabric, "
+            "worst quality, low quality, deformed, extra limbs",
+        ),
+        "lower_body": (
+            "model wearing plain simple beige tank top, "
+            "bare legs, visible skin, simple neutral",
+            "jeans, trousers, pants, skirt, shorts, leggings, "
+            "original clothing, old garment, residual fabric, "
+            "worst quality, low quality, deformed, extra limbs",
+        ),
+    }
+    stage1_positive, stage1_negative = _ERASE_PROMPTS.get(
+        src_stripped, _ERASE_PROMPTS["dresses"]
     )
 
     erased_person, erased_raw, stage1_meta = run_idm_vton_inference(
         person_img=person_img,
         garment_img=neutral,
-        garment_desc=stage1_desc,
-        cloth_type="dresses",
-        garment_subtype="saree",  # triggers draped mode → arm labels in mask
+        garment_desc="plain beige seamless tank top and shorts, solid neutral",
+        cloth_type=erase_cloth_type,
+        garment_subtype=garment_subtype,
         steps=erase_steps,
         seed=seed,
         guidance_scale=erase_guidance,
@@ -1115,6 +1128,8 @@ def run_idm_vton_inference(
         validate_mask_coverage,
         validate_mask_integrity,
         detect_inference_failures,
+        analyze_garment_image,
+        save_mask_debug_artifacts,
     )
 
     # Trust preprocessing canvas when garment is already at target resolution.
@@ -1196,8 +1211,10 @@ def run_idm_vton_inference(
         schp_np = schp_np.squeeze(0)
     schp_np = schp_np.astype(np.uint8)
 
+    garment_img_info = analyze_garment_image(garment_img)
     final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
         schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
+        garment_img_info=garment_img_info, trace_id=job_id,
     )
     draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
@@ -1590,6 +1607,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     protect_np=mask_meta.get("protect_mask_np"),
                     schp_labels=mask_meta.get("schp_labels"),
                     garment_subtype=garment_subtype,
+                    source_cloth_type=source_cloth_type,
+                    trace_id=job_id,
                 )
                 best_candidate_score = cc_vresult.score
                 quality_report = InferenceQualityReport(
@@ -1686,6 +1705,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                         protect_np=c_protect_np,
                         schp_labels=c_schp_labels,
                         garment_subtype=garment_subtype,
+                        source_cloth_type=source_cloth_type,
+                        trace_id=trace_id,
                     )
                     logger.info(
                         "candidate_ci=%d score=%.4f face=%.4f garment=%.4f "

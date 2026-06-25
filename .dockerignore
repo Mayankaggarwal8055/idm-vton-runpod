@@ -17,3 +17,5 @@ models/
 *.pth
 *.ckpt
 *.safetensors
+garment_warp.py
+quality_validation.py

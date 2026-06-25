@@ -1,26 +1,27 @@
 """
-GPU worker mask pipeline — SCHP-only binary masks with target-aware expansion.
+GPU worker mask pipeline — SCHP semantic masks with source+target union masks.
 
 SCHP is the single authoritative mask source. All masks are binary.
 No feathering, no fusing, no hybrid strategies. The model output is final.
 
 Design principles (quality-first):
-  - Inpaint mask = UNION of source garment region AND target garment expected
-    body region, aggressively dilated. This prevents the model from preserving
-    source geometry when the target garment has different coverage.
-  - Protect mask = identity-critical regions only (face, hair, hands, shoes),
-    NOT the inverted clothing mask (which shrinks editable area and blocks
-    saree/dupatta drape over arms).
-  - Draped garments (saree, dupatta, lehenga) include arm regions in inpaint
-    but protect hand endpoints so mehndi / phones stay intact.
-  - Garment-specific expansion rules ensure the mask covers the TARGET
-    garment's expected body region, not just the source garment's region.
+  - Same-category: mask = target garment labels only. Model changes texture/color
+    within the source garment's shape.
+  - Cross-category: mask = UNION of source + target garment labels, plus an
+    adaptive dilated buffer around source labels. This ensures the model can
+    fully erase the old garment while generating the new one in the correct
+    body region.
+  - Protect mask = identity-critical regions (face, hair, hands, shoes) plus
+    non-target body regions (lower body protected when only swapping tops).
+  - Draped garments (saree, dupatta, lehenga) use hand-only arm protection
+    so pallu/drape can be generated over forearms.
+  - Buffer dilation is adaptive: scales to garment size and body proportions.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -401,132 +402,309 @@ def _dilate_mask(mask: np.ndarray, kernel_size: int, iterations: int = 1) -> np.
     return cv2.dilate(mask, kernel, iterations=iterations)
 
 
-def _expand_mask_for_target(
-    inpaint_mask: np.ndarray,
-    geometry: GarmentGeometry,
-    schp_labels: np.ndarray,
-) -> np.ndarray:
-    """Expand the inpaint mask to cover the target garment's expected body region.
+# ── Garment image geometry analysis ────────────────────────────────────
+@dataclass(frozen=True)
+class GarmentImageInfo:
+    """Geometry extracted from the target garment image."""
+    bbox_area_ratio: float = 0.0
+    aspect_ratio: float = 1.0
+    width_ratio: float = 0.0
+    height_ratio: float = 0.0
+    center_y_ratio: float = 0.5
+    has_sleeves: bool = False
+    is_long: bool = False
+    is_wide: bool = False
 
-    This is the core fix for source-geometry preservation. When the target garment
-    covers different body regions than the source (e.g., t-shirt → jacket), the
-    mask must expand to include those regions so the model can reconstruct the
-    target garment's full shape.
 
-    Expansion is bounded by the body silhouette (SCHP labels != 0) and identity
-    protect labels (face, hair, shoes) to avoid painting into the background
-    or destroying identity.
+def analyze_garment_image(garment_img: Image.Image) -> GarmentImageInfo:
+    """Extract geometry from the target garment reference image.
+
+    Uses contour analysis on the non-white region to estimate bounding box
+    coverage, aspect ratio, and sleeve/length/width hints.
     """
-    h, w = inpaint_mask.shape
-    result = inpaint_mask.copy()
+    arr = np.array(garment_img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
 
-    # Body silhouette: everything except background
-    body_mask = (schp_labels != _LABEL_BG).astype(np.uint8) * 255
+    is_white = np.all(arr > 240, axis=2)
+    fg = (~is_white).astype(np.uint8) * 255
 
-    # Identity regions to never expand into
-    identity_labels = list(_IDENTITY_PROTECT_LABELS)
+    if not np.any(fg):
+        return GarmentImageInfo()
 
-    # ── Downward expansion (target is longer than source) ──────────────
-    if geometry.expansion_down > 0:
-        # Find the lowest editable pixel in the current mask
-        editable_ys = np.where(np.any(result > 127, axis=1))[0]
-        if len(editable_ys) > 0:
-            y_start = int(editable_ys.max()) + 1
-            y_end = min(h, y_start + geometry.expansion_down)
-            # Expand into body pixels only (not background, not identity)
-            for y in range(y_start, y_end):
-                for x in range(w):
-                    if (body_mask[y, x] > 127
-                            and schp_labels[y, x] not in identity_labels):
-                        result[y, x] = 255
+    ys, xs = np.where(fg > 0)
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
 
-    # ── Upward expansion (target is shorter / exposes more above) ──────
-    if geometry.expansion_up > 0:
-        editable_ys = np.where(np.any(result > 127, axis=1))[0]
-        if len(editable_ys) > 0:
-            y_end = max(0, int(editable_ys.min()) - 1)
-            y_start = max(0, y_end - geometry.expansion_up)
-            for y in range(y_start, y_end):
-                for x in range(w):
-                    if (body_mask[y, x] > 127
-                            and schp_labels[y, x] not in identity_labels):
-                        result[y, x] = 255
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+    bbox_area = bbox_w * bbox_h
+    total_area = max(h * w, 1)
 
-    # ── Width expansion (target is wider: kimono, poncho, cape) ────────
-    if geometry.expansion_width > 0:
-        # Find leftmost and rightmost editable pixels per row
-        for y in range(h):
-            editable_xs = np.where(result[y, :] > 127)[0]
-            if len(editable_xs) == 0:
-                continue
-            x_left = max(0, int(editable_xs.min()) - geometry.expansion_width)
-            x_right = min(w, int(editable_xs.max()) + geometry.expansion_width + 1)
-            for x in range(x_left, x_right):
-                if (body_mask[y, x] > 127
-                        and schp_labels[y, x] not in identity_labels):
-                    result[y, x] = 255
+    width_ratio = bbox_w / max(w, 1)
+    height_ratio = bbox_h / max(h, 1)
+    aspect_ratio = bbox_w / max(bbox_h, 1)
+    center_y_ratio = ((y1 + y2) / 2.0) / max(h, 1)
 
-    return result
+    left_col = int(0.15 * w)
+    right_col = int(0.85 * w)
+    left_fg = bool(np.any(fg[:, :left_col] > 0))
+    right_fg = bool(np.any(fg[:, right_col:] > 0))
+    has_sleeves = left_fg and right_fg
+
+    return GarmentImageInfo(
+        bbox_area_ratio=round(bbox_area / total_area, 4),
+        aspect_ratio=round(aspect_ratio, 3),
+        width_ratio=round(width_ratio, 3),
+        height_ratio=round(height_ratio, 3),
+        center_y_ratio=round(center_y_ratio, 3),
+        has_sleeves=has_sleeves,
+        is_long=height_ratio > 0.50,
+        is_wide=width_ratio > 0.60,
+    )
 
 
-def _compute_cross_category_expansion(
+# ── Adaptive buffer dilation ────────────────────────────────────────────
+def _adaptive_buffer_ks(
     schp_labels: np.ndarray,
-    source_cloth_type: str,
-    target_cloth_type: str,
-    target_geometry: GarmentGeometry,
+    source_labels: set,
+    garment_img_info: "GarmentImageInfo | None" = None,
 ) -> int:
-    """Compute additional downward expansion for cross-category transitions.
+    """Compute adaptive dilation kernel size for cross-category source buffer.
 
-    When source is upper_body and target is dresses/full_body, the mask needs
-    to expand into the lower body region. The expansion amount is based on
-    how much of the lower body is currently NOT in the source mask.
+    Scales to body size, source garment coverage, and target garment geometry.
     """
-    if source_cloth_type == target_cloth_type:
-        return 0
-
     h, w = schp_labels.shape
+    scale = max(1.0, h / 512.0)
 
-    # If target covers full body but source is upper-only, expand to lower body
-    if target_geometry.body_region in ("full", "draped"):
-        if source_cloth_type == "upper_body":
-            # Expand into pants/skirt/leg region
-            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
-                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
-            lower_mask = np.isin(schp_labels, list(lower_labels))
-            if np.any(lower_mask):
-                ys = np.where(lower_mask)[0]
-                return int(ys.max() - ys.min()) + 20
-            return 120  # default expansion into lower body
+    base_ks = int(12 * scale)
 
-    # If target covers upper but source is lower, expand upward
-    if target_geometry.body_region == "upper":
-        if source_cloth_type in ("lower_body", "dresses", "full_body"):
-            upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
-            upper_mask = np.isin(schp_labels, list(upper_labels))
-            if np.any(upper_mask):
-                ys = np.where(upper_mask)[0]
-                return int(ys.max() - ys.min()) + 20
-            return 100  # default expansion into upper body
+    if source_labels:
+        source_px = sum(int(np.sum(schp_labels == lbl)) for lbl in source_labels)
+        source_frac = source_px / max(h * w, 1)
+        if source_frac > 0.15:
+            base_ks = int(16 * scale)
+        elif source_frac > 0.08:
+            base_ks = int(14 * scale)
+        else:
+            base_ks = int(10 * scale)
 
-    return 0
+    if garment_img_info:
+        if garment_img_info.is_wide:
+            base_ks = int(base_ks * 1.2)
+        if garment_img_info.is_long:
+            base_ks = int(base_ks * 1.1)
+
+    ks = max(5, min(base_ks, int(25 * scale)))
+    if ks % 2 == 0:
+        ks += 1
+    return ks
+
+
+# ── Garment family routing ─────────────────────────────────────────────
+_FAMILY_UPPER_STRUCTURED = frozenset({
+    "jacket", "blazer", "coat", "leather_jacket", "denim_jacket",
+    "cardigan", "windbreaker", "trench", "peacoat", "overcoat",
+})
+_FAMILY_UPPER_FITTED = frozenset({
+    "tshirt", "t_shirt", "shirt", "polo", "blouse", "sweatshirt",
+    "sports_jersey", "henley",
+})
+_FAMILY_UPPER_SLEEVELESS = frozenset({
+    "tank_top", "crop_top", "camisole", "vest", "corset", "halter",
+})
+_FAMILY_UPPER_LOOSE = frozenset({
+    "hoodie", "sweater", "poncho", "cape", "shrug", "pullover",
+})
+_FAMILY_LOWER = frozenset({
+    "jeans", "trousers", "pants", "shorts", "skirt", "mini_skirt",
+    "long_skirt", "leggings", "joggers", "cargo_pants", "wide_leg",
+    "palazzo", "dhoti_pants", "chinos", "bermuda",
+})
+_FAMILY_FULL = frozenset({
+    "dress", "mini_dress", "midi_dress", "maxi_dress", "bodycon",
+    "a_line", "jumpsuit", "evening_gown", "ball_gown", "wedding",
+    "maxi", "wrap_dress", "off_shoulder", "one_shoulder", "strap",
+    "kurti", "kurta", "abaya", "kaftan", "jalabiya", "kimono",
+    "hanbok", "cheongsam", "qipao", "yukata", "sherwani",
+})
+_FAMILY_DRAPED = frozenset({
+    "saree", "sari", "lehenga", "ghagra", "dupatta", "shawl",
+    "anarkali", "salwar_suit", "dhoti", "lungi",
+})
+
+
+def get_garment_family(garment_subtype: str) -> str:
+    """Classify garment subtype into a routing family.
+
+    Returns: "upper_structured", "upper_fitted", "upper_sleeveless",
+    "upper_loose", "lower", "full", "draped", or "unknown".
+    """
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if not key:
+        return "unknown"
+
+    families = [
+        ("upper_structured", _FAMILY_UPPER_STRUCTURED),
+        ("upper_fitted", _FAMILY_UPPER_FITTED),
+        ("upper_sleeveless", _FAMILY_UPPER_SLEEVELESS),
+        ("upper_loose", _FAMILY_UPPER_LOOSE),
+        ("lower", _FAMILY_LOWER),
+        ("full", _FAMILY_FULL),
+        ("draped", _FAMILY_DRAPED),
+    ]
+    for family_name, family_set in families:
+        if key in family_set:
+            return family_name
+    for family_name, family_set in families:
+        for member in family_set:
+            if key in member or member in key:
+                return family_name
+    return "unknown"
+
+
+# ── Debug artifact generation ──────────────────────────────────────────
+def save_mask_debug_artifacts(
+    trace_id: str,
+    *,
+    schp_labels: np.ndarray | None = None,
+    inpaint_mask: np.ndarray | None = None,
+    protect_mask: np.ndarray | None = None,
+    final_mask: np.ndarray | None = None,
+    person_img: Image.Image | None = None,
+) -> None:
+    """Save mask overlay images for debugging under /tmp/idm-vton-debug/."""
+    if not trace_id:
+        return
+    from pathlib import Path
+    debug_dir = Path("/tmp/idm-vton-debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    prefix = str(debug_dir / f"mask_{trace_id}")
+
+    try:
+        if schp_labels is not None:
+            colors = np.zeros((*schp_labels.shape, 3), dtype=np.uint8)
+            label_colors = [
+                (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+                (0, 0, 128), (255, 0, 0), (255, 128, 0), (255, 255, 0),
+                (128, 128, 128), (0, 255, 0), (0, 128, 128), (128, 0, 128),
+                (0, 255, 255), (255, 0, 255), (128, 64, 0), (64, 128, 0),
+                (0, 64, 128), (0, 128, 64), (64, 0, 128), (128, 0, 64),
+            ]
+            for i, c in enumerate(label_colors):
+                if i < 20:
+                    colors[schp_labels == i] = c
+            Image.fromarray(colors).save(f"{prefix}_schp_labels.png")
+
+        for mask_arr, suffix, clr in [
+            (inpaint_mask, "inpaint", (255, 80, 80)),
+            (protect_mask, "protect", (80, 80, 255)),
+            (final_mask, "final", (80, 255, 80)),
+        ]:
+            if person_img is not None and mask_arr is not None:
+                bg = person_img.convert("RGB").copy()
+                if bg.size != (mask_arr.shape[1], mask_arr.shape[0]):
+                    bg = bg.resize((mask_arr.shape[1], mask_arr.shape[0]), Image.LANCZOS)
+                arr = np.array(bg, dtype=np.uint8)
+                m = mask_arr > 127
+                arr[m, 0] = (arr[m, 0].astype(np.uint16) + clr[0]) // 2
+                arr[m, 1] = (arr[m, 1].astype(np.uint16) + clr[1]) // 2
+                arr[m, 2] = (arr[m, 2].astype(np.uint16) + clr[2]) // 2
+                contours, _ = cv2.findContours(
+                    mask_arr.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(arr, contours, -1, clr, 2)
+                Image.fromarray(arr).save(f"{prefix}_{suffix}_overlay.png")
+
+        logger.info("mask_debug_saved prefix=%s", prefix)
+    except Exception as exc:
+        logger.warning("mask_debug_save_failed error=%s", exc)
 
 
 def build_schp_inpaint_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
     garment_subtype: str = "",
+    source_cloth_type: str = "",
+    garment_img_info: "GarmentImageInfo | None" = None,
 ) -> np.ndarray:
-    """
-    Build binary inpaint mask from SCHP labels.
-    255 = editable garment region, 0 = protected.
-    """
-    labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
-    mask = (np.isin(schp_labels, list(labels)).astype(np.uint8) * 255)
+    """Build binary inpaint mask from SCHP labels.
 
-    draped = is_draped_garment(cloth_type, garment_subtype)
-    if draped:
-        arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
-        mask = np.maximum(mask, arm_mask)
+    Same-category: uses target garment labels — the model changes texture/color
+    within the source garment's shape.
+
+    Cross-category: uses UNION of source + target garment labels, plus an
+    adaptive dilated buffer around source labels. This ensures the model can
+    fully erase the old garment (source labels + buffer) while generating the new
+    garment in the correct body region (target labels).
+
+    The protect mask (built separately) constrains which regions actually
+    change — identity (face, hair, shoes) is always protected, and
+    non-target body regions are protected per garment family.
+
+    255 = editable, 0 = protected.
+    """
+    target_labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
+    is_cross = (
+        source_cloth_type
+        and source_cloth_type != cloth_type
+        and source_cloth_type != "unknown"
+    )
+
+    if is_cross:
+        source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
+        combined = target_labels | source_labels
+
+        # Base mask: all present garment labels (source + target)
+        mask = np.isin(schp_labels, list(combined)).astype(np.uint8) * 255
+
+        # Dilated buffer around SOURCE labels only — ensures clean erasure
+        # of old garment even at edges where SCHP segmentation is imperfect.
+        # Kernel size adapts to body size, source coverage, target geometry.
+        source_only = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
+        if np.any(source_only):
+            ks = _adaptive_buffer_ks(schp_labels, source_labels, garment_img_info=garment_img_info)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+            source_dilated = cv2.dilate(source_only, kernel, iterations=1)
+            ke = max(3, ks - 4)
+            if ke % 2 == 0:
+                ke += 1
+            kernel_e = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke))
+            source_tight = cv2.erode(source_dilated, kernel_e, iterations=1)
+            mask = np.maximum(mask, source_tight)
+
+        # Include arm labels if source is draped (saree pallu over arms)
+        if source_cloth_type in ("dresses", "full_body"):
+            src_subtype = (garment_subtype or "").lower()
+            if any(kw in src_subtype for kw in _DRAPE_KEYWORDS):
+                arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
+                mask = np.maximum(mask, arm_mask)
+
+        # Include leg labels if source is lower or full body but target is upper
+        if source_cloth_type in ("lower_body", "dresses", "full_body"):
+            if cloth_type == "upper_body":
+                leg_labels = {_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG, _LABEL_PANTS,
+                             _LABEL_SKIRT, _LABEL_SOCKS}
+                leg_mask = np.isin(schp_labels, list(leg_labels)).astype(np.uint8) * 255
+                mask = np.maximum(mask, leg_mask)
+
+        # Include upper labels if source is upper but target is lower/full
+        if source_cloth_type == "upper_body":
+            if cloth_type in ("lower_body", "dresses", "full_body"):
+                upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
+                upper_mask = np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255
+                mask = np.maximum(mask, upper_mask)
+    else:
+        # Same-category: target labels only
+        mask = np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255
+
+        # Include arm labels for draped targets (saree pallu, dupatta)
+        if is_draped_garment(cloth_type, garment_subtype):
+            arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
+            mask = np.maximum(mask, arm_mask)
+
+    # Always exclude identity labels from the inpaint mask
+    identity_mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
+    mask = np.where(identity_mask > 0, 0, mask).astype(np.uint8)
 
     return mask
 
@@ -572,7 +750,11 @@ def build_schp_protect_mask(
         mask = np.maximum(mask, np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255)
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
     elif draped:
-        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+        # Draped targets: protect only HANDS (distal arm), not full forearms.
+        # This lets pallu/drape be generated over forearms while keeping
+        # mehndi, phones, and ring details intact.
+        hand_zone = _hand_zones_from_arms(schp_labels)
+        mask = np.maximum(mask, hand_zone)
     else:
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
 
@@ -589,23 +771,19 @@ def dilate_inpaint_mask(
     garment_subtype: str = "",
     schp_height: int = 512,
 ) -> np.ndarray:
-    """
-    Contour-aware dilation scaled to SCHP resolution.
-    Dresses/draped garments get moderate expansion — enough to smooth edges
-    but not so much that the mask bleeds into shoulders/chest.
+    """Mild dilation for edge blending.
+
+    With the full-body-silhouette architecture, the mask already covers
+    the entire body.  Dilation is only needed to smooth mask boundaries
+    so the diffusion model doesn't create hard-edge artifacts.  We use a
+    small uniform kernel regardless of garment family.
     """
     scale = schp_height / 512.0
-    draped = is_draped_garment(cloth_type, garment_subtype)
-
-    if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_ks = (max(3, int(9 * scale)), max(3, int(13 * scale)))
-        leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
-        iterations = 1
-        return cv2.dilate(inpaint_mask, leg_k, iterations=iterations)
-
-    mild_ks = (max(3, int(13 * scale)), max(3, int(9 * scale)))
-    mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
-    return cv2.dilate(inpaint_mask, mild_k, iterations=1)
+    ks = max(3, int(5 * scale))
+    if ks % 2 == 0:
+        ks += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    return cv2.dilate(inpaint_mask, kernel, iterations=1)
 
 
 def build_final_inpaint_mask(
@@ -613,59 +791,64 @@ def build_final_inpaint_mask(
     cloth_type: str,
     garment_subtype: str = "",
     source_cloth_type: str = "",
+    garment_img_info: "GarmentImageInfo | None" = None,
+    trace_id: str = "",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Full mask pipeline: inpaint -> expand for target -> dilate -> subtract identity protect.
+    """Full mask pipeline: source+target labels → protect → dilate → subtract.
 
-    The mask is now TARGET-AWARE: it covers both the source garment region
-    (to ensure old garment is removed) AND the target garment's expected body
-    region (to ensure new garment can be reconstructed with correct geometry).
+    For same-category: mask = target garment labels. Model changes texture/color
+    within the source garment's shape.
+
+    For cross-category: mask = UNION of source + target garment labels plus a
+    dilated buffer around source labels. This ensures the model can fully erase
+    the old garment while generating the new one in the correct body region.
+
+    The protect mask constrains which regions actually change:
+      - Identity (face, hair, shoes) is always protected
+      - Non-target body regions are protected per garment family
+        (e.g. lower body protected when only swapping tops)
 
     Args:
         schp_labels: SCHP label map from person image.
         cloth_type: Target garment's cloth_type.
         garment_subtype: Target garment's specific subtype (e.g. "jacket", "saree").
-        source_cloth_type: Person's current garment cloth_type (for cross-category expansion).
+        source_cloth_type: Person's current garment cloth_type (for cross-category mask).
+        garment_img_info: Target garment image geometry (for adaptive buffer sizing).
+        trace_id: Debug trace ID for artifact generation.
     """
-    geometry = get_garment_geometry(garment_subtype)
-
-    # 1. Build source mask (SCHP clothing labels — ensures old garment is removed)
-    inpaint_raw = build_schp_inpaint_mask(schp_labels, cloth_type, garment_subtype)
-
-    # 2. Expand mask for target garment geometry
-    #    This is the critical fix: mask now covers where the TARGET garment
-    #    should be, not just where the SOURCE garment was.
-    inpaint_expanded = _expand_mask_for_target(inpaint_raw, geometry, schp_labels)
-
-    # 3. Additional expansion for cross-category transitions
-    if source_cloth_type and source_cloth_type != cloth_type:
-        cross_expansion = _compute_cross_category_expansion(
-            schp_labels, source_cloth_type, cloth_type, geometry,
-        )
-        if cross_expansion > 0:
-            # Apply downward expansion for cross-category
-            h, w = schp_labels.shape
-            body_mask = (schp_labels != _LABEL_BG).astype(np.uint8) * 255
-            identity_labels = list(_IDENTITY_PROTECT_LABELS)
-            editable_ys = np.where(np.any(inpaint_expanded > 127, axis=1))[0]
-            if len(editable_ys) > 0:
-                y_start = int(editable_ys.max()) + 1
-                y_end = min(h, y_start + cross_expansion)
-                for y in range(y_start, y_end):
-                    for x in range(w):
-                        if (body_mask[y, x] > 127
-                                and schp_labels[y, x] not in identity_labels):
-                            inpaint_expanded[y, x] = 255
-
-    # 4. Build protect mask (identity regions)
-    protect = build_schp_protect_mask(schp_labels, cloth_type, garment_subtype)
-
-    # 5. Dilate
-    inpaint_dilated = dilate_inpaint_mask(
-        inpaint_expanded, cloth_type, garment_subtype, schp_height=schp_labels.shape[0],
+    # 1. Build inpaint mask — source+target labels for cross-category
+    inpaint_raw = build_schp_inpaint_mask(
+        schp_labels, cloth_type, garment_subtype, source_cloth_type, garment_img_info,
     )
 
-    # 6. Apply protection (subtract identity from editable)
+    # 2. Build protect mask (identity regions + non-target body regions)
+    protect = build_schp_protect_mask(schp_labels, cloth_type, garment_subtype)
+
+    # 3. Mild dilation for edge blending (small kernel — just smooths boundaries)
+    h, w = schp_labels.shape
+    scale = max(1.0, h / 512.0)
+    ks = max(3, int(5 * scale))
+    if ks % 2 == 0:
+        ks += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
+
+    # 4. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
+
+    # 5. Debug artifacts
+    if trace_id:
+        try:
+            save_mask_debug_artifacts(
+                trace_id,
+                schp_labels=schp_labels,
+                inpaint_mask=inpaint_dilated,
+                protect_mask=protect,
+                final_mask=final,
+            )
+        except Exception:
+            pass
+
     return final, inpaint_dilated, protect
 
 
