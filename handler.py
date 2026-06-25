@@ -405,6 +405,7 @@ def run_cross_category_inference(
     seed: int = 42,
     guidance_scale: float | None = None,
     trace_id: str = "",
+    source_cloth_type: str = "",
 ) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
     """Two-stage cross-category try-on.
 
@@ -465,6 +466,7 @@ def run_cross_category_inference(
         crop_preserve_lower=True,
         override_prompt=stage1_positive,
         override_negative_prompt=stage1_negative,
+        source_cloth_type=source_cloth_type,
     )
 
     logger.info(
@@ -488,6 +490,7 @@ def run_cross_category_inference(
         guidance_scale=stage2_guidance,
         auto_crop=True,
         crop_preserve_lower=True,
+        source_cloth_type=source_cloth_type,
     )
 
     logger.info(
@@ -922,6 +925,161 @@ def _maybe_autocast():
     return _NullCtx()
 
 
+# ── Subtype-aware prompt construction ────────────────────────────────
+# Different garment families need different prompt guidance to help the
+# model generate the correct geometry, fit, and structure.
+
+_GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
+    # Upper body: short / fitted
+    "tshirt":     {"fit": "fitted", "sleeves": "short sleeves", "structure": "casual"},
+    "t_shirt":    {"fit": "fitted", "sleeves": "short sleeves", "structure": "casual"},
+    "polo":       {"fit": "fitted", "sleeves": "short sleeves", "structure": "collar with buttons"},
+    "shirt":      {"fit": "regular fit", "sleeves": "long sleeves", "structure": "collar with button front"},
+    "blouse":     {"fit": "regular fit", "sleeves": "long sleeves", "structure": "feminine collar"},
+    "sweatshirt": {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "crew neck pullover"},
+    "sports_jersey": {"fit": "loose fit", "sleeves": "short sleeves", "structure": "athletic"},
+    # Upper body: sleeveless
+    "tank_top":   {"fit": "fitted", "sleeves": "sleeveless", "structure": "thin straps"},
+    "crop_top":   {"fit": "fitted", "sleeves": "short or sleeveless", "structure": "cropped at midriff"},
+    "camisole":   {"fit": "fitted", "sleeves": "sleeveless", "structure": "thin straps"},
+    "vest":       {"fit": "fitted", "sleeves": "sleeveless", "structure": "open front"},
+    "corset":     {"fit": "tight fitted", "sleeves": "sleeveless", "structure": "boned structured"},
+    # Upper body: extended
+    "sweater":    {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "knit pullover"},
+    "hoodie":     {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "hood with front pocket"},
+    "jacket":     {"fit": "structured fit", "sleeves": "long sleeves", "structure": "zip or button front, collar, extends below waist"},
+    "blazer":     {"fit": "structured fit", "sleeves": "long sleeves", "structure": "notched lapels, button front, extends below waist"},
+    "coat":       {"fit": "structured fit", "sleeves": "long sleeves", "structure": "long to knees, button front, collar"},
+    "cardigan":   {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "open front knit"},
+    "leather_jacket": {"fit": "structured fit", "sleeves": "long sleeves", "structure": "zip front, leather texture"},
+    "denim_jacket": {"fit": "structured fit", "sleeves": "long sleeves", "structure": "button front, denim texture"},
+    # Upper body: wide
+    "poncho":     {"fit": "loose draped", "sleeves": "sleeveless", "structure": "drapes over shoulders, wide"},
+    "cape":       {"fit": "loose draped", "sleeves": "sleeveless", "structure": "drapes over shoulders, open front"},
+    "shrug":      {"fit": "fitted", "sleeves": "short sleeves", "structure": "bolero style, cropped"},
+    # Lower body
+    "jeans":      {"fit": "regular fit", "structure": "denim, two legs, button fly"},
+    "trousers":   {"fit": "regular fit", "structure": "formal, creased, two legs"},
+    "pants":      {"fit": "regular fit", "structure": "casual, two legs"},
+    "shorts":     {"fit": "regular fit", "structure": "above knee, two legs"},
+    "skirt":      {"fit": "regular fit", "structure": "no leg separation"},
+    "leggings":   {"fit": "tight fitted", "structure": "stretchy, body-hugging"},
+    "joggers":    {"fit": "relaxed fit", "structure": "elastic waist, tapered leg"},
+    "wide_leg":   {"fit": "loose wide", "structure": "wide from hip to hem"},
+    "palazzo":    {"fit": "very loose wide", "structure": "very wide flowing leg"},
+    "dhoti_pants": {"fit": "draped loose", "structure": "wrapped, pleated"},
+    # Full body
+    "dress":      {"fit": "regular fit", "structure": "one piece"},
+    "mini_dress": {"fit": "regular fit", "structure": "above knee"},
+    "midi_dress": {"fit": "regular fit", "structure": "below knee"},
+    "maxi_dress": {"fit": "regular fit", "structure": "ankle length"},
+    "bodycon":    {"fit": "tight fitted", "structure": "body-hugging, stretchy"},
+    "a_line":     {"fit": "fitted bodice", "structure": "flared from waist"},
+    "jumpsuit":   {"fit": "regular fit", "structure": "one piece with pants"},
+    "evening_gown": {"fit": "elegant fitted", "structure": "floor length, formal"},
+    "ball_gown":  {"fit": "fitted bodice", "structure": "voluminous skirt, floor length"},
+    "wedding":    {"fit": "elegant fitted", "structure": "white, floor length, formal"},
+    "wrap_dress": {"fit": "regular fit", "structure": "wrap closure, tied at waist"},
+    "off_shoulder": {"fit": "regular fit", "structure": "exposed shoulders, neckline below shoulders"},
+    "one_shoulder": {"fit": "regular fit", "structure": "one shoulder strap"},
+    "strap":      {"fit": "fitted", "structure": "thin straps"},
+    # Traditional
+    "saree":      {"fit": "draped", "structure": "pallu over shoulder, wrapped around body"},
+    "sari":       {"fit": "draped", "structure": "pallu over shoulder, wrapped around body"},
+    "lehenga":    {"fit": "fitted bodice", "structure": "flared skirt with dupatta"},
+    "anarkali":   {"fit": "fitted bodice", "structure": "flared from waist, long"},
+    "salwar_suit": {"fit": "regular fit", "structure": "tunic with pants"},
+    "kurti":      {"fit": "regular fit", "structure": "tunic to hips"},
+    "kurta":      {"fit": "regular fit", "structure": "tunic to hips, collar"},
+    "sherwani":   {"fit": "structured fit", "structure": "long to knees, formal, embroidered"},
+    "abaya":      {"fit": "loose flowing", "structure": "full body, loose, modest"},
+    "kaftan":     {"fit": "loose flowing", "structure": "tunic, wide sleeves, loose"},
+    "kimono":     {"fit": "loose draped", "structure": "wide sleeves, wrap front, to ankles"},
+    "hanbok":     {"fit": "fitted bodice", "structure": "jacket with high waist skirt"},
+    "cheongsam":  {"fit": "tight fitted", "structure": "mandarin collar, side slit"},
+    "qipao":      {"fit": "tight fitted", "structure": "mandarin collar, side slit"},
+    "dhoti":      {"fit": "draped loose", "structure": "wrapped around waist and legs"},
+    "lungi":      {"fit": "draped loose", "structure": "wrapped around waist"},
+}
+
+# Source garment-specific negative terms to prevent source residual
+_SOURCE_NEGATIVES: dict[str, list[str]] = {
+    "saree":   ["saree drape", "pallu", "arm drape", "wrapped fabric", "blouse sleeves"],
+    "sari":    ["saree drape", "pallu", "arm drape", "wrapped fabric", "blouse sleeves"],
+    "lehenga": ["lehenga skirt", "dupatta drape", "embroidered border"],
+    "dupatta": ["dupatta drape", "shawl drape", "arm drape"],
+    "jacket":  ["lapels", "zipper", "button placket", "cuff"],
+    "blazer":  ["notched lapels", "button front", "structured shoulder"],
+    "coat":    ["long coat hem", "coat collar", "coat buttons"],
+    "hoodie":  ["hood", "kangaroo pocket", "drawstring"],
+    "shirt":   ["collar", "button placket", "cuff"],
+    "kimono":  ["wide sleeves", "wrap closure", "obi belt"],
+    "abaya":   ["loose flowing fabric", "wide sleeves"],
+    "kaftan":  ["wide sleeves", "loose tunic"],
+    "sherwani": ["embroidery", "long hem", "mandarin collar"],
+}
+
+
+def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") -> str:
+    """Build a prompt that describes the target garment's fit, sleeves, and structure."""
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    attrs = _GARMENT_PROMPT_ATTRS.get(key, {})
+    if not attrs:
+        # Fuzzy match — prefer longest/most-specific match
+        best_len = 0
+        for geo_key, geo_val in _GARMENT_PROMPT_ATTRS.items():
+            if key and geo_key in key and len(geo_key) > best_len:
+                attrs = geo_val
+                best_len = len(geo_key)
+        if not attrs:
+            best_len = 0
+            for geo_key, geo_val in _GARMENT_PROMPT_ATTRS.items():
+                if key and key in geo_key and len(geo_key) > best_len:
+                    attrs = geo_val
+                    best_len = len(geo_key)
+
+    parts = ["model wearing " + garment_desc]
+    if "fit" in attrs:
+        parts.append(attrs["fit"])
+    if "sleeves" in attrs:
+        parts.append(attrs["sleeves"])
+    if "structure" in attrs:
+        parts.append(attrs["structure"])
+    parts.append("detailed fabric texture, natural garment folds")
+    return ", ".join(parts)
+
+
+def _build_source_specific_negative(
+    source_cloth_type: str = "",
+    target_subtype: str = "",
+) -> str:
+    """Build negative prompt that suppresses source garment residual."""
+    base = (
+        "worst quality, low quality, "
+        "ugly, blurry, watermark, signature, text, logo"
+    )
+
+    # Add source-specific negatives to prevent old garment from bleeding through
+    key = (source_cloth_type or "").strip().lower().replace(" ", "_").replace("-", "_")
+    source_terms = _SOURCE_NEGATIVES.get(key, [])
+    if not source_terms:
+        # Fuzzy match — prefer longest/most-specific match
+        best_len = 0
+        for src_key, src_terms in _SOURCE_NEGATIVES.items():
+            if key and src_key in key and len(src_key) > best_len:
+                source_terms = src_terms
+                best_len = len(src_key)
+
+    # Also add generic garment-transition negatives
+    transition_terms = ["original clothing", "old garment", "residual fabric"]
+
+    all_terms = source_terms + transition_terms
+    if all_terms:
+        base += ", " + ", ".join(all_terms)
+
+    return base
+
+
 def run_idm_vton_inference(
     person_img: Image.Image,
     garment_img: Image.Image,
@@ -935,6 +1093,7 @@ def run_idm_vton_inference(
     crop_preserve_lower: bool = True,
     override_prompt: str | None = None,
     override_negative_prompt: str | None = None,
+    source_cloth_type: str = "",
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -1038,7 +1197,7 @@ def run_idm_vton_inference(
     schp_np = schp_np.astype(np.uint8)
 
     final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
-        schp_np, cloth_type, garment_subtype,
+        schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
     )
     draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
@@ -1112,19 +1271,12 @@ def run_idm_vton_inference(
     if override_prompt is not None:
         prompt = override_prompt
     else:
-        prompt = (
-            "model is wearing " + garment_desc
-        )
+        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
 
     if override_negative_prompt is not None:
         negative_prompt = override_negative_prompt
     else:
-        negative_prompt = (
-            "worst quality, low quality, "
-            "ugly, blurry, watermark, signature, text, logo, "
-            "original clothing, old garment, previous outfit, "
-            "residual fabric, double garment, layered clothing"
-        )
+        negative_prompt = _build_source_specific_negative(source_cloth_type, garment_subtype)
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -1135,7 +1287,7 @@ def run_idm_vton_inference(
                 negative_prompt=negative_prompt,
             )
 
-            prompt_c = "a photo of " + garment_desc
+            prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
@@ -1235,6 +1387,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         is_draped_garment,
         validate_mask_coverage,
         InferenceQualityReport,
+        detect_source_cloth_type,
     )
 
     job_start = time.perf_counter()
@@ -1364,6 +1517,29 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     failure_reasons: list[str] = []
     best_candidate_score: float = -1.0
 
+    # ── Detect source garment type from SCHP ────────────────────────────
+    # Run SCHP on person image to determine what the person is currently wearing.
+    # This enables target-aware mask expansion: when target covers different
+    # body regions than source, the mask expands to include them.
+    source_cloth_type = ""
+    try:
+        det_img = person_img.convert("RGB").resize(TARGET_SIZE)
+        det_parse, _ = parsing_model(det_img)
+        det_schp = np.array(det_parse) if not isinstance(det_parse, np.ndarray) else det_parse
+        if isinstance(det_parse, torch.Tensor):
+            det_schp = det_parse.cpu().numpy()
+        if det_schp.ndim == 3:
+            det_schp = det_schp.squeeze(0)
+        det_schp = det_schp.astype(np.uint8)
+        source_cloth_type = detect_source_cloth_type(det_schp)
+        logger.info(
+            "source_cloth_type_detected source=%s target=%s trace_id=%s",
+            source_cloth_type, vton_type, trace_id,
+        )
+    except Exception as exc:
+        logger.warning("source_cloth_type_detection_failed error=%s trace_id=%s", exc, trace_id)
+        source_cloth_type = ""
+
     # ── Cross-category detection —───────────────────────────────────────
     # If the person's current garment covers label categories outside the
     # target cloth_type's editable mask, two-stage erase+apply is needed.
@@ -1387,12 +1563,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             seed=seed,
             guidance_scale=guidance_scale,
             trace_id=trace_id,
+            source_cloth_type=source_cloth_type,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_start) * 1000
 
-        # Dummy quality report  — no candidate scoring for cross-category path
+        # Score cross-category output with garment-aware weights
         quality_report = InferenceQualityReport(
             passed=True, identity_drift_score=0.0, failure_reasons=(),
         )
@@ -1402,6 +1579,32 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         failure_reasons = []
         effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
         draped_request = False
+
+        if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
+            try:
+                cc_vresult = _score_candidate(
+                    person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                    result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+                    garment_img,
+                    mask_np=mask_meta.get("final_mask_np"),
+                    protect_np=mask_meta.get("protect_mask_np"),
+                    schp_labels=mask_meta.get("schp_labels"),
+                    garment_subtype=garment_subtype,
+                )
+                best_candidate_score = cc_vresult.score
+                quality_report = InferenceQualityReport(
+                    passed=cc_vresult.identity_drift < 50.0,
+                    identity_drift_score=cc_vresult.identity_drift,
+                    failure_reasons=tuple(cc_vresult.failure_reasons),
+                )
+                logger.info(
+                    "cross_category_scored score=%.4f face=%.4f garment=%.4f "
+                    "drift=%.1f replacement=%.4f trace_id=%s",
+                    cc_vresult.score, cc_vresult.face_quality, cc_vresult.garment_quality,
+                    cc_vresult.identity_drift, cc_vresult.garment_replacement, trace_id,
+                )
+            except Exception as e:
+                logger.warning("cross_category_scoring_failed error=%s trace_id=%s", e, trace_id)
 
         logger.info(
             "cross_category_inference_complete inference_ms=%.0f trace_id=%s",
@@ -1466,6 +1669,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     auto_crop=True,
                     guidance_scale=c_guidance,
                     crop_preserve_lower=True,
+                    source_cloth_type=source_cloth_type,
                 )
 
                 # Validate + score candidate
@@ -1481,6 +1685,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                         mask_np=c_final_mask_np,
                         protect_np=c_protect_np,
                         schp_labels=c_schp_labels,
+                        garment_subtype=garment_subtype,
                     )
                     logger.info(
                         "candidate_ci=%d score=%.4f face=%.4f garment=%.4f "

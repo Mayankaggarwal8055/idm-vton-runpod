@@ -1,16 +1,20 @@
 """
-GPU worker mask pipeline — SCHP-only binary masks.
+GPU worker mask pipeline — SCHP-only binary masks with target-aware expansion.
 
 SCHP is the single authoritative mask source. All masks are binary.
 No feathering, no fusing, no hybrid strategies. The model output is final.
 
 Design principles (quality-first):
-  - Inpaint mask = SCHP clothing labels for cloth_type, aggressively dilated.
+  - Inpaint mask = UNION of source garment region AND target garment expected
+    body region, aggressively dilated. This prevents the model from preserving
+    source geometry when the target garment has different coverage.
   - Protect mask = identity-critical regions only (face, hair, hands, shoes),
     NOT the inverted clothing mask (which shrinks editable area and blocks
     saree/dupatta drape over arms).
   - Draped garments (saree, dupatta, lehenga) include arm regions in inpaint
     but protect hand endpoints so mehndi / phones stay intact.
+  - Garment-specific expansion rules ensure the mask covers the TARGET
+    garment's expected body region, not just the source garment's region.
 """
 
 from __future__ import annotations
@@ -93,6 +97,150 @@ _DRAPE_KEYWORDS = (
     "pallu", "shawl", "wrap", "anarkali", "ethnic",
 )
 
+# ── Garment-aware geometry taxonomy ───────────────────────────────────
+# Maps garment subtypes to their geometric properties. This drives
+# target-aware mask expansion: when the target garment covers different
+# body regions than the source, the mask must expand to include them.
+#
+# expansion_down: extra pixels below the source garment's lowest point
+# expansion_up: extra pixels above the source garment's highest point
+# expansion_width: extra pixels on each side
+# expose_arms: if True, arms are NOT protected (tank tops, sleeveless)
+# protect_lower: if True, lower body is protected (upper-only swaps)
+# protect_upper: if True, upper body is protected (lower-only swaps)
+# body_region: which body regions the target garment covers
+
+@dataclass(frozen=True)
+class GarmentGeometry:
+    expansion_down: int = 0
+    expansion_up: int = 0
+    expansion_width: int = 0
+    expose_arms: bool = False
+    protect_lower: bool = True
+    protect_upper: bool = False
+    body_region: str = "upper"  # upper, lower, full, draped
+
+GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
+    # ── Upper body: short / fitted ────────────────────────────────────
+    "tshirt":     GarmentGeometry(body_region="upper", protect_lower=True),
+    "t_shirt":    GarmentGeometry(body_region="upper", protect_lower=True),
+    "polo":       GarmentGeometry(body_region="upper", protect_lower=True),
+    "shirt":      GarmentGeometry(body_region="upper", protect_lower=True),
+    "blouse":     GarmentGeometry(body_region="upper", protect_lower=True),
+    "sweatshirt": GarmentGeometry(body_region="upper", protect_lower=True),
+    "sports_jersey": GarmentGeometry(body_region="upper", protect_lower=True),
+    # ── Upper body: sleeveless / exposed ──────────────────────────────
+    "tank_top":   GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "crop_top":   GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "camisole":   GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "vest":       GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "corset":     GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    # ── Upper body: extended / long ───────────────────────────────────
+    "sweater":    GarmentGeometry(expansion_down=40, body_region="upper", protect_lower=True),
+    "hoodie":     GarmentGeometry(expansion_down=40, expansion_up=30, body_region="upper", protect_lower=True),
+    "jacket":     GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "blazer":     GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "coat":       GarmentGeometry(expansion_down=160, body_region="upper", protect_lower=True),
+    "cardigan":   GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "leather_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "denim_jacket":   GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    # ── Upper body: wide / flowing ────────────────────────────────────
+    "poncho":     GarmentGeometry(expansion_down=60, expansion_width=80, body_region="upper", protect_lower=True),
+    "cape":       GarmentGeometry(expansion_down=80, expansion_width=80, body_region="upper", protect_lower=True),
+    "shrug":      GarmentGeometry(expansion_width=40, body_region="upper", protect_lower=True),
+    # ── Lower body ────────────────────────────────────────────────────
+    "jeans":      GarmentGeometry(body_region="lower", protect_upper=True),
+    "trousers":   GarmentGeometry(body_region="lower", protect_upper=True),
+    "pants":      GarmentGeometry(body_region="lower", protect_upper=True),
+    "shorts":     GarmentGeometry(body_region="lower", protect_upper=True),
+    "skirt":      GarmentGeometry(body_region="lower", protect_upper=True),
+    "mini_skirt": GarmentGeometry(body_region="lower", protect_upper=True),
+    "long_skirt": GarmentGeometry(body_region="lower", protect_upper=True),
+    "leggings":   GarmentGeometry(body_region="lower", protect_upper=True),
+    "joggers":    GarmentGeometry(body_region="lower", protect_upper=True),
+    "cargo_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    "wide_leg":   GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=30),
+    "palazzo":    GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=60),
+    "dhoti_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    # ── Full body: standard ───────────────────────────────────────────
+    "dress":      GarmentGeometry(body_region="full"),
+    "mini_dress": GarmentGeometry(body_region="full"),
+    "midi_dress": GarmentGeometry(body_region="full"),
+    "maxi_dress": GarmentGeometry(body_region="full"),
+    "bodycon":    GarmentGeometry(body_region="full"),
+    "a_line":     GarmentGeometry(body_region="full", expansion_width=20),
+    "jumpsuit":   GarmentGeometry(body_region="full"),
+    # ── Full body: extended ───────────────────────────────────────────
+    "evening_gown": GarmentGeometry(expansion_down=60, body_region="full"),
+    "ball_gown":  GarmentGeometry(expansion_down=60, expansion_width=80, body_region="full"),
+    "wedding":    GarmentGeometry(expansion_down=80, expansion_width=60, body_region="full"),
+    "maxi":       GarmentGeometry(body_region="full"),
+    "wrap_dress": GarmentGeometry(body_region="full"),
+    "off_shoulder": GarmentGeometry(expansion_up=20, body_region="full"),
+    "one_shoulder": GarmentGeometry(body_region="full"),
+    "strap":      GarmentGeometry(body_region="full"),
+    # ── Traditional: draped ───────────────────────────────────────────
+    "saree":      GarmentGeometry(body_region="draped", expansion_width=40),
+    "sari":       GarmentGeometry(body_region="draped", expansion_width=40),
+    "lehenga":    GarmentGeometry(body_region="draped", expansion_width=40),
+    "ghagra":     GarmentGeometry(body_region="draped", expansion_width=40),
+    "dupatta":    GarmentGeometry(body_region="draped", expansion_width=60),
+    "shawl":      GarmentGeometry(body_region="draped", expansion_width=60),
+    "anarkali":   GarmentGeometry(body_region="draped", expansion_down=40),
+    "salwar_suit": GarmentGeometry(body_region="draped"),
+    "kurti":      GarmentGeometry(body_region="full"),
+    "kurta":      GarmentGeometry(body_region="full"),
+    # ── Traditional: structured ───────────────────────────────────────
+    "sherwani":   GarmentGeometry(expansion_down=80, body_region="full"),
+    "abaya":      GarmentGeometry(body_region="full", expansion_width=40),
+    "kaftan":     GarmentGeometry(body_region="full", expansion_width=60),
+    "jalabiya":   GarmentGeometry(body_region="full", expansion_width=40),
+    "kimono":     GarmentGeometry(body_region="full", expansion_width=80),
+    "hanbok":     GarmentGeometry(body_region="full", expansion_width=40),
+    "cheongsam":  GarmentGeometry(body_region="full"),
+    "qipao":      GarmentGeometry(body_region="full"),
+    "yukata":     GarmentGeometry(body_region="full", expansion_width=60),
+    "dhoti":      GarmentGeometry(body_region="draped"),
+    "lungi":      GarmentGeometry(body_region="draped"),
+    # ── Layered (treat as outer layer) ────────────────────────────────
+    "shirt_under_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "hoodie_under_jacket": GarmentGeometry(expansion_down=80, expansion_up=30, body_region="upper", protect_lower=True),
+    "dress_under_coat": GarmentGeometry(expansion_down=120, body_region="full"),
+    "saree_with_shawl": GarmentGeometry(body_region="draped", expansion_width=80),
+    "dupatta_over_kurti": GarmentGeometry(body_region="draped", expansion_width=60),
+    "any_with_scarf": GarmentGeometry(body_region="draped", expansion_width=40),
+}
+
+
+def get_garment_geometry(garment_subtype: str) -> GarmentGeometry:
+    """Look up geometric properties for a garment subtype.
+
+    Falls back to cloth_type-based defaults if subtype is not in the taxonomy.
+    """
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in GARMENT_GEOMETRY:
+        return GARMENT_GEOMETRY[key]
+    # Fuzzy match: prefer longest/most-specific match
+    # Direction A: taxonomy key is substring of input (e.g. "saree" in "saree_with_shawl")
+    best_a = None
+    best_a_len = 0
+    for geo_key, geo_val in GARMENT_GEOMETRY.items():
+        if key and geo_key in key and len(geo_key) > best_a_len:
+            best_a = geo_val
+            best_a_len = len(geo_key)
+    if best_a:
+        return best_a
+    # Direction B: input is substring of taxonomy key (e.g. "jacket" in "bomber_jacket")
+    best_b = None
+    best_b_len = 0
+    for geo_key, geo_val in GARMENT_GEOMETRY.items():
+        if key and key in geo_key and len(geo_key) > best_b_len:
+            best_b = geo_val
+            best_b_len = len(geo_key)
+    if best_b:
+        return best_b
+    return GarmentGeometry()  # conservative defaults
+
 
 @dataclass(frozen=True)
 class InferenceQualityReport:
@@ -144,6 +292,67 @@ def needs_two_stage(
     return uncovered_frac > uncovered_threshold
 
 
+def detect_source_cloth_type(schp_np: np.ndarray) -> str:
+    """Detect what the person is currently wearing from SCHP labels.
+
+    Returns one of: "upper_body", "lower_body", "dresses", "unknown".
+    This is used for source-aware mask expansion: when the target garment
+    covers different body regions than the source, the mask must expand.
+    """
+    h, w = schp_np.shape
+    total = h * w
+
+    # Count pixels per label
+    label_counts = {}
+    for lbl in range(20):
+        count = int(np.sum(schp_np == lbl))
+        if count > 0:
+            label_counts[lbl] = count
+
+    garment_px = sum(label_counts.get(lbl, 0) for lbl in _ALL_GARMENT_LABELS)
+    if garment_px == 0:
+        return "unknown"
+
+    # Check for coat/outerwear (label 7) — high confidence indicator
+    coat_px = label_counts.get(_LABEL_COAT, 0)
+    if coat_px / max(garment_px, 1) > 0.15:
+        return "upper_body"
+
+    # Check for dress (label 6) — covers most of body
+    dress_px = label_counts.get(_LABEL_DRESS, 0)
+    if dress_px / max(garment_px, 1) > 0.30:
+        return "dresses"
+
+    # Check for scarf (label 11) — indicates draped garment
+    scarf_px = label_counts.get(_LABEL_SCARF, 0)
+    if scarf_px / max(garment_px, 1) > 0.10:
+        return "dresses"
+
+    # Check for pants (label 9) — lower body dominant
+    pants_px = label_counts.get(_LABEL_PANTS, 0)
+    skirt_px = label_counts.get(_LABEL_SKIRT, 0)
+    lower_px = pants_px + skirt_px + label_counts.get(_LABEL_SOCKS, 0)
+    if lower_px / max(garment_px, 1) > 0.40:
+        return "lower_body"
+
+    # Check for upper clothes (label 5) — upper body dominant
+    upper_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
+    if upper_px / max(garment_px, 1) > 0.40:
+        return "upper_body"
+
+    # Check for jumpsuit (label 10) — full body
+    jumpsuit_px = label_counts.get(_LABEL_JUMPSUITS, 0)
+    if jumpsuit_px / max(garment_px, 1) > 0.20:
+        return "dresses"
+
+    # Default: if mostly upper clothing, assume upper_body
+    if upper_px >= dress_px and upper_px >= lower_px:
+        return "upper_body"
+    if lower_px >= upper_px and lower_px >= dress_px:
+        return "lower_body"
+    return "dresses"
+
+
 def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
     """Assert mask values are only {0,255} or {0,1}."""
     if mask.dtype != np.uint8:
@@ -192,6 +401,116 @@ def _dilate_mask(mask: np.ndarray, kernel_size: int, iterations: int = 1) -> np.
     return cv2.dilate(mask, kernel, iterations=iterations)
 
 
+def _expand_mask_for_target(
+    inpaint_mask: np.ndarray,
+    geometry: GarmentGeometry,
+    schp_labels: np.ndarray,
+) -> np.ndarray:
+    """Expand the inpaint mask to cover the target garment's expected body region.
+
+    This is the core fix for source-geometry preservation. When the target garment
+    covers different body regions than the source (e.g., t-shirt → jacket), the
+    mask must expand to include those regions so the model can reconstruct the
+    target garment's full shape.
+
+    Expansion is bounded by the body silhouette (SCHP labels != 0) and identity
+    protect labels (face, hair, shoes) to avoid painting into the background
+    or destroying identity.
+    """
+    h, w = inpaint_mask.shape
+    result = inpaint_mask.copy()
+
+    # Body silhouette: everything except background
+    body_mask = (schp_labels != _LABEL_BG).astype(np.uint8) * 255
+
+    # Identity regions to never expand into
+    identity_labels = list(_IDENTITY_PROTECT_LABELS)
+
+    # ── Downward expansion (target is longer than source) ──────────────
+    if geometry.expansion_down > 0:
+        # Find the lowest editable pixel in the current mask
+        editable_ys = np.where(np.any(result > 127, axis=1))[0]
+        if len(editable_ys) > 0:
+            y_start = int(editable_ys.max()) + 1
+            y_end = min(h, y_start + geometry.expansion_down)
+            # Expand into body pixels only (not background, not identity)
+            for y in range(y_start, y_end):
+                for x in range(w):
+                    if (body_mask[y, x] > 127
+                            and schp_labels[y, x] not in identity_labels):
+                        result[y, x] = 255
+
+    # ── Upward expansion (target is shorter / exposes more above) ──────
+    if geometry.expansion_up > 0:
+        editable_ys = np.where(np.any(result > 127, axis=1))[0]
+        if len(editable_ys) > 0:
+            y_end = max(0, int(editable_ys.min()) - 1)
+            y_start = max(0, y_end - geometry.expansion_up)
+            for y in range(y_start, y_end):
+                for x in range(w):
+                    if (body_mask[y, x] > 127
+                            and schp_labels[y, x] not in identity_labels):
+                        result[y, x] = 255
+
+    # ── Width expansion (target is wider: kimono, poncho, cape) ────────
+    if geometry.expansion_width > 0:
+        # Find leftmost and rightmost editable pixels per row
+        for y in range(h):
+            editable_xs = np.where(result[y, :] > 127)[0]
+            if len(editable_xs) == 0:
+                continue
+            x_left = max(0, int(editable_xs.min()) - geometry.expansion_width)
+            x_right = min(w, int(editable_xs.max()) + geometry.expansion_width + 1)
+            for x in range(x_left, x_right):
+                if (body_mask[y, x] > 127
+                        and schp_labels[y, x] not in identity_labels):
+                    result[y, x] = 255
+
+    return result
+
+
+def _compute_cross_category_expansion(
+    schp_labels: np.ndarray,
+    source_cloth_type: str,
+    target_cloth_type: str,
+    target_geometry: GarmentGeometry,
+) -> int:
+    """Compute additional downward expansion for cross-category transitions.
+
+    When source is upper_body and target is dresses/full_body, the mask needs
+    to expand into the lower body region. The expansion amount is based on
+    how much of the lower body is currently NOT in the source mask.
+    """
+    if source_cloth_type == target_cloth_type:
+        return 0
+
+    h, w = schp_labels.shape
+
+    # If target covers full body but source is upper-only, expand to lower body
+    if target_geometry.body_region in ("full", "draped"):
+        if source_cloth_type == "upper_body":
+            # Expand into pants/skirt/leg region
+            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
+                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+            lower_mask = np.isin(schp_labels, list(lower_labels))
+            if np.any(lower_mask):
+                ys = np.where(lower_mask)[0]
+                return int(ys.max() - ys.min()) + 20
+            return 120  # default expansion into lower body
+
+    # If target covers upper but source is lower, expand upward
+    if target_geometry.body_region == "upper":
+        if source_cloth_type in ("lower_body", "dresses", "full_body"):
+            upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
+            upper_mask = np.isin(schp_labels, list(upper_labels))
+            if np.any(upper_mask):
+                ys = np.where(upper_mask)[0]
+                return int(ys.max() - ys.min()) + 20
+            return 100  # default expansion into upper body
+
+    return 0
+
+
 def build_schp_inpaint_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
@@ -224,29 +543,41 @@ def build_schp_protect_mask(
 
     Uses explicit identity labels — NOT inverted clothing — so inpaint coverage
     stays large enough for full outfit replacement and draped overlays.
+
+    Arm protection is garment-aware:
+    - Tank tops, crop tops, vests: arms EXPOSED (not protected) so model
+      can generate bare arms or sleeveless output
+    - Draped garments: full arms protected (pallu generated via IP-Adapter)
+    - Standard garments: full arms protected
     """
+    geometry = get_garment_geometry(garment_subtype)
     draped = is_draped_garment(cloth_type, garment_subtype)
     mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
 
     if cloth_type == "upper_body":
-        # Block lower-body replacement when only swapping tops.
-        lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
-        mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
-        # Full arms protected for upper_body (short sleeves replace arm clothing only inside torso mask).
-        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+        if not geometry.expose_arms:
+            # Block lower-body replacement when only swapping tops.
+            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
+                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+            mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
+            # Full arms protected (unless garment exposes arms like tank top)
+            mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+        else:
+            # Sleeveless garment: only protect lower body, NOT arms
+            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
+                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+            mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
     elif cloth_type == "lower_body":
         upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT, _LABEL_DRESS, _LABEL_SCARF}
         mask = np.maximum(mask, np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255)
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
     elif draped:
-        # Drape over forearms — protect hands only.
-        mask = np.maximum(mask, _hand_zones_from_arms(schp_labels))
+        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
     else:
-        # Standard full-body dress: protect full arms (no drape over arms).
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
 
     if draped:
-        dilate_px = max(9, dilate_px - 4)
+        dilate_px = max(11, dilate_px - 2)
 
     mask = _dilate_mask(mask, dilate_px, iterations=1)
     return mask
@@ -260,18 +591,19 @@ def dilate_inpaint_mask(
 ) -> np.ndarray:
     """
     Contour-aware dilation scaled to SCHP resolution.
-    Dresses/draped garments get extra expansion for full replacement.
+    Dresses/draped garments get moderate expansion — enough to smooth edges
+    but not so much that the mask bleeds into shoulders/chest.
     """
     scale = schp_height / 512.0
     draped = is_draped_garment(cloth_type, garment_subtype)
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_ks = (max(3, int(13 * scale)), max(3, int(19 * scale)))
+        leg_ks = (max(3, int(9 * scale)), max(3, int(13 * scale)))
         leg_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, leg_ks)
-        iterations = 2 if draped else 1
+        iterations = 1
         return cv2.dilate(inpaint_mask, leg_k, iterations=iterations)
 
-    mild_ks = (max(3, int(17 * scale)), max(3, int(11 * scale)))
+    mild_ks = (max(3, int(13 * scale)), max(3, int(9 * scale)))
     mild_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, mild_ks)
     return cv2.dilate(inpaint_mask, mild_k, iterations=1)
 
@@ -280,16 +612,59 @@ def build_final_inpaint_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
     garment_subtype: str = "",
+    source_cloth_type: str = "",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Full mask pipeline: inpaint -> expand for target -> dilate -> subtract identity protect.
+
+    The mask is now TARGET-AWARE: it covers both the source garment region
+    (to ensure old garment is removed) AND the target garment's expected body
+    region (to ensure new garment can be reconstructed with correct geometry).
+
+    Args:
+        schp_labels: SCHP label map from person image.
+        cloth_type: Target garment's cloth_type.
+        garment_subtype: Target garment's specific subtype (e.g. "jacket", "saree").
+        source_cloth_type: Person's current garment cloth_type (for cross-category expansion).
     """
-    Full mask pipeline: inpaint → dilate → subtract identity protect.
-    Returns (final_mask, inpaint_dilated, protect_mask).
-    """
+    geometry = get_garment_geometry(garment_subtype)
+
+    # 1. Build source mask (SCHP clothing labels — ensures old garment is removed)
     inpaint_raw = build_schp_inpaint_mask(schp_labels, cloth_type, garment_subtype)
+
+    # 2. Expand mask for target garment geometry
+    #    This is the critical fix: mask now covers where the TARGET garment
+    #    should be, not just where the SOURCE garment was.
+    inpaint_expanded = _expand_mask_for_target(inpaint_raw, geometry, schp_labels)
+
+    # 3. Additional expansion for cross-category transitions
+    if source_cloth_type and source_cloth_type != cloth_type:
+        cross_expansion = _compute_cross_category_expansion(
+            schp_labels, source_cloth_type, cloth_type, geometry,
+        )
+        if cross_expansion > 0:
+            # Apply downward expansion for cross-category
+            h, w = schp_labels.shape
+            body_mask = (schp_labels != _LABEL_BG).astype(np.uint8) * 255
+            identity_labels = list(_IDENTITY_PROTECT_LABELS)
+            editable_ys = np.where(np.any(inpaint_expanded > 127, axis=1))[0]
+            if len(editable_ys) > 0:
+                y_start = int(editable_ys.max()) + 1
+                y_end = min(h, y_start + cross_expansion)
+                for y in range(y_start, y_end):
+                    for x in range(w):
+                        if (body_mask[y, x] > 127
+                                and schp_labels[y, x] not in identity_labels):
+                            inpaint_expanded[y, x] = 255
+
+    # 4. Build protect mask (identity regions)
     protect = build_schp_protect_mask(schp_labels, cloth_type, garment_subtype)
+
+    # 5. Dilate
     inpaint_dilated = dilate_inpaint_mask(
-        inpaint_raw, cloth_type, garment_subtype, schp_height=schp_labels.shape[0],
+        inpaint_expanded, cloth_type, garment_subtype, schp_height=schp_labels.shape[0],
     )
+
+    # 6. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
     return final, inpaint_dilated, protect
 

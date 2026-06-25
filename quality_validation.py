@@ -176,7 +176,7 @@ def validate_garment_region(
     inpaint_region = mask_np > 127
 
     if not np.any(inpaint_region):
-        return 0.5, 0.0, ["no_inpaint_region_found"]
+        return 0.5, 0.0, 0.5, ["no_inpaint_region_found"]
 
     # ── 1. Replacement strength ─────────────────────────────────────────
     diff = np.mean(np.abs(orig - out), axis=2)
@@ -243,6 +243,61 @@ def cv2_laplacian(gray: np.ndarray) -> np.ndarray:
 # Candidate scoring
 # ═══════════════════════════════════════════════════════════════════════
 
+# Garment-aware scoring weights: different garment families need different
+# priorities. Structured garments (jackets, blazers) need higher garment
+# quality weight. Draped garments (sarees) need higher color coherence.
+# Tight garments (bodycon) need higher sharpness.
+_GARMENT_WEIGHTS: dict[str, dict[str, float]] = {
+    # Structured outerwear: garment geometry matters most
+    "jacket":      {"face_quality": 0.30, "garment_quality": 0.45, "sharpness": 0.15, "color_coherence": 0.10},
+    "blazer":      {"face_quality": 0.30, "garment_quality": 0.45, "sharpness": 0.15, "color_coherence": 0.10},
+    "coat":        {"face_quality": 0.30, "garment_quality": 0.45, "sharpness": 0.15, "color_coherence": 0.10},
+    "leather_jacket": {"face_quality": 0.30, "garment_quality": 0.45, "sharpness": 0.15, "color_coherence": 0.10},
+    "denim_jacket":   {"face_quality": 0.30, "garment_quality": 0.45, "sharpness": 0.15, "color_coherence": 0.10},
+    # Draped garments: color coherence matters most (drape is IP-Adapter driven)
+    "saree":       {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.20},
+    "sari":        {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.20},
+    "lehenga":     {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.20},
+    "kimono":      {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.20},
+    "abaya":       {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.20},
+    # Tight/fitted: sharpness matters (fabric texture must be crisp)
+    "bodycon":     {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.25, "color_coherence": 0.10},
+    "leggings":    {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.25, "color_coherence": 0.10},
+    "cheongsam":   {"face_quality": 0.30, "garment_quality": 0.35, "sharpness": 0.25, "color_coherence": 0.10},
+    # Formal: face quality matters more (formal wear = close-up portraits)
+    "evening_gown": {"face_quality": 0.40, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.10},
+    "ball_gown":   {"face_quality": 0.40, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.10},
+    "wedding":     {"face_quality": 0.40, "garment_quality": 0.35, "sharpness": 0.15, "color_coherence": 0.10},
+}
+
+_DEFAULT_WEIGHTS = {
+    "face_quality": 0.35,
+    "garment_quality": 0.40,
+    "sharpness": 0.15,
+    "color_coherence": 0.10,
+}
+
+
+def _get_garment_weights(garment_subtype: str = "") -> dict[str, float]:
+    """Get scoring weights adapted to the garment type."""
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in _GARMENT_WEIGHTS:
+        return _GARMENT_WEIGHTS[key]
+    # Fuzzy match — prefer longest/most-specific match
+    best_len = 0
+    best_val = _DEFAULT_WEIGHTS
+    for geo_key, geo_val in _GARMENT_WEIGHTS.items():
+        if key and geo_key in key and len(geo_key) > best_len:
+            best_val = geo_val
+            best_len = len(geo_key)
+    if best_len > 0:
+        return best_val
+    for geo_key, geo_val in _GARMENT_WEIGHTS.items():
+        if key and key in geo_key and len(geo_key) > best_len:
+            best_val = geo_val
+            best_len = len(geo_key)
+    return best_val
+
 
 def score_candidate(
     original: Image.Image,
@@ -252,24 +307,18 @@ def score_candidate(
     protect_np: np.ndarray | None = None,
     schp_labels: np.ndarray | None = None,
     weights: dict[str, float] | None = None,
+    garment_subtype: str = "",
 ) -> ValidationResult:
     """
     Run all validations and compute an aggregate quality score.
 
-    Weights default:
-      face_quality      = 0.35
-      garment_quality   = 0.40
-      sharpness         = 0.15
-      color_coherence   = 0.10
+    Weights are garment-aware: structured garments prioritize garment quality,
+    draped garments prioritize color coherence, tight garments prioritize
+    sharpness. Can be overridden via the `weights` parameter.
 
     Returns a ValidationResult with `score` being the weighted sum.
     """
-    w = weights or {
-        "face_quality": 0.35,
-        "garment_quality": 0.40,
-        "sharpness": 0.15,
-        "color_coherence": 0.10,
-    }
+    w = weights or _get_garment_weights(garment_subtype)
 
     all_reasons: list[str] = []
 
