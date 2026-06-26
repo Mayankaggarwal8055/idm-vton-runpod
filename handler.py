@@ -480,6 +480,7 @@ def run_cross_category_inference(
         override_prompt=stage1_positive,
         override_negative_prompt=stage1_negative,
         source_cloth_type=source_cloth_type,
+        trace_id=trace_id,
     )
 
     logger.info(
@@ -504,6 +505,7 @@ def run_cross_category_inference(
         auto_crop=True,
         crop_preserve_lower=True,
         source_cloth_type=source_cloth_type,
+        trace_id=trace_id,
     )
 
     logger.info(
@@ -1107,6 +1109,7 @@ def run_idm_vton_inference(
     override_prompt: str | None = None,
     override_negative_prompt: str | None = None,
     source_cloth_type: str = "",
+    trace_id: str = "",
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -1214,7 +1217,7 @@ def run_idm_vton_inference(
     garment_img_info = analyze_garment_image(garment_img)
     final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
         schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
-        garment_img_info=garment_img_info, trace_id=job_id,
+        garment_img_info=garment_img_info, trace_id=trace_id,
     )
     draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
@@ -1608,7 +1611,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     schp_labels=mask_meta.get("schp_labels"),
                     garment_subtype=garment_subtype,
                     source_cloth_type=source_cloth_type,
-                    trace_id=job_id,
+                    trace_id=trace_id,
                 )
                 best_candidate_score = cc_vresult.score
                 quality_report = InferenceQualityReport(
@@ -1689,6 +1692,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     guidance_scale=c_guidance,
                     crop_preserve_lower=True,
                     source_cloth_type=source_cloth_type,
+                    trace_id=trace_id,
                 )
 
                 # Validate + score candidate
