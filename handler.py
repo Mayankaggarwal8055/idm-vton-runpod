@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import io
 import os
 import sys
@@ -124,6 +125,7 @@ tensor_transform = None
 get_mask_location_fn = None
 
 _WARM = threading.Event()
+_WARMUP_LOCK = threading.Lock()
 _STARTUP_TIME = time.perf_counter()
 _REUSE_COUNT: int = 0
 _REUSE_LOCK = threading.Lock()
@@ -379,6 +381,7 @@ def run_cross_category_inference(
     pipeline_route: "PipelineRoute | None" = None,
     alignment: "AlignmentTransform | None" = None,
     garment_profile: "GarmentProfile | None" = None,
+    input_warnings: "list[str] | None" = None,
 ) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
     """Two-stage cross-category try-on.
 
@@ -467,6 +470,11 @@ def run_cross_category_inference(
         trace_id, erased_person.size,
     )
 
+    # ── Free GPU memory between stages ────────────────────────────────
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
     # ── Stage 2: apply target garment ─────────────────────────────────
     # Use PipelineRoute's family-aware guidance for stage 2.
     if pipeline_route is not None:
@@ -490,6 +498,20 @@ def run_cross_category_inference(
         alignment=alignment,
         garment_profile=garment_profile,
     )
+
+    # ── P0: Dump diagnostic findings ────────────────────────────────────
+    _p0 = mask_meta.get("p0_probe")
+    if _p0 is not None:
+        try:
+            _p0.finalize()
+            _p0.dump()
+        except Exception:
+            pass
+
+    # Extract runtime warnings from inference stage
+    _runtime_warns = mask_meta.pop("_runtime_warnings", [])
+    if input_warnings is not None and _runtime_warns:
+        input_warnings.extend(_runtime_warns)
 
     logger.info(
         "cross_category_stage2_complete trace_id=%s",
@@ -928,76 +950,158 @@ def _maybe_autocast():
 # model generate the correct geometry, fit, and structure.
 
 _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
-    # Upper body: short / fitted
-    "tshirt":     {"fit": "fitted", "sleeves": "short sleeves", "structure": "casual"},
-    "t_shirt":    {"fit": "fitted", "sleeves": "short sleeves", "structure": "casual"},
-    "polo":       {"fit": "fitted", "sleeves": "short sleeves", "structure": "collar with buttons"},
-    "shirt":      {"fit": "regular fit", "sleeves": "long sleeves", "structure": "collar with button front"},
-    "blouse":     {"fit": "regular fit", "sleeves": "long sleeves", "structure": "feminine collar"},
-    "sweatshirt": {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "crew neck pullover"},
-    "sports_jersey": {"fit": "loose fit", "sleeves": "short sleeves", "structure": "athletic"},
-    # Upper body: sleeveless
-    "tank_top":   {"fit": "fitted", "sleeves": "sleeveless", "structure": "thin straps"},
-    "crop_top":   {"fit": "fitted", "sleeves": "short or sleeveless", "structure": "cropped at midriff"},
-    "camisole":   {"fit": "fitted", "sleeves": "sleeveless", "structure": "thin straps"},
-    "vest":       {"fit": "fitted", "sleeves": "sleeveless", "structure": "open front"},
-    "corset":     {"fit": "tight fitted", "sleeves": "sleeveless", "structure": "boned structured"},
-    # Upper body: extended
-    "sweater":    {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "knit pullover"},
-    "hoodie":     {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "hood with front pocket"},
-    "jacket":     {"fit": "structured fit", "sleeves": "long sleeves", "structure": "zip or button front, collar, extends below waist"},
-    "blazer":     {"fit": "structured fit", "sleeves": "long sleeves", "structure": "notched lapels, button front, extends below waist"},
-    "coat":       {"fit": "structured fit", "sleeves": "long sleeves", "structure": "long to knees, button front, collar"},
-    "cardigan":   {"fit": "relaxed fit", "sleeves": "long sleeves", "structure": "open front knit"},
-    "leather_jacket": {"fit": "structured fit", "sleeves": "long sleeves", "structure": "zip front, leather texture"},
-    "denim_jacket": {"fit": "structured fit", "sleeves": "long sleeves", "structure": "button front, denim texture"},
-    # Upper body: wide
-    "poncho":     {"fit": "loose draped", "sleeves": "sleeveless", "structure": "drapes over shoulders, wide"},
-    "cape":       {"fit": "loose draped", "sleeves": "sleeveless", "structure": "drapes over shoulders, open front"},
-    "shrug":      {"fit": "fitted", "sleeves": "short sleeves", "structure": "bolero style, cropped"},
-    # Lower body
-    "jeans":      {"fit": "regular fit", "structure": "denim, two legs, button fly"},
-    "trousers":   {"fit": "regular fit", "structure": "formal, creased, two legs"},
-    "pants":      {"fit": "regular fit", "structure": "casual, two legs"},
-    "shorts":     {"fit": "regular fit", "structure": "above knee, two legs"},
-    "skirt":      {"fit": "regular fit", "structure": "no leg separation"},
-    "leggings":   {"fit": "tight fitted", "structure": "stretchy, body-hugging"},
-    "joggers":    {"fit": "relaxed fit", "structure": "elastic waist, tapered leg"},
-    "wide_leg":   {"fit": "loose wide", "structure": "wide from hip to hem"},
-    "palazzo":    {"fit": "very loose wide", "structure": "very wide flowing leg"},
-    "dhoti_pants": {"fit": "draped loose", "structure": "wrapped, pleated"},
-    # Full body
-    "dress":      {"fit": "regular fit", "structure": "one piece"},
-    "mini_dress": {"fit": "regular fit", "structure": "above knee"},
-    "midi_dress": {"fit": "regular fit", "structure": "below knee"},
-    "maxi_dress": {"fit": "regular fit", "structure": "ankle length"},
-    "bodycon":    {"fit": "tight fitted", "structure": "body-hugging, stretchy"},
-    "a_line":     {"fit": "fitted bodice", "structure": "flared from waist"},
-    "jumpsuit":   {"fit": "regular fit", "structure": "one piece with pants"},
-    "evening_gown": {"fit": "elegant fitted", "structure": "floor length, formal"},
-    "ball_gown":  {"fit": "fitted bodice", "structure": "voluminous skirt, floor length"},
-    "wedding":    {"fit": "elegant fitted", "structure": "white, floor length, formal"},
-    "wrap_dress": {"fit": "regular fit", "structure": "wrap closure, tied at waist"},
-    "off_shoulder": {"fit": "regular fit", "structure": "exposed shoulders, neckline below shoulders"},
-    "one_shoulder": {"fit": "regular fit", "structure": "one shoulder strap"},
-    "strap":      {"fit": "fitted", "structure": "thin straps"},
-    # Traditional
-    "saree":      {"fit": "draped", "structure": "pallu over shoulder, wrapped around body"},
-    "sari":       {"fit": "draped", "structure": "pallu over shoulder, wrapped around body"},
-    "lehenga":    {"fit": "fitted bodice", "structure": "flared skirt with dupatta"},
-    "anarkali":   {"fit": "fitted bodice", "structure": "flared from waist, long"},
-    "salwar_suit": {"fit": "regular fit", "structure": "tunic with pants"},
-    "kurti":      {"fit": "regular fit", "structure": "tunic to hips"},
-    "kurta":      {"fit": "regular fit", "structure": "tunic to hips, collar"},
-    "sherwani":   {"fit": "structured fit", "structure": "long to knees, formal, embroidered"},
-    "abaya":      {"fit": "loose flowing", "structure": "full body, loose, modest"},
-    "kaftan":     {"fit": "loose flowing", "structure": "tunic, wide sleeves, loose"},
-    "kimono":     {"fit": "loose draped", "structure": "wide sleeves, wrap front, to ankles"},
-    "hanbok":     {"fit": "fitted bodice", "structure": "jacket with high waist skirt"},
-    "cheongsam":  {"fit": "tight fitted", "structure": "mandarin collar, side slit"},
-    "qipao":      {"fit": "tight fitted", "structure": "mandarin collar, side slit"},
-    "dhoti":      {"fit": "draped loose", "structure": "wrapped around waist and legs"},
-    "lungi":      {"fit": "draped loose", "structure": "wrapped around waist"},
+    # ════════════════════════════════════════════════════════════════════
+    # UPPER WEAR — fitted
+    # ════════════════════════════════════════════════════════════════════
+    "tshirt":     {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "short sleeves", "neckline": "crew neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual knit", "drape": "minimal drape", "material": "cotton jersey", "fabric_behavior": "soft stretchy"},
+    "t_shirt":    {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "short sleeves", "neckline": "crew neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual knit", "drape": "minimal drape", "material": "cotton jersey", "fabric_behavior": "soft stretchy"},
+    "polo":       {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "short sleeves", "neckline": "collared placket", "collar": "polo collar with buttons", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual knit with collar", "drape": "minimal drape", "material": "piqué cotton", "fabric_behavior": "soft structured"},
+    "shirt":      {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "straight torso", "sleeves": "long sleeves", "neckline": "collared", "collar": "point collar or spread collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer or layered under jacket", "structure": "woven button front", "drape": "crisp drape", "material": "cotton poplin or oxford", "fabric_behavior": "crisp smooth woven"},
+    "blouse":     {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "relaxed torso", "sleeves": "long sleeves", "neckline": "soft v-neck or round", "collar": "feminine collar or bow", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "feminine woven", "drape": "soft drape", "material": "silk or chiffon or crepe", "fabric_behavior": "flowing lightweight"},
+    "sweatshirt": {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed torso", "sleeves": "long sleeves", "neckline": "crew neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual pullover", "drape": "stiff drape", "material": "fleece or terry cotton", "fabric_behavior": "thick soft"},
+    "sports_jersey": {"coverage": "upper body garment", "fit": "loose fit", "silhouette": "relaxed torso", "sleeves": "short sleeves", "neckline": "v-neck or crew", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "athletic mesh", "drape": "minimal drape", "material": "polyester mesh", "fabric_behavior": "lightweight breathable"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # UPPER WEAR — sleeveless / exposed
+    # ════════════════════════════════════════════════════════════════════
+    "tank_top":   {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "sleeveless", "neckline": "scoop neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual knit", "drape": "minimal drape", "material": "cotton rib knit", "fabric_behavior": "soft stretchy"},
+    "crop_top":   {"coverage": "upper body garment, cropped", "fit": "fitted", "silhouette": "close to torso", "sleeves": "short or sleeveless", "neckline": "various", "collar": "no collar", "waist_position": "above natural waist", "garment_length": "cropped above navel", "layering": "single layer", "structure": "casual cropped", "drape": "minimal drape", "material": "cotton or rib knit", "fabric_behavior": "soft stretchy"},
+    "camisole":   {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "sleeveless", "neckline": "v-neck or straight", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer or under layer", "structure": "delicate knit", "drape": "minimal drape", "material": "satin or silk", "fabric_behavior": "slippery lightweight"},
+    "vest":       {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "sleeveless", "neckline": "v-neck or round", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "layering piece", "structure": "knit or woven", "drape": "minimal drape", "material": "cotton or wool knit", "fabric_behavior": "soft structured"},
+    "corset":     {"coverage": "upper body garment, cropped", "fit": "tight fitted", "silhouette": "cinched waist", "sleeves": "sleeveless", "neckline": "sweetheart or straight", "collar": "no collar", "waist_position": "cinched at waist", "garment_length": "cropped at waist or hip", "layering": "single layer or over layer", "structure": "boned structured", "drape": "rigid no drape", "material": "satin or brocade", "fabric_behavior": "stiff rigid"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # UPPER WEAR — extended / long
+    # ════════════════════════════════════════════════════════════════════
+    "sweater":    {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed torso", "sleeves": "long sleeves", "neckline": "crew neck or turtleneck", "collar": "no collar or roll neck", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "knit pullover", "drape": "soft drape", "material": "wool or cashmere knit", "fabric_behavior": "thick warm textured"},
+    "hoodie":     {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed torso", "sleeves": "long sleeves", "neckline": "hooded", "collar": "hood", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "casual pullover with hood", "drape": "stiff drape", "material": "fleece or french terry", "fabric_behavior": "thick soft"},
+    "jacket":     {"coverage": "upper body garment, extends below waist", "fit": "structured fit", "silhouette": "structured shoulders", "sleeves": "long sleeves", "neckline": "collared", "collar": "notched lapel or stand collar", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "zip or button front structured", "drape": "structured no drape", "material": "cotton or nylon or wool", "fabric_behavior": "stiff structured"},
+    "blazer":     {"coverage": "upper body garment, extends below waist", "fit": "structured fit", "silhouette": "structured shoulders", "sleeves": "long sleeves", "neckline": "collared", "collar": "notched lapels", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "button front tailored", "drape": "structured no drape", "material": "wool blend or linen", "fabric_behavior": "crisp structured"},
+    "coat":       {"coverage": "upper body garment, extends to knees", "fit": "structured fit", "silhouette": "structured shoulders", "sleeves": "long sleeves", "neckline": "collared", "collar": "notched lapel or Peter Pan", "waist_position": "natural waist", "garment_length": "extends to knee or below", "layering": "outer layer", "structure": "long button front", "drape": "heavy drape", "material": "wool or trench fabric", "fabric_behavior": "heavy structured"},
+    "cardigan":   {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed open", "sleeves": "long sleeves", "neckline": "open front", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip or below", "layering": "layering piece", "structure": "open front knit", "drape": "soft drape", "material": "wool or cotton knit", "fabric_behavior": "soft flowing"},
+    "leather_jacket": {"coverage": "upper body garment, extends below waist", "fit": "structured fit", "silhouette": "structured shoulders", "sleeves": "long sleeves", "neckline": "collared", "collar": "point collar or mandarin", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "zip front leather", "drape": "stiff no drape", "material": "leather or faux leather", "fabric_behavior": "stiff rigid"},
+    "denim_jacket": {"coverage": "upper body garment, extends below waist", "fit": "structured fit", "silhouette": "structured shoulders", "sleeves": "long sleeves", "neckline": "collared", "collar": "point collar", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "button front denim", "drape": "stiff no drape", "material": "denim cotton twill", "fabric_behavior": "stiff structured"},
+    "puffer_jacket": {"coverage": "upper body garment, extends below waist", "fit": "relaxed fit", "silhouette": "puffy insulated", "sleeves": "long sleeves", "neckline": "collared or hooded", "collar": "stand collar or hood", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "quilted insulated", "drape": "voluminous no drape", "material": "nylon with down fill", "fabric_behavior": "puffy bulky"},
+    "parka":      {"coverage": "upper body garment, extends to knees", "fit": "relaxed fit", "silhouette": "relaxed insulated", "sleeves": "long sleeves", "neckline": "hooded", "collar": "hood with fur trim", "waist_position": "natural waist", "garment_length": "extends to knee", "layering": "outer layer", "structure": "zip front insulated", "drape": "heavy drape", "material": "nylon with down fill", "fabric_behavior": "thick insulated"},
+    "fleece":     {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed torso", "sleeves": "long sleeves", "neckline": "zip or crew", "collar": "no collar or stand", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "mid layer", "structure": "pullover or zip", "drape": "soft drape", "material": "polyester fleece", "fabric_behavior": "soft warm"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # UPPER WEAR — wide / flowing
+    # ════════════════════════════════════════════════════════════════════
+    "poncho":     {"coverage": "upper body garment", "fit": "loose draped", "silhouette": "wide triangular", "sleeves": "sleeveless", "neckline": "open neck hole", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "hits at hip or below", "layering": "outer layer", "structure": "drapes over shoulders", "drape": "heavy flowing drape", "material": "wool or cotton weave", "fabric_behavior": "flowing loose"},
+    "cape":       {"coverage": "upper body garment", "fit": "loose draped", "silhouette": "wide flowing", "sleeves": "sleeveless", "neckline": "open or clasp", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "hits at hip or below", "layering": "outer layer", "structure": "drapes over shoulders open front", "drape": "heavy flowing drape", "material": "wool or cashmere", "fabric_behavior": "flowing elegant"},
+    "shrug":      {"coverage": "upper body garment", "fit": "fitted", "silhouette": "cropped bolero", "sleeves": "short sleeves", "neckline": "open front", "collar": "no collar", "waist_position": "above natural waist", "garment_length": "cropped at chest", "layering": "layering piece", "structure": "bolero style cropped", "drape": "minimal drape", "material": "knit or velvet", "fabric_behavior": "soft structured"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # LOWER WEAR
+    # ════════════════════════════════════════════════════════════════════
+    "jeans":      {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "straight leg", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist or hip", "garment_length": "full length to ankle", "layering": "single layer", "structure": "denim two legs button fly", "drape": "minimal drape", "material": "denim cotton twill", "fabric_behavior": "stiff structured"},
+    "trousers":   {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "straight or tapered leg", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "formal creased two legs", "drape": "crisp drape", "material": "wool or cotton suiting", "fabric_behavior": "crisp structured"},
+    "pants":      {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "straight leg", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "casual two legs", "drape": "soft drape", "material": "cotton or linen", "fabric_behavior": "soft comfortable"},
+    "shorts":     {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "above knee", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "above knee", "layering": "single layer", "structure": "casual two legs short", "drape": "minimal drape", "material": "cotton or chino", "fabric_behavior": "soft casual"},
+    "skirt":      {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "A-line or straight", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "no leg separation", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "flowing or structured"},
+    "mini_skirt": {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "above knee", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "above knee", "layering": "single layer", "structure": "no leg separation short", "drape": "minimal drape", "material": "denim or cotton", "fabric_behavior": "stiff or flowy"},
+    "maxi_skirt": {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "long flowing", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "ankle length", "layering": "single layer", "structure": "no leg separation long", "drape": "flowing drape", "material": "chiffon or cotton", "fabric_behavior": "flowing lightweight"},
+    "leggings":   {"coverage": "lower body garment", "fit": "tight fitted", "silhouette": "body-hugging", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist or high waist", "garment_length": "full length to ankle", "layering": "single layer or under layer", "structure": "stretchy two legs", "drape": "no drape skin tight", "material": "spandex blend", "fabric_behavior": "stretchy body-hugging"},
+    "joggers":    {"coverage": "lower body garment", "fit": "relaxed fit", "silhouette": "tapered leg", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "elastic waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "elastic waist tapered leg", "drape": "soft drape", "material": "fleece or cotton", "fabric_behavior": "soft comfortable"},
+    "wide_leg":   {"coverage": "lower body garment", "fit": "loose wide", "silhouette": "wide from hip to hem", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist or high waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "wide from hip to hem", "drape": "flowing drape", "material": "crepe or linen", "fabric_behavior": "flowing wide"},
+    "palazzo":    {"coverage": "lower body garment", "fit": "very loose wide", "silhouette": "very wide flowing", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "very wide flowing leg", "drape": "heavy flowing drape", "material": "crepe or chiffon", "fabric_behavior": "flowing dramatic"},
+    "dhoti_pants": {"coverage": "lower body garment", "fit": "draped loose", "silhouette": "draped wrapped", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "wrapped pleated", "drape": "heavy draped drape", "material": "cotton or silk", "fabric_behavior": "draped flowing"},
+    "cycling_shorts": {"coverage": "lower body garment", "fit": "tight fitted", "silhouette": "body-hugging", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "above knee", "layering": "single layer", "structure": "tight stretchy", "drape": "no drape skin tight", "material": "lycra or spandex", "fabric_behavior": "stretchy compressive"},
+    "yoga_pants":  {"coverage": "lower body garment", "fit": "tight fitted", "silhouette": "body-hugging", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "high waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "stretchy pull-on", "drape": "no drape skin tight", "material": "nylon spandex blend", "fabric_behavior": "stretchy smooth"},
+    "cargo_pants": {"coverage": "lower body garment", "fit": "relaxed fit", "silhouette": "relaxed straight", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "pocketed utility", "drape": "stiff drape", "material": "cotton twill", "fabric_behavior": "stiff durable"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # FULL BODY — dresses
+    # ════════════════════════════════════════════════════════════════════
+    "dress":      {"coverage": "full body garment", "fit": "regular fit", "silhouette": "varies", "sleeves": "long sleeves", "neckline": "various", "collar": "various", "waist_position": "natural waist", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "one piece", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "varies"},
+    "mini_dress": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "above knee", "sleeves": "short or long", "neckline": "various", "collar": "various", "waist_position": "natural waist", "garment_length": "above knee", "layering": "single layer", "structure": "one piece short", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "varies"},
+    "midi_dress": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "below knee", "sleeves": "long sleeves", "neckline": "various", "collar": "various", "waist_position": "natural waist", "garment_length": "below knee", "layering": "single layer", "structure": "one piece midi", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "varies"},
+    "maxi_dress": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "long flowing", "sleeves": "long sleeves", "neckline": "various", "collar": "various", "waist_position": "natural waist or empire", "garment_length": "ankle length", "layering": "single layer", "structure": "one piece long", "drape": "flowing drape", "material": "chiffon or cotton", "fabric_behavior": "flowing lightweight"},
+    "bodycon":    {"coverage": "full body garment", "fit": "tight fitted", "silhouette": "body-hugging", "sleeves": "short or long", "neckline": "various", "collar": "no collar", "waist_position": "natural waist", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "body-hugging stretchy", "drape": "no drape skin tight", "material": "jersey or rib knit", "fabric_behavior": "stretchy body-hugging"},
+    "a_line":     {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted top flared skirt", "sleeves": "long sleeves", "neckline": "various", "collar": "various", "waist_position": "natural waist", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "fitted bodice flared from waist", "drape": "flared drape", "material": "various fabrics", "fabric_behavior": "structured to flowing"},
+    "jumpsuit":   {"coverage": "full body garment", "fit": "regular fit", "silhouette": "one piece pants", "sleeves": "long sleeves", "neckline": "various", "collar": "various", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "one piece with pants", "drape": "varies", "material": "various fabrics", "fabric_behavior": "varies"},
+    "evening_gown": {"coverage": "full body garment", "fit": "elegant fitted", "silhouette": "elegant long", "sleeves": "sleeveless or long", "neckline": "v-neck or sweetheart", "collar": "no collar", "waist_position": "natural waist", "garment_length": "floor length", "layering": "single layer", "structure": "floor length formal", "drape": "flowing drape", "material": "silk or satin or tulle", "fabric_behavior": "flowing elegant"},
+    "ball_gown":  {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted top voluminous skirt", "sleeves": "sleeveless or long", "neckline": "sweetheart or off shoulder", "collar": "no collar", "waist_position": "natural waist", "garment_length": "floor length", "layering": "single layer", "structure": "fitted bodice voluminous skirt floor length", "drape": "voluminous drape", "material": "tulle or satin", "fabric_behavior": "voluminous structured"},
+    "wedding":    {"coverage": "full body garment", "fit": "elegant fitted", "silhouette": "elegant long", "sleeves": "sleeveless or long", "neckline": "various", "collar": "no collar", "waist_position": "natural waist", "garment_length": "floor length with train", "layering": "single layer", "structure": "white formal floor length", "drape": "flowing drape", "material": "lace or satin or tulle", "fabric_behavior": "flowing elegant"},
+    "wrap_dress": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "wrap closure", "sleeves": "long sleeves", "neckline": "v-neck wrap", "collar": "no collar", "waist_position": "tied at waist", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "wrap closure tied at waist", "drape": "soft drape", "material": "jersey or silk", "fabric_behavior": "soft flowing"},
+    "off_shoulder": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "exposed shoulders", "sleeves": "off shoulder sleeves", "neckline": "off shoulder wide", "collar": "no collar", "waist_position": "natural waist", "garment_length": "varies", "layering": "single layer", "structure": "exposed shoulders neckline below shoulders", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "varies"},
+    "one_shoulder": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "asymmetric", "sleeves": "one shoulder strap", "neckline": "one shoulder", "collar": "no collar", "waist_position": "natural waist", "garment_length": "varies", "layering": "single layer", "structure": "one shoulder strap asymmetric", "drape": "soft drape", "material": "various fabrics", "fabric_behavior": "varies"},
+    "cocktail_dress": {"coverage": "full body garment", "fit": "fitted", "silhouette": "knee length elegant", "sleeves": "sleeveless or short", "neckline": "v-neck or round", "collar": "no collar", "waist_position": "natural waist", "garment_length": "knee length", "layering": "single layer", "structure": "semi-formal knee length", "drape": "soft drape", "material": "silk or crepe", "fabric_behavior": "elegant structured"},
+    "sundress":   {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted top flared skirt", "sleeves": "sleeveless or straps", "neckline": "scoop or sweetheart", "collar": "no collar", "waist_position": "natural waist or empire", "garment_length": "varies knee to ankle", "layering": "single layer", "structure": "casual summer dress", "drape": "flowing drape", "material": "cotton or linen", "fabric_behavior": "lightweight flowing"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # INDIAN WEAR — traditional / ethnic
+    # ════════════════════════════════════════════════════════════════════
+    "saree":      {"coverage": "draped full body garment", "fit": "draped", "silhouette": "draped wrapped with pallu", "sleeves": "blouse sleeves vary", "neckline": "blouse neckline", "collar": "no collar", "waist_position": "natural waist wrapped", "garment_length": "floor length draped", "layering": "draped over blouse", "structure": "pallu over shoulder wrapped around body", "drape": "heavy flowing drape", "material": "silk or cotton or georgette", "fabric_behavior": "flowing draped"},
+    "sari":       {"coverage": "draped full body garment", "fit": "draped", "silhouette": "draped wrapped with pallu", "sleeves": "blouse sleeves vary", "neckline": "blouse neckline", "collar": "no collar", "waist_position": "natural waist wrapped", "garment_length": "floor length draped", "layering": "draped over blouse", "structure": "pallu over shoulder wrapped around body", "drape": "heavy flowing drape", "material": "silk or cotton or georgette", "fabric_behavior": "flowing draped"},
+    "lehenga":    {"coverage": "draped full body garment", "fit": "fitted bodice", "silhouette": "fitted choli flared skirt", "sleeves": "short or long blouse sleeves", "neckline": "blouse neckline", "collar": "no collar", "waist_position": "natural waist", "garment_length": "floor length skirt", "layering": "choli with lehenga skirt and dupatta", "structure": "flared skirt with dupatta", "drape": "flared drape", "material": "silk or brocade or net", "fabric_behavior": "structured to flowing"},
+    "dupatta":    {"coverage": "draped upper body accessory", "fit": "draped loose", "silhouette": "flowing rectangular", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "n/a", "garment_length": "varies", "layering": "draped over shoulders or arms", "structure": "rectangular drape piece", "drape": "heavy flowing drape", "material": "chiffon or silk or cotton", "fabric_behavior": "flowing lightweight"},
+    "shawl":      {"coverage": "draped upper body accessory", "fit": "draped loose", "silhouette": "flowing rectangular", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "n/a", "garment_length": "varies", "layering": "draped over shoulders", "structure": "rectangular or triangular drape", "drape": "heavy flowing drape", "material": "wool or pashmina or silk", "fabric_behavior": "flowing warm"},
+    "anarkali":   {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted top flared from waist", "sleeves": "long sleeves", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "floor length", "layering": "single layer with churidar", "structure": "flared from waist long", "drape": "flowing flared drape", "material": "silk or cotton or georgette", "fabric_behavior": "flowing elegant"},
+    "salwar_suit": {"coverage": "full body garment", "fit": "regular fit", "silhouette": "tunic with pants", "sleeves": "long sleeves", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "tunic to hips or knees", "layering": "tunic with salwar pants", "structure": "tunic with pants", "drape": "soft drape", "material": "cotton or silk", "fabric_behavior": "soft comfortable"},
+    "kurti":      {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "straight tunic", "sleeves": "long or short sleeves", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "tunic to hips or knees", "layering": "single layer or with pants", "structure": "tunic to hips", "drape": "soft drape", "material": "cotton or silk or rayon", "fabric_behavior": "soft flowing"},
+    "kurta":      {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "straight tunic", "sleeves": "long or short sleeves", "neckline": "mandarin collar", "collar": "mandarin collar", "waist_position": "natural waist", "garment_length": "tunic to hips or knees", "layering": "single layer or with pants", "structure": "tunic to hips with collar", "drape": "soft drape", "material": "cotton or silk", "fabric_behavior": "soft flowing"},
+    "sherwani":   {"coverage": "full body garment", "fit": "structured fit", "silhouette": "long structured coat", "sleeves": "long sleeves", "neckline": "mandarin collar", "collar": "mandarin collar", "waist_position": "natural waist", "garment_length": "to knee or below", "layering": "over churidar", "structure": "long to knees formal embroidered", "drape": "structured no drape", "material": "silk or brocade or velvet", "fabric_behavior": "stiff structured"},
+    "abaya":      {"coverage": "full body garment", "fit": "loose flowing", "silhouette": "loose full body", "sleeves": "long wide sleeves", "neckline": "modest round", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "floor length", "layering": "outer modest layer", "structure": "full body loose modest", "drape": "heavy flowing drape", "material": "crepe or chiffon", "fabric_behavior": "flowing loose"},
+    "kaftan":     {"coverage": "full body garment", "fit": "loose flowing", "silhouette": "wide loose tunic", "sleeves": "wide long sleeves", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "knee to ankle length", "layering": "single layer", "structure": "tunic wide sleeves loose", "drape": "heavy flowing drape", "material": "silk or cotton or chiffon", "fabric_behavior": "flowing loose"},
+    "dhoti":      {"coverage": "draped lower body garment", "fit": "draped loose", "silhouette": "draped wrapped", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "wrapped around waist and legs", "drape": "heavy draped drape", "material": "cotton or silk", "fabric_behavior": "draped flowing"},
+    "lungi":      {"coverage": "draped lower body garment", "fit": "draped loose", "silhouette": "wrapped cylindrical", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "to ankle", "layering": "single layer", "structure": "wrapped around waist", "drape": "draped drape", "material": "cotton", "fabric_behavior": "soft casual"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # TRADITIONAL WEAR — non-Indian
+    # ════════════════════════════════════════════════════════════════════
+    "kimono":     {"coverage": "full body garment", "fit": "loose draped", "silhouette": "wide rectangular", "sleeves": "wide long sleeves", "neckline": "wrap v-neck", "collar": "no collar", "waist_position": "obi belt at waist", "garment_length": "to ankles", "layering": "layered robe", "structure": "wide sleeves wrap front to ankles", "drape": "structured drape", "material": "silk or cotton", "fabric_behavior": "structured flowing"},
+    "hanbok":     {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted jacket voluminous skirt", "sleeves": "wide sleeves", "neckline": "high round neck", "collar": "no collar", "waist_position": "high waist above natural", "garment_length": "floor length skirt", "layering": "jacket with skirt", "structure": "jacket with high waist skirt", "drape": "voluminous drape", "material": "silk or ramie", "fabric_behavior": "structured voluminous"},
+    "cheongsam":  {"coverage": "full body garment", "fit": "tight fitted", "silhouette": "body-hugging with side slit", "sleeves": "short or long", "neckline": "mandarin collar", "collar": "mandarin collar", "waist_position": "natural waist", "garment_length": "knee to ankle", "layering": "single layer", "structure": "mandarin collar side slit", "drape": "no drape skin tight", "material": "silk or brocade", "fabric_behavior": "stiff structured"},
+    "qipao":      {"coverage": "full body garment", "fit": "tight fitted", "silhouette": "body-hugging with side slit", "sleeves": "short or long", "neckline": "mandarin collar", "collar": "mandarin collar", "waist_position": "natural waist", "garment_length": "knee to ankle", "layering": "single layer", "structure": "mandarin collar side slit", "drape": "no drape skin tight", "material": "silk or brocade", "fabric_behavior": "stiff structured"},
+    "thobe":      {"coverage": "full body garment", "fit": "regular fit", "silhouette": "long straight robe", "sleeves": "long sleeves", "neckline": "collared or round", "collar": "simple collar", "waist_position": "natural waist", "garment_length": "ankle length", "layering": "single layer", "structure": "long straight robe", "drape": "minimal drape", "material": "cotton or polyester", "fabric_behavior": "crisp smooth"},
+    "dirndl":     {"coverage": "full body garment", "fit": "fitted bodice", "silhouette": "fitted bodice flared skirt", "sleeves": "short puffed sleeves", "neckline": "square or sweetheart", "collar": "no collar", "waist_position": "natural waist", "garment_length": "knee length", "layering": "blouse under bodice with skirt", "structure": "fitted bodice flared skirt with apron", "drape": "flared drape", "material": "cotton or linen", "fabric_behavior": "structured flowing"},
+    "lederhosen": {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "short suspender pants", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "above knee", "layering": "with suspenders", "structure": "leather shorts with suspenders", "drape": "no drape stiff", "material": "leather or suede", "fabric_behavior": "stiff structured"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # WINTER / OUTERWEAR
+    # ════════════════════════════════════════════════════════════════════
+    "down_jacket": {"coverage": "upper body garment, extends below waist", "fit": "relaxed fit", "silhouette": "puffy insulated", "sleeves": "long sleeves", "neckline": "collared or hooded", "collar": "stand collar or hood", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "quilted down filled", "drape": "voluminous no drape", "material": "nylon with down fill", "fabric_behavior": "puffy bulky"},
+    "ski_jacket": {"coverage": "upper body garment, extends below waist", "fit": "structured fit", "silhouette": "athletic insulated", "sleeves": "long sleeves", "neckline": "hooded", "collar": "high collar with hood", "waist_position": "natural waist", "garment_length": "extends below waist to hip", "layering": "outer layer", "structure": "technical waterproof", "drape": "structured no drape", "material": "gore-tex or nylon", "fabric_behavior": "stiff technical"},
+    "trench_coat": {"coverage": "upper body garment, extends to knees", "fit": "structured fit", "silhouette": "tailored long", "sleeves": "long sleeves", "neckline": "collared", "collar": "notched lapels with storm flap", "waist_position": "belted at waist", "garment_length": "extends to knee", "layering": "outer layer", "structure": "double breasted belted", "drape": "crisp structured drape", "material": "cotton gabardine", "fabric_behavior": "crisp structured"},
+    "windbreaker": {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "lightweight shell", "sleeves": "long sleeves", "neckline": "collared or hooded", "collar": "stand collar or hood", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "outer layer", "structure": "lightweight zip front", "drape": "stiff no drape", "material": "nylon or polyester", "fabric_behavior": "crisp lightweight"},
+    "raincoat":   {"coverage": "upper body garment, extends to knees", "fit": "regular fit", "silhouette": "waterproof shell", "sleeves": "long sleeves", "neckline": "collared or hooded", "collar": "hood or stand collar", "waist_position": "natural waist", "garment_length": "extends to knee", "layering": "outer layer", "structure": "waterproof zip or snap", "drape": "stiff no drape", "material": "rubberized or gore-tex", "fabric_behavior": "stiff waterproof"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # SPORTSWEAR
+    # ════════════════════════════════════════════════════════════════════
+    "tracksuit":  {"coverage": "full body garment", "fit": "regular fit", "silhouette": "matching set", "sleeves": "long sleeves", "neckline": "zip or crew", "collar": "no collar or stand", "waist_position": "elastic waist", "garment_length": "full length", "layering": "single layer", "structure": "matching jacket and pants", "drape": "soft drape", "material": "polyester or nylon", "fabric_behavior": "smooth athletic"},
+    "athletic_shirt": {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "relaxed torso", "sleeves": "short sleeves", "neckline": "crew neck or v-neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "single layer", "structure": "moisture wicking", "drape": "minimal drape", "material": "polyester mesh", "fabric_behavior": "lightweight breathable"},
+    "swimsuit":   {"coverage": "full body garment", "fit": "tight fitted", "silhouette": "body-hugging", "sleeves": "sleeveless", "neckline": "various", "collar": "no collar", "waist_position": "natural waist", "garment_length": "varies", "layering": "single layer", "structure": "swimwear", "drape": "no drape skin tight", "material": "nylon spandex", "fabric_behavior": "stretchy smooth"},
+    "bikini":     {"coverage": "partial body garment", "fit": "tight fitted", "silhouette": "two piece", "sleeves": "sleeveless", "neckline": "various", "collar": "no collar", "waist_position": "natural waist", "garment_length": "very short", "layering": "single layer", "structure": "two piece swimwear", "drape": "no drape skin tight", "material": "nylon spandex", "fabric_behavior": "stretchy smooth"},
+    "sports_bra": {"coverage": "upper body garment, cropped", "fit": "tight fitted", "silhouette": "close to torso", "sleeves": "sleeveless", "neckline": "various", "collar": "no collar", "waist_position": "above natural waist", "garment_length": "cropped at ribcage", "layering": "single layer or under layer", "structure": "supportive crop", "drape": "no drape skin tight", "material": "nylon spandex", "fabric_behavior": "stretchy supportive"},
+    "gym_shorts": {"coverage": "lower body garment", "fit": "relaxed fit", "silhouette": "above knee loose", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "elastic waist", "garment_length": "above knee", "layering": "single layer", "structure": "athletic short", "drape": "soft drape", "material": "polyester or mesh", "fabric_behavior": "lightweight breathable"},
+    "hiking_pants": {"coverage": "lower body garment", "fit": "regular fit", "silhouette": "straight leg", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "full length to ankle", "layering": "single layer", "structure": "zip-off convertible", "drape": "stiff drape", "material": "nylon or ripstop", "fabric_behavior": "stiff durable"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # FORMAL / BUSINESS
+    # ════════════════════════════════════════════════════════════════════
+    "suit":       {"coverage": "full body garment", "fit": "structured fit", "silhouette": "tailored jacket and pants", "sleeves": "long sleeves", "neckline": "collared", "collar": "notched lapels", "waist_position": "natural waist", "garment_length": "jacket to hip, pants to ankle", "layering": "jacket with pants", "structure": "tailored two piece", "drape": "structured no drape", "material": "wool suiting", "fabric_behavior": "crisp structured"},
+    "tuxedo":     {"coverage": "full body garment", "fit": "structured fit", "silhouette": "formal tailored", "sleeves": "long sleeves", "neckline": "collared", "collar": "peak lapels satin", "waist_position": "natural waist", "garment_length": "jacket to hip, pants to ankle", "layering": "jacket with pants", "structure": "formal evening suit", "drape": "structured no drape", "material": "wool or barathea", "fabric_behavior": "crisp formal"},
+    "waistcoat":  {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso", "sleeves": "sleeveless", "neckline": "v-neck", "collar": "no collar", "waist_position": "natural waist", "garment_length": "hits at waist or hip", "layering": "layering piece under jacket", "structure": "button front tailored", "drape": "minimal drape", "material": "wool or silk", "fabric_behavior": "crisp structured"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # LAYERED / MIXED
+    # ════════════════════════════════════════════════════════════════════
+    "shrug_over_dress": {"coverage": "upper body garment", "fit": "fitted", "silhouette": "cropped over dress", "sleeves": "short sleeves", "neckline": "open front", "collar": "no collar", "waist_position": "above natural waist", "garment_length": "cropped at chest", "layering": "layering piece over dress", "structure": "bolero cropped layer", "drape": "minimal drape", "material": "knit or velvet", "fabric_behavior": "soft structured"},
+    "vest_over_shirt": {"coverage": "upper body garment", "fit": "regular fit", "silhouette": "layered torso", "sleeves": "long sleeves from shirt", "neckline": "v-neck from vest", "collar": "shirt collar visible", "waist_position": "natural waist", "garment_length": "hits at hip", "layering": "vest over shirt", "structure": "waistcoat over button shirt", "drape": "structured layering", "material": "wool vest cotton shirt", "fabric_behavior": "crisp layered"},
+
+    # ════════════════════════════════════════════════════════════════════
+    # ETHNIC WEAR — misc
+    # ════════════════════════════════════════════════════════════════════
+    "dashiki":    {"coverage": "upper body garment", "fit": "relaxed fit", "silhouette": "loose tunic", "sleeves": "short or long sleeves", "neckline": "round embroidered", "collar": "no collar", "waist_position": "natural waist", "garment_length": "to hips or knees", "layering": "single layer", "structure": "embroidered tunic", "drape": "soft drape", "material": "cotton or silk", "fabric_behavior": "soft flowing"},
+    "boubou":     {"coverage": "full body garment", "fit": "loose flowing", "silhouette": "wide flowing robe", "sleeves": "wide long sleeves", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "ankle length", "layering": "single layer", "structure": "wide flowing robe", "drape": "heavy flowing drape", "material": "cotton or silk", "fabric_behavior": "flowing loose"},
+    "agbada":     {"coverage": "full body garment", "fit": "loose flowing", "silhouette": "wide flowing over garment", "sleeves": "wide long sleeves", "neckline": "round", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "ankle length", "layering": "outer over inner", "structure": "wide flowing over garment", "drape": "heavy flowing drape", "material": "cotton or silk", "fabric_behavior": "flowing loose"},
+    "sarong":     {"coverage": "draped lower body garment", "fit": "draped loose", "silhouette": "wrapped cylindrical", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "to ankle", "layering": "single layer", "structure": "wrapped around waist", "drape": "draped drape", "material": "cotton or batik", "fabric_behavior": "flowing casual"},
+    "pareo":      {"coverage": "draped lower body garment", "fit": "draped loose", "silhouette": "wrapped various", "sleeves": "n/a", "neckline": "n/a", "collar": "n/a", "waist_position": "natural waist", "garment_length": "varies", "layering": "single layer", "structure": "wrapped various styles", "drape": "flowing drape", "material": "cotton or rayon", "fabric_behavior": "flowing lightweight"},
+    "muumuu":     {"coverage": "full body garment", "fit": "loose flowing", "silhouette": "wide loose dress", "sleeves": "short or long", "neckline": "round or v-neck", "collar": "no collar", "waist_position": "no defined waist", "garment_length": "to ankle", "layering": "single layer", "structure": "loose Hawaiian dress", "drape": "heavy flowing drape", "material": "cotton or rayon", "fabric_behavior": "flowing loose"},
+    "sari_blouse": {"coverage": "upper body garment", "fit": "fitted", "silhouette": "close to torso cropped", "sleeves": "short or long", "neckline": "various", "collar": "no collar", "waist_position": "natural waist", "garment_length": "cropped at waist", "layering": "under sari", "structure": "cropped fitted blouse", "drape": "no drape fitted", "material": "silk or cotton", "fabric_behavior": "stiff fitted"},
 }
 
 # Source garment-specific negative terms to prevent source residual
@@ -1019,7 +1123,17 @@ _SOURCE_NEGATIVES: dict[str, list[str]] = {
 
 
 def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") -> str:
-    """Build a prompt that describes the target garment's fit, sleeves, and structure."""
+    """Build a prompt that describes the target garment comprehensively.
+
+    Uses all 13 attributes: coverage, fit, silhouette, sleeves, neckline,
+    collar, waist_position, garment_length, layering, structure, drape,
+    material, fabric_behavior.
+
+    Includes coverage hints so the model distinguishes:
+      - blouse (upper body only) vs saree drape (full body draped)
+      - structured jacket (rigid, extends below waist) vs loose drape
+      - sleeveless crop top vs long-sleeve shirt
+    """
     key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
     attrs = _GARMENT_PROMPT_ATTRS.get(key, {})
     if not attrs:
@@ -1037,12 +1151,12 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
                     best_len = len(geo_key)
 
     parts = ["model wearing " + garment_desc]
-    if "fit" in attrs:
-        parts.append(attrs["fit"])
-    if "sleeves" in attrs:
-        parts.append(attrs["sleeves"])
-    if "structure" in attrs:
-        parts.append(attrs["structure"])
+    # Include all available attributes in the prompt
+    for attr_key in ("coverage", "fit", "silhouette", "sleeves", "neckline",
+                     "collar", "waist_position", "garment_length", "layering",
+                     "structure", "drape", "material", "fabric_behavior"):
+        if attr_key in attrs:
+            parts.append(attrs[attr_key])
     parts.append("detailed fabric texture, natural garment folds")
     return ", ".join(parts)
 
@@ -1128,6 +1242,7 @@ def run_idm_vton_inference(
         safe_build_profile,
         safe_build_mask,
         validate_mask_safety,
+        apply_protection_binary,
     )
 
     # Apply geometry-aware alignment to garment image, then resize to target.
@@ -1142,6 +1257,15 @@ def run_idm_vton_inference(
             garm_img = _center_canvas_resize(garm_img, TARGET_SIZE)
     else:
         garm_img = _center_canvas_resize(garm_img, TARGET_SIZE)
+
+    # ── P0-4: Garment canvas diagnostics ────────────────────────────────
+    try:
+        from p0_diagnostics import P0Probe as _P0Probe
+        _p0_probe = _P0Probe(trace_id=trace_id)
+        _p0_probe.record_garment_canvas(garm_img, TARGET_SIZE)
+    except Exception:
+        _p0_probe = None
+
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -1225,6 +1349,48 @@ def run_idm_vton_inference(
             garment_img_info=garment_img_info, profile=garment_profile, trace_id=trace_id,
         )
 
+    # ── Garment-shape-aware mask expansion ────────────────────────────
+    # The SCHP-based mask covers body region labels (coarse). The aligned
+    # garment image provides finer-grained shape information. Add the
+    # garment silhouette as an additional inpaint component so the mask
+    # covers the garment's actual shape, not just the body region.
+    try:
+        garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
+        # Canvas is mid-gray (128,128,128) — foreground deviates from gray
+        garm_silhouette = ~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 40, axis=2)
+        garm_silhouette_mask = garm_silhouette.astype(np.uint8) * 255
+        # Resize to match mask dimensions
+        if garm_silhouette_mask.shape[:2] != inpaint_mask_np.shape[:2]:
+            garm_silhouette_mask = np.array(
+                Image.fromarray(garm_silhouette_mask).resize(
+                    (inpaint_mask_np.shape[1], inpaint_mask_np.shape[0]), Image.LANCZOS
+                )
+            )
+            garm_silhouette_mask = (garm_silhouette_mask > 127).astype(np.uint8) * 255
+        # Add garment silhouette to inpaint mask
+        enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
+        # Re-apply protection so identity is never overwritten
+        final_mask_np = apply_protection_binary(enhanced_inpaint, protect_mask_np)
+        inpaint_mask_np = enhanced_inpaint
+        logger.info(
+            "garment_silhouette_mask_added silhouette_px=%d inpaint_px=%d final_px=%d trace_id=%s",
+            int(np.sum(garm_silhouette_mask > 127)),
+            int(np.sum(enhanced_inpaint > 127)),
+            int(np.sum(final_mask_np > 127)),
+            trace_id,
+        )
+    except Exception as exc:
+        logger.warning("garment_silhouette_mask_failed error=%s trace_id=%s", exc, trace_id)
+
+    # ── P0-5: Mask-silhouette IoU diagnostics ──────────────────────────
+    try:
+        if _p0_probe is not None:
+            _garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
+            _garm_sil = (~np.all(np.abs(_garm_arr.astype(np.int16) - 128) < 40, axis=2)).astype(np.uint8) * 255
+            _p0_probe.record_mask_silhouette_iou(final_mask_np, _garm_sil)
+    except Exception:
+        pass
+
     draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
     validate_mask_integrity(final_mask_np, "final_mask")
@@ -1262,6 +1428,8 @@ def run_idm_vton_inference(
         "final_mask_np": final_mask_np,
         "is_draped_garment": draped,
         "garment_subtype": garment_subtype,
+        "p0_probe": _p0_probe,
+        "processed_garment": garm_img,
     }
 
     # ── Pre-inference mask validation ──────────────────────────────────
@@ -1288,9 +1456,10 @@ def run_idm_vton_inference(
         densepose_pred = densepose_predictor(human_img_arg)
         if "instances" not in densepose_pred or len(densepose_pred["instances"]) == 0:
             logger.warning(
-                "densepose_no_instances_fallback image_shape=%s cloth_type=%s",
-                human_img_arg.shape, cloth_type,
+                "densepose_no_instances_fallback image_shape=%s cloth_type=%s trace_id=%s",
+                human_img_arg.shape, cloth_type, trace_id,
             )
+            mask_meta.setdefault("_runtime_warnings", []).append("densepose_no_instances_used_gray_fallback")
             pose_img = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
         else:
             densepose_outputs = densepose_pred["instances"]
@@ -1339,6 +1508,9 @@ def run_idm_vton_inference(
 
     pose_tensor = tensor_transform(pose_img).unsqueeze(0).to(device, TORCH_DTYPE)
     garm_tensor = tensor_transform(garm_img).unsqueeze(0).to(device, TORCH_DTYPE)
+
+    # Store pose output in mask_meta for debug artifacts
+    mask_meta["pose_output"] = pose_img
     generator = torch.Generator(device).manual_seed(seed) if seed is not None and torch.cuda.is_available() else None
 
     with torch.inference_mode():
@@ -1518,17 +1690,14 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     download_ms = (time.perf_counter() - download_start) * 1000
 
     # ── Garment foreground area check ──────────────────────────────────
-    # If the garment image is mostly white/background (e.g. a product shot
-    # placed on a white canvas with too much padding), the model doesn't
+    # If the garment image is mostly background (e.g. a product shot
+    # placed on a mid-gray canvas with too much padding), the model doesn't
     # have enough garment pixels to render correctly. Log the ratio for
     # monitoring — severe cases could be addressed by fallback.
+    # Background is mid-gray (128,128,128) — foreground deviates from gray.
     garm_check = np.array(garment_img.convert("RGB"), dtype=np.uint8)
-    non_white = (
-        (garm_check[:, :, 0] < 240)
-        | (garm_check[:, :, 1] < 240)
-        | (garm_check[:, :, 2] < 240)
-    )
-    garm_foreground_ratio = float(np.mean(non_white))
+    is_bg = np.all(np.abs(garm_check.astype(np.int16) - 128) < 40, axis=2)
+    garm_foreground_ratio = float(np.mean(~is_bg))
     logger.info(
         "garment_foreground_ratio=%.3f cloth_type=%s trace_id=%s",
         garm_foreground_ratio, vton_type, trace_id,
@@ -1569,6 +1738,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     best_candidate_score: float = -1.0
     candidate_count = 1
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+    vresult = None  # quality validation result (set in single-stage path)
 
     # ── Debug artifacts collection ──────────────────────────────────────
     debug = DebugArtifacts(trace_id=trace_id, target_cloth_type=vton_type)
@@ -1598,9 +1768,10 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         source_cloth_type = ""
 
     # ── Input validation (now with actual SCHP labels) ──────────────────
-    input_warnings = validate_pipeline_inputs(det_schp, vton_type, garment_subtype, source_cloth_type)
-    if input_warnings:
-        logger.warning("input_validation_warnings trace_id=%s warnings=%s", trace_id, input_warnings)
+    validation_warnings = validate_pipeline_inputs(det_schp, vton_type, garment_subtype, source_cloth_type)
+    input_warnings.extend(validation_warnings)
+    if validation_warnings:
+        logger.warning("input_validation_warnings trace_id=%s warnings=%s", trace_id, validation_warnings)
 
     # ── Build GarmentProfile ────────────────────────────────────────────
     garment_img_info = analyze_garment_image(garment_img)
@@ -1651,6 +1822,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             pipeline_route=pipeline_route,
             alignment=alignment,
             garment_profile=garment_profile,
+            input_warnings=input_warnings,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1777,6 +1949,11 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     garment_profile=garment_profile,
                 )
 
+                # Free GPU memory between candidate inferences
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                 # Validate + score candidate
                 c_final_mask_np = c_meta.get("final_mask_np")
                 c_protect_np = c_meta.get("protect_mask_np")
@@ -1827,6 +2004,19 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 best_candidate_score = 0.0
             else:
                 raise RuntimeError("No candidates generated — inference produced no output")
+
+            # ── P0: Dump diagnostic findings from best candidate ────────
+            _p0 = mask_meta.get("p0_probe")
+            if _p0 is not None:
+                try:
+                    _p0.finalize()
+                    _p0.dump()
+                except Exception:
+                    pass
+
+            # Extract runtime warnings from inference
+            _runtime_warns = mask_meta.pop("_runtime_warnings", [])
+            input_warnings.extend(_runtime_warns)
 
             # ── Populate debug candidate scores ──────────────────────────
             for ci_idx, (_cr, _cro, _cm, cv) in enumerate(candidates):
@@ -1899,10 +2089,31 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     debug.protect_mask_np = mask_meta.get("protect_mask_np")
     debug.final_mask_np = mask_meta.get("final_mask_np")
     debug.warnings = input_warnings
-    try:
-        save_debug_artifacts_v2(debug, person_img, garment_img)
-    except Exception as exc:
-        logger.warning("debug_artifacts_save_failed error=%s trace_id=%s", exc, trace_id)
+
+    # Populate new debug fields
+    debug.processed_garment = mask_meta.get("processed_garment")
+    debug.pose_output = mask_meta.get("pose_output")
+    _debug_garm_arr = np.array(garment_img.convert("RGB"), dtype=np.uint8) if garment_img is not None else None
+    if _debug_garm_arr is not None:
+        debug.garment_silhouette_np = (
+            ~np.all(np.abs(_debug_garm_arr.astype(np.int16) - 128) < 40, axis=2)
+        ).astype(np.uint8) * 255
+    if vresult is not None:
+        debug.quality_metrics = {
+            "score": vresult.score, "face_quality": vresult.face_quality,
+            "garment_quality": vresult.garment_quality, "sharpness": vresult.sharpness,
+            "identity_drift": vresult.identity_drift,
+            "garment_replacement": vresult.garment_replacement,
+            "ssim": vresult.ssim, "region_edit": vresult.region_edit,
+            "boundary_quality": vresult.boundary_quality,
+            "pose_consistency": vresult.pose_consistency,
+            "geometry_correctness": vresult.geometry_correctness,
+            "leakage_penalty": vresult.leakage_penalty,
+            "color_coherence": vresult.color_coherence,
+            "passed": vresult.passed, "failure_reasons": vresult.failure_reasons,
+        }
+
+    # Face restoration output will be captured after the face restore step below
 
     # ── DEBUG SAVE: raw output before face restoration ─────────────────────
     _debug_dir = Path("/tmp/idm-vton-debug")
@@ -1913,10 +2124,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         logger.warning("debug_save_raw_output raw_output_is_None trace_id=%s", trace_id)
 
     # ── Face restoration — mild enhancement, no identity overwrite ────────
-    # Enahnces the face region in the diffusion output using mild sharpening
-    # or GFPGAN.  Sources the face from the original person image and never
-    # pastes original pixels over generated clothing.
-    face_restore_enabled = os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1"
+    face_restore_enabled = os.environ.get("ENABLE_FACE_RESTORATION", "1") != "0"
     logger.info("ENABLE_FACE_RESTORATION=%s trace_id=%s", face_restore_enabled, trace_id)
     if (
         face_restore_enabled
@@ -1927,19 +2135,34 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         person_ref = person_img
         if person_ref.size != result.size:
             person_ref = person_ref.resize(result.size, Image.LANCZOS)
-        result, face_meta_out = _do_enhance_face(result, person_original=person_ref)
+        result, face_meta_out = _do_enhance_face(result, person_original=person_ref, trace_id=trace_id)
+        debug.face_restoration_output = result
+        debug.final_output = result
         logger.info(
-            "face_restoration_applied face_detected=%s trace_id=%s",
-            face_meta_out.get("face_detected", "unknown"), trace_id,
+            "face_restoration_applied method=%s face_detected=%s "
+            "sharp_before=%s sharp_after=%s sharp_delta=%s "
+            "identity_sim_before=%s identity_sim_after=%s trace_id=%s",
+            face_meta_out.get("restoration_method", "unknown"),
+            face_meta_out.get("face_detected", "unknown"),
+            face_meta_out.get("face_sharpness_before"),
+            face_meta_out.get("face_sharpness_after"),
+            face_meta_out.get("face_sharpness_delta"),
+            face_meta_out.get("identity_similarity_before"),
+            face_meta_out.get("identity_similarity_after"),
+            trace_id,
         )
-        # ── DEBUG SAVE: output after face restoration ────────────────────
         result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
     else:
-        logger.info("face_restoration_skipped available=%s trace_id=%s",
-                     _FACE_RESTORATION_AVAILABLE, trace_id)
-        # ── DEBUG SAVE: output with face restoration skipped ─────────────
+        logger.info("face_restoration_skipped available=%s enabled=%s trace_id=%s",
+                     _FACE_RESTORATION_AVAILABLE, face_restore_enabled, trace_id)
         if result is not None:
             result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
+
+    # ── Save debug artifacts (after face restoration) ────────────────────
+    try:
+        save_debug_artifacts_v2(debug, person_img, garment_img)
+    except Exception as exc:
+        logger.warning("debug_artifacts_save_failed error=%s trace_id=%s", exc, trace_id)
 
     # ── DEBUG SAVE: final returned output ─────────────────────────────────
     if result is not None:
@@ -2000,7 +2223,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     job_start = time.time()
 
     if not _WARM.is_set():
-        warmup()
+        with _WARMUP_LOCK:
+            if not _WARM.is_set():
+                warmup()
         cold_start = True
     else:
         cold_start = False

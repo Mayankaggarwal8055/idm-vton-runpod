@@ -31,7 +31,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: mayankaggarwal8055/idm-vton-runpod:v23
+          tags: mayankaggarwal8055/idm-vton-runpod:v24
           build-args: GIT_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

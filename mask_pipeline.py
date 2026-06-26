@@ -1399,14 +1399,19 @@ class GarmentImageInfo:
 def analyze_garment_image(garment_img: Image.Image) -> GarmentImageInfo:
     """Extract geometry from the target garment reference image.
 
-    Uses contour analysis on the non-white region to estimate bounding box
+    Uses contour analysis on the non-background region to estimate bounding box
     coverage, aspect ratio, and sleeve/length/width hints.
+
+    Background detection: pixels within 40 levels of mid-gray (128,128,128)
+    are treated as background. This works because the preprocessing canvas
+    uses mid-gray, and garment colors are rarely mid-gray.
     """
     arr = np.array(garment_img.convert("RGB"), dtype=np.uint8)
     h, w = arr.shape[:2]
 
-    is_white = np.all(arr > 240, axis=2)
-    fg = (~is_white).astype(np.uint8) * 255
+    # Detect mid-gray background (128,128,128 ± 40) — canvas is mid-gray
+    is_bg = np.all(np.abs(arr.astype(np.int16) - 128) < 40, axis=2)
+    fg = (~is_bg).astype(np.uint8) * 255
 
     if not np.any(fg):
         return GarmentImageInfo()
@@ -1988,6 +1993,13 @@ class DebugArtifacts:
     # Results
     raw_output: "Image.Image | None" = None
     final_output: "Image.Image | None" = None
+    # Processed images
+    processed_garment: "Image.Image | None" = None
+    garment_silhouette_np: "np.ndarray | None" = None
+    face_restoration_output: "Image.Image | None" = None
+    pose_output: "Image.Image | None" = None
+    # Quality
+    quality_metrics: dict[str, object] | None = None
     # Timing
     timing_ms: dict[str, float] = field(default_factory=dict)
     # Scores
@@ -2131,6 +2143,25 @@ def save_debug_artifacts_v2(
         if garment_img is not None:
             garment_img.convert("RGB").save(str(debug_dir / "garment_input.png"))
 
+        # Processed garment (after alignment/resize)
+        if artifacts.processed_garment is not None:
+            artifacts.processed_garment.convert("RGB").save(str(debug_dir / "processed_garment.png"))
+
+        # Garment silhouette
+        if artifacts.garment_silhouette_np is not None:
+            sil_img = Image.fromarray(
+                (artifacts.garment_silhouette_np > 127).astype(np.uint8) * 255, mode="L"
+            )
+            sil_img.save(str(debug_dir / "garment_silhouette.png"))
+
+        # Face restoration output
+        if artifacts.face_restoration_output is not None:
+            artifacts.face_restoration_output.save(str(debug_dir / "face_restoration_output.png"))
+
+        # Pose / DensePose output
+        if artifacts.pose_output is not None:
+            artifacts.pose_output.convert("RGB").save(str(debug_dir / "pose_output.png"))
+
         # Raw and final output
         if artifacts.raw_output is not None:
             artifacts.raw_output.save(str(debug_dir / "raw_output.png"))
@@ -2145,6 +2176,12 @@ def save_debug_artifacts_v2(
         if artifacts.candidate_scores:
             (debug_dir / "candidate_scores.json").write_text(
                 json.dumps(artifacts.candidate_scores, indent=2, default=str)
+            )
+
+        # Quality metrics
+        if artifacts.quality_metrics:
+            (debug_dir / "quality_metrics.json").write_text(
+                json.dumps(artifacts.quality_metrics, indent=2, default=str)
             )
 
         # Routing decision

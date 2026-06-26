@@ -34,9 +34,15 @@ def enhance_face(
     """
     Detect face in the result and apply mild in-place enhancement.
 
-    person_original is ignored for blending — kept for API compatibility.
+    person_original is used for identity comparison — kept for logging.
+    Returns (enhanced_image, metadata) where metadata includes before/after
+    face quality scores for diagnostics.
     """
-    if os.environ.get("ENABLE_FACE_RESTORATION", "0") != "1":
+    if os.environ.get("ENABLE_FACE_RESTORATION", "1") != "0":
+        enabled = True
+    else:
+        enabled = False
+    if not enabled:
         return result, {"face_restoration": "disabled"}
 
     meta: dict[str, object] = {"face_restoration": "enabled"}
@@ -63,6 +69,24 @@ def enhance_face(
         meta["restoration_method"] = "none"
         return result, meta
 
+    # ── Face quality BEFORE restoration ─────────────────────────────────
+    face_sharpness_before = _estimate_face_sharpness(face_region)
+    meta["face_sharpness_before"] = round(face_sharpness_before, 3)
+
+    # If person_original is available, compute identity similarity
+    if person_original is not None:
+        try:
+            orig_np = np.array(person_original.convert("RGB"))
+            orig_face = _detect_face_bbox_from_array(orig_np)
+            if orig_face is not None:
+                ox1, oy1, ox2, oy2 = orig_face
+                orig_face_region = orig_np[oy1:oy2, ox1:ox2]
+                if orig_face_region.shape == face_region.shape:
+                    identity_sim = _compute_identity_similarity(orig_face_region, face_region)
+                    meta["identity_similarity_before"] = round(identity_sim, 4)
+        except Exception:
+            pass
+
     method = "opencv_sharpen"
     try:
         gfpgan_face = _apply_gfpgan(face_region, trace_id)
@@ -77,11 +101,36 @@ def enhance_face(
     meta["restoration_method"] = method
     result_np = _blend_face(result_np, enhanced_face, x1, y1, x2, y2, feather_fraction=0.20)
 
+    # ── Face quality AFTER restoration ──────────────────────────────────
+    enhanced_region = result_np[y1:y2, x1:x2]
+    face_sharpness_after = _estimate_face_sharpness(enhanced_region)
+    meta["face_sharpness_after"] = round(face_sharpness_after, 3)
+    meta["face_sharpness_delta"] = round(face_sharpness_after - face_sharpness_before, 3)
+
+    # Identity similarity after restoration
+    if person_original is not None:
+        try:
+            orig_np = np.array(person_original.convert("RGB"))
+            orig_face = _detect_face_bbox_from_array(orig_np)
+            if orig_face is not None:
+                ox1, oy1, ox2, oy2 = orig_face
+                orig_face_region = orig_np[oy1:oy2, ox1:ox2]
+                if orig_face_region.shape == enhanced_region.shape:
+                    identity_sim_after = _compute_identity_similarity(orig_face_region, enhanced_region)
+                    meta["identity_similarity_after"] = round(identity_sim_after, 4)
+                    meta["identity_drift"] = round(
+                        abs(identity_sim_after - meta.get("identity_similarity_before", 0)), 4
+                    )
+        except Exception:
+            pass
+
     elapsed = (time.perf_counter() - t0) * 1000
     meta["restoration_time_ms"] = round(elapsed, 1)
     logger.info(
-        "face_restoration done method=%s time_ms=%.0f trace_id=%s",
-        method, elapsed, trace_id,
+        "face_restoration done method=%s sharp_before=%.3f sharp_after=%.3f "
+        "sharp_delta=%.3f time_ms=%.0f trace_id=%s",
+        method, face_sharpness_before, face_sharpness_after,
+        face_sharpness_after - face_sharpness_before, elapsed, trace_id,
     )
     return Image.fromarray(result_np), meta
 
@@ -199,3 +248,38 @@ def _blend_face(
     blended = roi * (1.0 - feather_mask_3d) + enhanced_resized.astype(np.float32) * feather_mask_3d
     result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
     return result
+
+
+def _estimate_face_sharpness(face_rgb: np.ndarray) -> float:
+    """Estimate face sharpness using Laplacian variance.
+
+    Higher values indicate sharper edges. Used to compare face quality
+    before and after restoration.
+    """
+    gray = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(laplacian.var())
+
+
+def _compute_identity_similarity(face_a: np.ndarray, face_b: np.ndarray) -> float:
+    """Compute structural similarity between two face regions.
+
+    Uses normalized correlation on grayscale face patches. Values close to 1.0
+    indicate high similarity (good identity preservation).
+    """
+    gray_a = cv2.cvtColor(face_a, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray_b = cv2.cvtColor(face_b, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # Resize to same dimensions if needed
+    if gray_a.shape != gray_b.shape:
+        gray_b = cv2.resize(gray_b, (gray_a.shape[1], gray_a.shape[0]))
+
+    # Normalize to zero mean, unit variance
+    mean_a, std_a = gray_a.mean(), max(gray_a.std(), 1e-6)
+    mean_b, std_b = gray_b.mean(), max(gray_b.std(), 1e-6)
+    norm_a = (gray_a - mean_a) / std_a
+    norm_b = (gray_b - mean_b) / std_b
+
+    # Normalized cross-correlation
+    similarity = float(np.mean(norm_a * norm_b))
+    return max(-1.0, min(1.0, similarity))

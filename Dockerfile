@@ -299,6 +299,7 @@ COPY mask_pipeline.py /workspace/mask_pipeline.py
 COPY quality_validation.py /workspace/quality_validation.py
 COPY post_processing.py /workspace/post_processing.py
 COPY face_restoration.py /workspace/face_restoration.py
+COPY p0_diagnostics.py /workspace/p0_diagnostics.py
 
 # =============================================================================
 # Layer 7 — Validate worker module (mask_pipeline.py)

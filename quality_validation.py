@@ -318,7 +318,7 @@ def _region_editing_score(
         out = np.array(result.convert("RGB").resize(original.size, Image.LANCZOS), dtype=np.float32)
 
     h, w = orig.shape[:2]
-    if mask_np.shape[:2] != (h, w):
+    if mask_np is None or mask_np.shape[:2] != (h, w):
         return 0.5
 
     inpaint = mask_np > 127
