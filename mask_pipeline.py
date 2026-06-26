@@ -1,21 +1,27 @@
 """
-GPU worker mask pipeline — SCHP semantic masks with source+target union masks.
+GPU worker mask pipeline — Garment-aware difference-based editing.
 
 SCHP is the single authoritative mask source. All masks are binary.
 No feathering, no fusing, no hybrid strategies. The model output is final.
 
-Design principles (quality-first):
-  - Same-category: mask = target garment labels only. Model changes texture/color
-    within the source garment's shape.
-  - Cross-category: mask = UNION of source + target garment labels, plus an
-    adaptive dilated buffer around source labels. This ensures the model can
-    fully erase the old garment while generating the new one in the correct
-    body region.
-  - Protect mask = identity-critical regions (face, hair, hands, shoes) plus
-    non-target body regions (lower body protected when only swapping tops).
-  - Draped garments (saree, dupatta, lehenga) use hand-only arm protection
-    so pallu/drape can be generated over forearms.
-  - Buffer dilation is adaptive: scales to garment size and body proportions.
+Architecture:
+  1. GARMENT PROFILE — structured understanding of target garment (family,
+     coverage, sleeves, drape, layering, fit). Replaces flat cloth_type.
+  2. BODY REGION ANALYSIS — maps garment profile to body regions that are
+     editable vs protected. Adapts per garment family.
+  3. DIFFERENCE-BASED EDITING — computes editable region from source/target
+     occupancy difference, not from a single mask.
+  4. FAMILY-AWARE ROUTING — different garment families get different mask
+     shapes, protect regions, prompts, and scoring weights.
+  5. MULTI-STAGE GENERATION — cross-category and layered garments get
+     erase + alignment + synthesis stages.
+
+Design principles:
+  - Same-category: mask = source garment labels (replace within source shape).
+  - Cross-category: mask = target body region + source labels + buffer.
+  - Protect = identity + regions target does NOT cover.
+  - Buffer dilation adapts to body size, source coverage, target geometry.
+  - Every garment family has its own masking profile.
 """
 
 from __future__ import annotations
@@ -241,6 +247,980 @@ def get_garment_geometry(garment_subtype: str) -> GarmentGeometry:
     if best_b:
         return best_b
     return GarmentGeometry()  # conservative defaults
+
+
+# ── Body region analysis for difference-based editing ────────────────
+# Maps cloth_type to the SCHP labels that are EDITABLE (inpaintable) for that
+# target. The protect mask is the complement: identity + labels NOT in this set.
+#
+# This replaces the old hardcoded "protect lower body for upper targets" logic.
+# Instead, the protect mask adapts to which body region the target garment covers.
+
+EDITABLE_BODY_REGIONS: dict[str, set[int]] = {
+    "upper_body": {
+        _LABEL_UPPER_CLOTHES,
+        _LABEL_COAT,
+        _LABEL_LEFT_ARM,
+        _LABEL_RIGHT_ARM,
+    },
+    "lower_body": {
+        _LABEL_PANTS,
+        _LABEL_SKIRT,
+        _LABEL_SOCKS,
+        _LABEL_LEFT_LEG,
+        _LABEL_RIGHT_LEG,
+    },
+    "dresses": {
+        _LABEL_UPPER_CLOTHES,
+        _LABEL_DRESS,
+        _LABEL_COAT,
+        _LABEL_PANTS,
+        _LABEL_JUMPSUITS,
+        _LABEL_SKIRT,
+        _LABEL_SCARF,
+        _LABEL_LEFT_ARM,
+        _LABEL_RIGHT_ARM,
+        _LABEL_LEFT_LEG,
+        _LABEL_RIGHT_LEG,
+    },
+    "full_body": {
+        _LABEL_UPPER_CLOTHES,
+        _LABEL_DRESS,
+        _LABEL_COAT,
+        _LABEL_PANTS,
+        _LABEL_JUMPSUITS,
+        _LABEL_SKIRT,
+        _LABEL_SCARF,
+        _LABEL_LEFT_ARM,
+        _LABEL_RIGHT_ARM,
+        _LABEL_LEFT_LEG,
+        _LABEL_RIGHT_LEG,
+    },
+}
+
+# For long upper garments (jacket, coat, blazer, cardigan, leather_jacket,
+# denim_jacket) that extend below the waist, the editable region must include
+# lower body labels too. Without this, the model can't generate the garment's
+# lower portion — it gets blocked by the protect mask.
+_LONG_UPPER_GARMENTS = frozenset({
+    "jacket", "blazer", "coat", "cardigan", "leather_jacket", "denim_jacket",
+    "trench", "peacoat", "overcoat", "windbreaker", "parka",
+})
+
+
+def analyze_target_body_region(
+    garment_subtype: str,
+    cloth_type: str,
+) -> str:
+    """Map target garment subtype to the cloth_type used for body region analysis.
+
+    Returns one of: "upper_body", "lower_body", "dresses", "full_body".
+
+    For long upper garments (jacket, coat), returns "dresses" so the editable
+    region includes both upper AND lower body labels — the jacket extends
+    below the waist, so the model needs freedom to generate there.
+
+    For fitted upper garments (t-shirt, shirt), returns "upper_body" — protect
+    the lower body since the garment doesn't extend past the waist.
+
+    This is the key function that determines which body regions are editable
+    for each target garment type.
+    """
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+    # Check if this is a long upper garment — treat as full-body coverage
+    if key in _LONG_UPPER_GARMENTS:
+        return "dresses"
+
+    # Fuzzy match for long upper garments
+    for long_name in _LONG_UPPER_GARMENTS:
+        if key and (long_name in key or key in long_name):
+            return "dresses"
+
+    # For everything else, use the provided cloth_type
+    return cloth_type
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GarmentProfile — structured garment understanding
+# ═══════════════════════════════════════════════════════════════════════
+# Every garment subtype gets a profile that drives masking, prompting,
+# scoring, and routing. This replaces flat cloth_type with rich structure.
+
+@dataclass(frozen=True)
+class GarmentProfile:
+    """Structured understanding of a garment's properties.
+
+    Used to drive:
+      - Mask shape and coverage (which body regions are editable)
+      - Protect mask (which regions to shield)
+      - Prompt construction (what to describe)
+      - Scoring weights (what to optimize for)
+      - Multi-stage routing (erase vs. single-stage)
+    """
+    # Core identity
+    family: str = "unknown"         # upper_fitted, upper_structured, lower, full, draped
+    cloth_type: str = "upper_body"  # upper_body, lower_body, dresses, full_body
+
+    # Body coverage
+    covers_upper: bool = True       # shoulders, chest, torso
+    covers_lower: bool = False      # waist, hips, legs
+    covers_arms: bool = True        # full arms
+    covers_hands: bool = False      # hands/wrists
+    covers_torso_full: bool = True  # full torso (vs. cropped)
+    extends_below_waist: bool = False  # jacket, coat extend past waist
+
+    # Sleeve / arm behavior
+    has_sleeves: bool = True
+    sleeve_length: str = "long"     # short, long, sleeveless
+    expose_arms: bool = False       # tank_top, crop_top — arms should be visible
+
+    # Fit / structure
+    is_fitted: bool = True          # body-hugging
+    is_structured: bool = False     # rigid shape (jacket, blazer)
+    is_loose: bool = False          # flowing (kaftan, poncho)
+
+    # Drape / flow
+    is_draped: bool = False         # saree, dupatta, lehenga
+    has_pallu: bool = False         # saree pallu over shoulder/arms
+    has_border: bool = False        # decorative border (saree, lehenga)
+
+    # Layering
+    is_layered: bool = False        # jacket over shirt, etc.
+    layer_order: int = 0            # 0=single, 1=outer, 2=inner
+
+    # Hem behavior
+    hem_type: str = "straight"      # straight, curved, asymmetric, flared
+
+    # Special properties
+    is_cropped: bool = False        # crop_top, mini_skirt
+    is_voluminous: bool = False     # ball_gown, palazzo
+    is_ethnic: bool = False         # saree, lehenga, kurta
+
+
+# ── Garment profiles database ─────────────────────────────────────────
+# Maps garment subtype → GarmentProfile. Every profile defines exactly
+# which body regions the garment covers and how the mask should behave.
+
+GARMENT_PROFILES: dict[str, GarmentProfile] = {
+    # ── Upper body: fitted ─────────────────────────────────────────────
+    "tshirt": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=True, is_structured=False,
+    ),
+    "t_shirt": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=True, is_structured=False,
+    ),
+    "polo": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=True, is_structured=False,
+    ),
+    "shirt": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=False,
+    ),
+    "blouse": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=False,
+    ),
+    "sweatshirt": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=False, is_loose=True,
+    ),
+    "sports_jersey": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=False, is_structured=False, is_loose=True,
+    ),
+
+    # ── Upper body: sleeveless / exposed ───────────────────────────────
+    "tank_top": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True,
+    ),
+    "crop_top": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=False, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True, is_cropped=True,
+    ),
+    "camisole": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True,
+    ),
+    "vest": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True,
+    ),
+    "corset": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=False, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True, is_structured=True,
+    ),
+
+    # ── Upper body: extended / long ────────────────────────────────────
+    "sweater": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True,
+    ),
+    "hoodie": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_structured=False,
+    ),
+    "jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "blazer": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "coat": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "cardigan": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True,
+    ),
+    "leather_jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "denim_jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+
+    # ── Upper body: wide / flowing ─────────────────────────────────────
+    "poncho": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=False, is_loose=True, is_voluminous=True,
+    ),
+    "cape": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=False, is_loose=True, is_voluminous=True,
+    ),
+
+    # ── Lower body ─────────────────────────────────────────────────────
+    "jeans": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "trousers": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "pants": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "shorts": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "skirt": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+    "mini_skirt": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+    "leggings": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "joggers": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_loose=True,
+    ),
+    "wide_leg": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_loose=True, is_voluminous=True,
+    ),
+    "palazzo": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_loose=True, is_voluminous=True,
+    ),
+
+    # ── Full body ──────────────────────────────────────────────────────
+    "dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "mini_dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "midi_dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "maxi_dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_voluminous=True,
+    ),
+    "bodycon": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True,
+    ),
+    "evening_gown": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True,
+    ),
+    "ball_gown": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True, is_voluminous=True,
+    ),
+    "wedding": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True,
+    ),
+    "jumpsuit": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True,
+    ),
+    "wrap_dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, hem_type="asymmetric",
+    ),
+
+    # ── Traditional: draped ────────────────────────────────────────────
+    "saree": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_hands=False, covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, has_pallu=True, has_border=True,
+        is_ethnic=True, is_loose=True,
+    ),
+    "sari": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_hands=False, covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, has_pallu=True, has_border=True,
+        is_ethnic=True, is_loose=True,
+    ),
+    "lehenga": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, has_border=True, is_ethnic=True,
+    ),
+    "dupatta": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_draped=True, has_pallu=True, is_ethnic=True, is_loose=True,
+    ),
+    "shawl": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_draped=True, is_ethnic=True, is_loose=True,
+    ),
+    "anarkali": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, is_ethnic=True, is_voluminous=True,
+    ),
+    "kimono": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, is_loose=True, is_voluminous=True,
+    ),
+    "abaya": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, is_loose=True, is_ethnic=True,
+    ),
+    "kaftan": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, is_loose=True, is_voluminous=True,
+    ),
+    "kurta": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "kurti": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "sherwani": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True, is_ethnic=True,
+    ),
+}
+
+
+def build_garment_profile(
+    garment_subtype: str,
+    cloth_type: str = "",
+    garment_img_info: "GarmentImageInfo | None" = None,
+) -> GarmentProfile:
+    """Build a GarmentProfile for the target garment.
+
+    Looks up the subtype in GARMENT_PROFILES, falls back to cloth_type-based
+    defaults, and optionally adjusts based on garment image geometry.
+
+    This is the single entry point for garment understanding — every other
+    function should use this instead of raw cloth_type.
+    """
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+    # Direct lookup
+    if key in GARMENT_PROFILES:
+        profile = GARMENT_PROFILES[key]
+    else:
+        # Fuzzy match — prefer longest match
+        best = None
+        best_len = 0
+        for pkey, pval in GARMENT_PROFILES.items():
+            if key and pkey in key and len(pkey) > best_len:
+                best = pval
+                best_len = len(pkey)
+        if best is None:
+            for pkey, pval in GARMENT_PROFILES.items():
+                if key and key in pkey and len(pkey) > best_len:
+                    best = pval
+                    best_len = len(pkey)
+        profile = best if best else GarmentProfile()
+
+    # Override cloth_type from parameter if provided
+    if cloth_type and cloth_type != profile.cloth_type:
+        profile = GarmentProfile(
+            family=profile.family,
+            cloth_type=cloth_type,
+            covers_upper=profile.covers_upper,
+            covers_lower=profile.covers_lower,
+            covers_arms=profile.covers_arms,
+            covers_hands=profile.covers_hands,
+            covers_torso_full=profile.covers_torso_full,
+            extends_below_waist=profile.extends_below_waist,
+            has_sleeves=profile.has_sleeves,
+            sleeve_length=profile.sleeve_length,
+            expose_arms=profile.expose_arms,
+            is_fitted=profile.is_fitted,
+            is_structured=profile.is_structured,
+            is_loose=profile.is_loose,
+            is_draped=profile.is_draped,
+            has_pallu=profile.has_pallu,
+            has_border=profile.has_border,
+            is_layered=profile.is_layered,
+            layer_order=profile.layer_order,
+            hem_type=profile.hem_type,
+            is_cropped=profile.is_cropped,
+            is_voluminous=profile.is_voluminous,
+            is_ethnic=profile.is_ethnic,
+        )
+
+    # Adjust based on garment image geometry if available
+    if garment_img_info:
+        if garment_img_info.is_long and not profile.extends_below_waist:
+            profile = GarmentProfile(
+                family=profile.family, cloth_type=profile.cloth_type,
+                covers_upper=profile.covers_upper, covers_lower=profile.covers_lower,
+                covers_arms=profile.covers_arms, covers_hands=profile.covers_hands,
+                covers_torso_full=profile.covers_torso_full,
+                extends_below_waist=True,
+                has_sleeves=profile.has_sleeves, sleeve_length=profile.sleeve_length,
+                expose_arms=profile.expose_arms, is_fitted=profile.is_fitted,
+                is_structured=profile.is_structured, is_loose=profile.is_loose,
+                is_draped=profile.is_draped, has_pallu=profile.has_pallu,
+                has_border=profile.has_border, is_layered=profile.is_layered,
+                layer_order=profile.layer_order, hem_type=profile.hem_type,
+                is_cropped=profile.is_cropped, is_voluminous=profile.is_voluminous,
+                is_ethnic=profile.is_ethnic,
+            )
+        if not garment_img_info.has_sleeves and profile.has_sleeves:
+            profile = GarmentProfile(
+                family=profile.family, cloth_type=profile.cloth_type,
+                covers_upper=profile.covers_upper, covers_lower=profile.covers_lower,
+                covers_arms=False, covers_hands=profile.covers_hands,
+                covers_torso_full=profile.covers_torso_full,
+                extends_below_waist=profile.extends_below_waist,
+                has_sleeves=False, sleeve_length="sleeveless",
+                expose_arms=True, is_fitted=profile.is_fitted,
+                is_structured=profile.is_structured, is_loose=profile.is_loose,
+                is_draped=profile.is_draped, has_pallu=profile.has_pallu,
+                has_border=profile.has_border, is_layered=profile.is_layered,
+                layer_order=profile.layer_order, hem_type=profile.hem_type,
+                is_cropped=profile.is_cropped, is_voluminous=profile.is_voluminous,
+                is_ethnic=profile.is_ethnic,
+            )
+
+    return profile
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 4 — Multi-Stage Pipeline Routing
+# ═══════════════════════════════════════════════════════════════════════
+# Determines the generation pipeline path based on garment profile,
+# source/target relationship, and routing rules.
+
+@dataclass(frozen=True)
+class PipelineRoute:
+    """Determines the generation pipeline for a specific try-on request.
+
+    Attributes:
+        pipeline: "single" | "cross_category" | "draped" | "layered" | "structured"
+        needs_erase: True for cross-category (stage 1 erases old garment)
+        erase_steps: Steps for erase stage (0 if no erase)
+        erase_guidance: Guidance for erase stage
+        apply_steps: Steps for apply stage
+        apply_guidance: Guidance for apply stage
+        is_cross: True if source and target are different cloth_types
+        is_draped: True if target is a draped garment
+        is_structured: True if target is structured outerwear
+        is_layered: True if target implies layering
+        family: Garment family string for routing
+    """
+    pipeline: str = "single"
+    needs_erase: bool = False
+    erase_steps: int = 0
+    erase_guidance: float = 5.5
+    apply_steps: int = 50
+    apply_guidance: float = 2.5
+    is_cross: bool = False
+    is_draped: bool = False
+    is_structured: bool = False
+    is_layered: bool = False
+    family: str = "unknown"
+
+
+def compute_pipeline_route(
+    source_cloth_type: str,
+    target_cloth_type: str,
+    target_profile: GarmentProfile,
+    schp_labels: np.ndarray | None = None,
+    requested_steps: int = 50,
+    requested_guidance: float | None = None,
+) -> PipelineRoute:
+    """Determine the optimal generation pipeline for this try-on request.
+
+    Routing logic:
+      1. Same-category, same-family → single stage (fast, stable)
+      2. Same-category, different family → single stage with enhanced masking
+      3. Cross-category → two-stage erase + apply
+      4. Draped target → two-stage with draped-specific erase prompt
+      5. Structured target (jacket/coat) → two-stage with structured erase
+      6. Layered target → two-stage with layered erase
+      7. Fallback → single stage (safest path)
+
+    Environment overrides:
+      ERASE_STEPS, ERASE_GUIDANCE, APPLY_STEPS, APPLY_GUIDANCE
+    """
+    import os
+
+    is_cross = (
+        source_cloth_type
+        and source_cloth_type != target_cloth_type
+        and source_cloth_type != "unknown"
+    )
+
+    family = target_profile.family
+    is_draped = target_profile.is_draped
+    is_structured = target_profile.is_structured
+    extends_below = target_profile.extends_below_waist
+
+    # Read env overrides
+    erase_steps_env = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "50"))
+    erase_guidance_env = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "5.5"))
+    apply_steps = requested_steps
+    apply_guidance = requested_guidance if requested_guidance is not None else float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
+
+    # ── Routing decision tree ──────────────────────────────────────────
+    if not is_cross:
+        # Same-category: single stage
+        # But increase steps/guidance for complex families
+        if is_draped:
+            apply_steps = max(apply_steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
+            apply_guidance = max(apply_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
+            route = "draped"
+        elif is_structured:
+            apply_steps = max(apply_steps, 40)
+            route = "structured"
+        else:
+            route = "single"
+
+        return PipelineRoute(
+            pipeline=route,
+            needs_erase=False,
+            erase_steps=0,
+            erase_guidance=0.0,
+            apply_steps=apply_steps,
+            apply_guidance=apply_guidance,
+            is_cross=False,
+            is_draped=is_draped,
+            is_structured=is_structured,
+            is_layered=target_profile.is_layered,
+            family=family,
+        )
+
+    # Cross-category: need erase stage
+    if is_draped:
+        route = "draped"
+        erase_steps = max(erase_steps_env, 50)
+        erase_guidance = max(erase_guidance_env, 5.5)
+    elif is_structured:
+        route = "structured"
+        erase_steps = max(erase_steps_env, 40)
+        erase_guidance = max(erase_guidance_env, 5.0)
+    elif extends_below:
+        # Long upper garment crossing into lower body
+        route = "cross_category"
+        erase_steps = erase_steps_env
+        erase_guidance = erase_guidance_env
+    else:
+        route = "cross_category"
+        erase_steps = erase_steps_env
+        erase_guidance = erase_guidance_env
+
+    return PipelineRoute(
+        pipeline=route,
+        needs_erase=True,
+        erase_steps=erase_steps,
+        erase_guidance=erase_guidance,
+        apply_steps=apply_steps,
+        apply_guidance=apply_guidance,
+        is_cross=True,
+        is_draped=is_draped,
+        is_structured=is_structured,
+        is_layered=target_profile.is_layered,
+        family=family,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 5 — Geometry-Aware Alignment
+# ═══════════════════════════════════════════════════════════════════════
+# Approximates garment-to-body alignment using contour analysis and
+# geometric normalization. Uses only existing dependencies (cv2, numpy).
+
+@dataclass
+class AlignmentTransform:
+    """Geometric alignment transform for garment-to-body mapping."""
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    offset_x: int = 0
+    offset_y: int = 0
+    flip_horizontal: bool = False
+    center_y_ratio: float = 0.5  # where garment center should align on body
+
+
+def compute_garment_alignment(
+    garment_img: Image.Image,
+    target_profile: GarmentProfile,
+    schp_labels: np.ndarray | None = None,
+) -> AlignmentTransform:
+    """Compute geometric alignment transform for garment-to-body mapping.
+
+    Uses contour analysis on the garment image to determine:
+      - How much to scale the garment to match body proportions
+      - Where to position the garment vertically on the body
+      - Whether to flip for correct orientation
+      - Center alignment based on garment type
+
+    This is the closest feasible alignment without a dedicated warping model.
+    It ensures the garment's canonical shape is properly oriented and scaled
+    before IP-Adapter conditioning.
+    """
+    import cv2
+
+    arr = np.array(garment_img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+
+    # Find garment foreground (non-white region)
+    is_white = np.all(arr > 240, axis=2)
+    fg = (~is_white).astype(np.uint8) * 255
+
+    if not np.any(fg):
+        return AlignmentTransform()
+
+    # Contour analysis
+    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return AlignmentTransform()
+
+    largest = max(contours, key=cv2.contourArea)
+    x, y, cw, ch = cv2.boundingRect(largest)
+
+    # Vertical alignment based on garment family
+    if target_profile.family == "lower":
+        # Lower body: garment should align to bottom of canvas
+        center_y_ratio = 0.75
+    elif target_profile.cloth_type in ("dresses", "full_body"):
+        # Full body: garment centered
+        center_y_ratio = 0.5
+    elif target_profile.extends_below_waist:
+        # Long upper: garment starts at top, extends down
+        center_y_ratio = 0.45
+    elif target_profile.is_cropped:
+        # Cropped: garment in upper third
+        center_y_ratio = 0.35
+    else:
+        # Standard upper: garment in upper half
+        center_y_ratio = 0.45
+
+    # Scale factor: garment bbox should fill ~70% of target canvas
+    target_fill = 0.70
+    scale_x = (w * target_fill) / max(cw, 1)
+    scale_y = (h * target_fill) / max(ch, 1)
+
+    # Offset to center garment horizontally
+    offset_x = (w - cw) // 2 - x
+    offset_y = int(h * center_y_ratio - (y + ch // 2))
+
+    return AlignmentTransform(
+        scale_x=round(scale_x, 3),
+        scale_y=round(scale_y, 3),
+        offset_x=offset_x,
+        offset_y=offset_y,
+        flip_horizontal=False,
+        center_y_ratio=round(center_y_ratio, 3),
+    )
+
+
+def apply_garment_alignment(
+    garment_img: Image.Image,
+    transform: AlignmentTransform,
+    target_size: tuple[int, int] = (768, 1024),
+) -> Image.Image:
+    """Apply alignment transform to garment image.
+
+    Rescales, offsets, and centers the garment on the target canvas
+    based on the computed AlignmentTransform.
+    """
+    import cv2
+
+    arr = np.array(garment_img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+    tw, th = target_size
+
+    # Scale
+    new_w = max(1, int(w * transform.scale_x))
+    new_h = max(1, int(h * transform.scale_y))
+    if new_w != w or new_h != h:
+        arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Create canvas and paste
+    canvas = np.full((th, tw, 3), 255, dtype=np.uint8)
+    paste_x = max(0, min(tw - new_w, (tw - new_w) // 2 + transform.offset_x))
+    paste_y = max(0, min(th - new_h, int(th * transform.center_y_ratio - new_h // 2) + transform.offset_y))
+
+    # Clip to canvas
+    src_x1 = max(0, -paste_x)
+    src_y1 = max(0, -paste_y)
+    dst_x1 = max(0, paste_x)
+    dst_y1 = max(0, paste_y)
+    copy_w = min(new_w - src_x1, tw - dst_x1)
+    copy_h = min(new_h - src_y1, th - dst_y1)
+
+    if copy_w > 0 and copy_h > 0:
+        canvas[dst_y1:dst_y1 + copy_h, dst_x1:dst_x1 + copy_w] = \
+            arr[src_y1:src_y1 + copy_h, src_x1:src_x1 + copy_w]
+
+    return Image.fromarray(canvas)
+
+
+def get_profile_editable_labels(profile: GarmentProfile) -> set[int]:
+    """Get SCHP labels that are editable for this garment profile.
+
+    This is the core of difference-based editing: the editable labels
+    determine which body regions the inpaint mask covers.
+    """
+    labels: set[int] = set()
+
+    if profile.covers_upper:
+        labels |= {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
+
+    if profile.covers_lower:
+        labels |= {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
+                    _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+
+    if profile.covers_arms or profile.expose_arms:
+        labels |= {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+
+    # Full body garments cover everything
+    if profile.cloth_type in ("dresses", "full_body"):
+        labels |= {
+            _LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
+            _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF,
+            _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
+            _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG, _LABEL_SOCKS,
+        }
+
+    return labels
+
+
+def get_profile_protect_labels(profile: GarmentProfile) -> set[int]:
+    """Get SCHP labels that should be protected for this garment profile.
+
+    Protect = identity + body regions NOT covered by the target garment.
+    """
+    labels: set[int] = set(_IDENTITY_PROTECT_LABELS)
+
+    # All garment labels
+    all_garment = (
+        {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT, _LABEL_PANTS,
+         _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF, _LABEL_SOCKS}
+        | {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+        | {_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+    )
+
+    # Editable labels from profile
+    editable = get_profile_editable_labels(profile)
+
+    # Protect everything NOT in editable set
+    non_target = all_garment - editable
+    labels |= non_target
+
+    # Arm handling: if garment exposes arms, don't protect arms
+    if profile.expose_arms:
+        labels -= {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+
+    # Drape handling: protect only hands, not full arms
+    if profile.is_draped:
+        labels -= {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+        # Will be handled by _hand_zones_from_arms in the protect mask builder
+
+    return labels
 
 
 @dataclass(frozen=True)
@@ -626,24 +1606,32 @@ def build_schp_inpaint_mask(
     garment_subtype: str = "",
     source_cloth_type: str = "",
     garment_img_info: "GarmentImageInfo | None" = None,
+    profile: "GarmentProfile | None" = None,
 ) -> np.ndarray:
-    """Build binary inpaint mask from SCHP labels.
+    """Build binary inpaint mask from SCHP labels using GarmentProfile.
 
-    Same-category: uses target garment labels — the model changes texture/color
-    within the source garment's shape.
+    Uses GarmentProfile-driven difference-based editing:
 
-    Cross-category: uses UNION of source + target garment labels, plus an
-    adaptive dilated buffer around source labels. This ensures the model can
-    fully erase the old garment (source labels + buffer) while generating the new
-    garment in the correct body region (target labels).
+    Same-category (source and target are same cloth_type):
+      Mask = SOURCE garment labels. The model replaces texture/color within the
+      source garment's shape — the source shape IS the edit region.
 
-    The protect mask (built separately) constrains which regions actually
-    change — identity (face, hair, shoes) is always protected, and
-    non-target body regions are protected per garment family.
+    Cross-category (source and target are different cloth_types):
+      Mask = TARGET body region labels (from GarmentProfile) PLUS SOURCE garment
+      labels with adaptive buffer. The GarmentProfile determines exactly which
+      body regions the target covers (e.g. jacket covers upper+lower, crop_top
+      covers upper only).
 
     255 = editable, 0 = protected.
     """
-    target_labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
+    # Build profile if not provided
+    if profile is None:
+        profile = build_garment_profile(garment_subtype, cloth_type, garment_img_info)
+
+    # Get editable labels from profile
+    target_labels = get_profile_editable_labels(profile)
+
+    # Determine if this is a cross-category edit
     is_cross = (
         source_cloth_type
         and source_cloth_type != cloth_type
@@ -652,19 +1640,19 @@ def build_schp_inpaint_mask(
 
     if is_cross:
         source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
-        combined = target_labels | source_labels
 
-        # Base mask: all present garment labels (source + target)
-        mask = np.isin(schp_labels, list(combined)).astype(np.uint8) * 255
+        # Base mask: target body region labels (what the target covers)
+        mask = np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255
 
-        # Dilated buffer around SOURCE labels only — ensures clean erasure
-        # of old garment even at edges where SCHP segmentation is imperfect.
-        # Kernel size adapts to body size, source coverage, target geometry.
-        source_only = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
-        if np.any(source_only):
+        # Add source garment labels — ensures old garment is included
+        source_present = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
+        mask = np.maximum(mask, source_present)
+
+        # Dilated buffer around SOURCE labels — ensures clean erasure
+        if np.any(source_present):
             ks = _adaptive_buffer_ks(schp_labels, source_labels, garment_img_info=garment_img_info)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-            source_dilated = cv2.dilate(source_only, kernel, iterations=1)
+            source_dilated = cv2.dilate(source_present, kernel, iterations=1)
             ke = max(3, ks - 4)
             if ke % 2 == 0:
                 ke += 1
@@ -672,33 +1660,28 @@ def build_schp_inpaint_mask(
             source_tight = cv2.erode(source_dilated, kernel_e, iterations=1)
             mask = np.maximum(mask, source_tight)
 
-        # Include arm labels if source is draped (saree pallu over arms)
+        # Include arm labels if source is draped
         if source_cloth_type in ("dresses", "full_body"):
-            src_subtype = (garment_subtype or "").lower()
-            if any(kw in src_subtype for kw in _DRAPE_KEYWORDS):
+            src_key = (garment_subtype or "").lower()
+            if any(kw in src_key for kw in _DRAPE_KEYWORDS):
                 arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
                 mask = np.maximum(mask, arm_mask)
 
-        # Include leg labels if source is lower or full body but target is upper
-        if source_cloth_type in ("lower_body", "dresses", "full_body"):
-            if cloth_type == "upper_body":
-                leg_labels = {_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG, _LABEL_PANTS,
-                             _LABEL_SKIRT, _LABEL_SOCKS}
-                leg_mask = np.isin(schp_labels, list(leg_labels)).astype(np.uint8) * 255
-                mask = np.maximum(mask, leg_mask)
-
-        # Include upper labels if source is upper but target is lower/full
-        if source_cloth_type == "upper_body":
-            if cloth_type in ("lower_body", "dresses", "full_body"):
-                upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
-                upper_mask = np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255
-                mask = np.maximum(mask, upper_mask)
+        # Include body regions where source overlaps but target doesn't cover
+        # This ensures old garment regions that are outside target coverage
+        # are still included for erasure
+        source_only_labels = source_labels - target_labels
+        if source_only_labels:
+            source_only_mask = np.isin(schp_labels, list(source_only_labels)).astype(np.uint8) * 255
+            mask = np.maximum(mask, source_only_mask)
     else:
-        # Same-category: target labels only
-        mask = np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255
+        # Same-category: source garment labels
+        source_cloth = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else cloth_type
+        source_labels = _CLOTHING_LABELS.get(source_cloth, _CLOTHING_LABELS.get(cloth_type, set()))
+        mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
 
-        # Include arm labels for draped targets (saree pallu, dupatta)
-        if is_draped_garment(cloth_type, garment_subtype):
+        # Include arm labels for draped targets
+        if profile.is_draped:
             arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
             mask = np.maximum(mask, arm_mask)
 
@@ -714,51 +1697,42 @@ def build_schp_protect_mask(
     cloth_type: str,
     garment_subtype: str = "",
     dilate_px: int = 13,
+    profile: "GarmentProfile | None" = None,
 ) -> np.ndarray:
-    """
-    Build binary protect mask from SCHP labels.
+    """Build binary protect mask using GarmentProfile.
+
     255 = protected (identity-critical), 0 = editable.
 
-    Uses explicit identity labels — NOT inverted clothing — so inpaint coverage
-    stays large enough for full outfit replacement and draped overlays.
+    Uses GarmentProfile-driven target-aware protection:
+      1. Always protect identity labels (face, hair, shoes, hat, gloves)
+      2. Protect body regions NOT covered by the target garment (from profile)
+      3. Garment-aware arm protection (expose_arms, is_draped)
 
-    Arm protection is garment-aware:
-    - Tank tops, crop tops, vests: arms EXPOSED (not protected) so model
-      can generate bare arms or sleeveless output
-    - Draped garments: full arms protected (pallu generated via IP-Adapter)
-    - Standard garments: full arms protected
+    The profile determines exactly which body regions the target covers,
+    and the protect mask is the complement. This replaces hardcoded rules
+    with per-garment profiling.
     """
-    geometry = get_garment_geometry(garment_subtype)
-    draped = is_draped_garment(cloth_type, garment_subtype)
-    mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
+    # Build profile if not provided
+    if profile is None:
+        profile = build_garment_profile(garment_subtype, cloth_type)
 
-    if cloth_type == "upper_body":
-        if not geometry.expose_arms:
-            # Block lower-body replacement when only swapping tops.
-            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
-                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
-            mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
-            # Full arms protected (unless garment exposes arms like tank top)
-            mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
-        else:
-            # Sleeveless garment: only protect lower body, NOT arms
-            lower_labels = {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
-                           _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
-            mask = np.maximum(mask, np.isin(schp_labels, list(lower_labels)).astype(np.uint8) * 255)
-    elif cloth_type == "lower_body":
-        upper_labels = {_LABEL_UPPER_CLOTHES, _LABEL_COAT, _LABEL_DRESS, _LABEL_SCARF}
-        mask = np.maximum(mask, np.isin(schp_labels, list(upper_labels)).astype(np.uint8) * 255)
-        mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
-    elif draped:
-        # Draped targets: protect only HANDS (distal arm), not full forearms.
-        # This lets pallu/drape be generated over forearms while keeping
-        # mehndi, phones, and ring details intact.
+    # Get protect labels from profile
+    protect_labels = get_profile_protect_labels(profile)
+
+    # Start with identity + non-target body regions
+    mask = np.isin(schp_labels, list(protect_labels)).astype(np.uint8) * 255
+
+    # Arm protection — garment-aware
+    if profile.is_draped:
+        # Draped: protect only HANDS (distal arm), not full forearms
         hand_zone = _hand_zones_from_arms(schp_labels)
         mask = np.maximum(mask, hand_zone)
-    else:
+    elif not profile.expose_arms:
+        # Standard garments: protect full arms
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
+    # else: sleeveless garment — arms NOT protected
 
-    if draped:
+    if profile.is_draped:
         dilate_px = max(11, dilate_px - 2)
 
     mask = _dilate_mask(mask, dilate_px, iterations=1)
@@ -793,38 +1767,54 @@ def build_final_inpaint_mask(
     source_cloth_type: str = "",
     garment_img_info: "GarmentImageInfo | None" = None,
     trace_id: str = "",
+    profile: "GarmentProfile | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Full mask pipeline: source+target labels → protect → dilate → subtract.
+    """Full mask pipeline: GarmentProfile-driven difference-based editing.
 
-    For same-category: mask = target garment labels. Model changes texture/color
-    within the source garment's shape.
+    Builds a GarmentProfile for the target garment (or uses the provided one),
+    then uses it to compute:
+      1. Inpaint mask — editable regions based on target coverage + source erasure
+      2. Protect mask — identity + non-target body regions
+      3. Final mask — inpaint minus protect
 
-    For cross-category: mask = UNION of source + target garment labels plus a
-    dilated buffer around source labels. This ensures the model can fully erase
-    the old garment while generating the new one in the correct body region.
-
-    The protect mask constrains which regions actually change:
-      - Identity (face, hair, shoes) is always protected
-      - Non-target body regions are protected per garment family
-        (e.g. lower body protected when only swapping tops)
+    The GarmentProfile drives everything:
+      - Which body regions are editable (covers_upper, covers_lower, etc.)
+      - Which regions are protected (complement of coverage)
+      - Arm behavior (expose_arms, is_draped)
+      - Buffer dilation (adaptive to garment geometry)
 
     Args:
         schp_labels: SCHP label map from person image.
         cloth_type: Target garment's cloth_type.
         garment_subtype: Target garment's specific subtype (e.g. "jacket", "saree").
-        source_cloth_type: Person's current garment cloth_type (for cross-category mask).
-        garment_img_info: Target garment image geometry (for adaptive buffer sizing).
-        trace_id: Debug trace ID for artifact generation.
+        source_cloth_type: Person's current garment cloth_type.
+        garment_img_info: Target garment image geometry.
+        trace_id: Debug trace ID.
     """
-    # 1. Build inpaint mask — source+target labels for cross-category
-    inpaint_raw = build_schp_inpaint_mask(
-        schp_labels, cloth_type, garment_subtype, source_cloth_type, garment_img_info,
+    # 1. Build GarmentProfile (or use provided one)
+    if profile is None:
+        profile = build_garment_profile(garment_subtype, cloth_type, garment_img_info)
+
+    logger.info(
+        "mask_profile subtype=%s family=%s covers_upper=%s covers_lower=%s "
+        "extends_below=%s expose_arms=%s is_draped=%s is_cropped=%s",
+        garment_subtype, profile.family, profile.covers_upper, profile.covers_lower,
+        profile.extends_below_waist, profile.expose_arms, profile.is_draped,
+        profile.is_cropped,
     )
 
-    # 2. Build protect mask (identity regions + non-target body regions)
-    protect = build_schp_protect_mask(schp_labels, cloth_type, garment_subtype)
+    # 2. Build inpaint mask — GarmentProfile-driven
+    inpaint_raw = build_schp_inpaint_mask(
+        schp_labels, cloth_type, garment_subtype, source_cloth_type,
+        garment_img_info, profile=profile,
+    )
 
-    # 3. Mild dilation for edge blending (small kernel — just smooths boundaries)
+    # 3. Build protect mask — GarmentProfile-driven
+    protect = build_schp_protect_mask(
+        schp_labels, cloth_type, garment_subtype, profile=profile,
+    )
+
+    # 4. Mild dilation for edge blending
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
     ks = max(3, int(5 * scale))
@@ -833,10 +1823,10 @@ def build_final_inpaint_mask(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
     inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
 
-    # 4. Apply protection (subtract identity from editable)
+    # 5. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
 
-    # 5. Debug artifacts
+    # 6. Debug artifacts
     if trace_id:
         try:
             save_mask_debug_artifacts(
@@ -972,3 +1962,338 @@ def detect_inference_failures(
         identity_drift_score=identity_drift,
         failure_reasons=tuple(reasons),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 7 — Complete Debug Artifact System
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DebugArtifacts:
+    """Complete debug artifact collection for a single inference run."""
+    trace_id: str = ""
+    # Garment understanding
+    garment_profile: "GarmentProfile | None" = None
+    garment_img_info: "GarmentImageInfo | None" = None
+    alignment_transform: "AlignmentTransform | None" = None
+    pipeline_route: "PipelineRoute | None" = None
+    # Body analysis
+    source_cloth_type: str = ""
+    target_cloth_type: str = ""
+    schp_labels: "np.ndarray | None" = None
+    # Masks
+    inpaint_mask_np: "np.ndarray | None" = None
+    protect_mask_np: "np.ndarray | None" = None
+    final_mask_np: "np.ndarray | None" = None
+    # Results
+    raw_output: "Image.Image | None" = None
+    final_output: "Image.Image | None" = None
+    # Timing
+    timing_ms: dict[str, float] = field(default_factory=dict)
+    # Scores
+    candidate_scores: list[dict[str, object]] = field(default_factory=list)
+    # Routing decision
+    routing_decision: str = ""
+    # Warnings
+    warnings: list[str] = field(default_factory=list)
+
+
+def save_debug_artifacts_v2(
+    artifacts: DebugArtifacts,
+    person_img: "Image.Image | None" = None,
+    garment_img: "Image.Image | None" = None,
+) -> str:
+    """Save complete debug artifact collection for pipeline observability.
+
+    Saves to /tmp/idm-vton-debug/{trace_id}/ with:
+      - garment_profile.json
+      - garment_img_info.json
+      - alignment_transform.json
+      - pipeline_route.json
+      - schp_labels.png
+      - inpaint_mask.png
+      - protect_mask.png
+      - final_mask.png
+      - mask_overlay.png
+      - person_input.png
+      - garment_input.png
+      - raw_output.png
+      - final_output.png
+      - timing.json
+      - candidate_scores.json
+      - routing_decision.json
+
+    Returns the debug directory path.
+    """
+    from pathlib import Path
+    import json
+
+    if not artifacts.trace_id:
+        return ""
+
+    debug_dir = Path("/tmp/idm-vton-debug") / artifacts.trace_id
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Garment profile
+        if artifacts.garment_profile:
+            p = artifacts.garment_profile
+            profile_data = {
+                "family": p.family, "cloth_type": p.cloth_type,
+                "covers_upper": p.covers_upper, "covers_lower": p.covers_lower,
+                "covers_arms": p.covers_arms, "covers_hands": p.covers_hands,
+                "covers_torso_full": p.covers_torso_full,
+                "extends_below_waist": p.extends_below_waist,
+                "has_sleeves": p.has_sleeves, "sleeve_length": p.sleeve_length,
+                "expose_arms": p.expose_arms, "is_fitted": p.is_fitted,
+                "is_structured": p.is_structured, "is_loose": p.is_loose,
+                "is_draped": p.is_draped, "has_pallu": p.has_pallu,
+                "has_border": p.has_border, "is_layered": p.is_layered,
+                "is_cropped": p.is_cropped, "is_voluminous": p.is_voluminous,
+                "is_ethnic": p.is_ethnic,
+            }
+            (debug_dir / "garment_profile.json").write_text(json.dumps(profile_data, indent=2))
+
+        # Garment image info
+        if artifacts.garment_img_info:
+            g = artifacts.garment_img_info
+            info_data = {
+                "bbox_area_ratio": g.bbox_area_ratio, "aspect_ratio": g.aspect_ratio,
+                "width_ratio": g.width_ratio, "height_ratio": g.height_ratio,
+                "center_y_ratio": g.center_y_ratio, "has_sleeves": g.has_sleeves,
+                "is_long": g.is_long, "is_wide": g.is_wide,
+            }
+            (debug_dir / "garment_img_info.json").write_text(json.dumps(info_data, indent=2))
+
+        # Alignment transform
+        if artifacts.alignment_transform:
+            a = artifacts.alignment_transform
+            align_data = {
+                "scale_x": a.scale_x, "scale_y": a.scale_y,
+                "offset_x": a.offset_x, "offset_y": a.offset_y,
+                "flip_horizontal": a.flip_horizontal,
+                "center_y_ratio": a.center_y_ratio,
+            }
+            (debug_dir / "alignment_transform.json").write_text(json.dumps(align_data, indent=2))
+
+        # Pipeline route
+        if artifacts.pipeline_route:
+            r = artifacts.pipeline_route
+            route_data = {
+                "pipeline": r.pipeline, "needs_erase": r.needs_erase,
+                "erase_steps": r.erase_steps, "erase_guidance": r.erase_guidance,
+                "apply_steps": r.apply_steps, "apply_guidance": r.apply_guidance,
+                "is_cross": r.is_cross, "is_draped": r.is_draped,
+                "is_structured": r.is_structured, "is_layered": r.is_layered,
+                "family": r.family,
+            }
+            (debug_dir / "pipeline_route.json").write_text(json.dumps(route_data, indent=2))
+
+        # SCHP labels
+        if artifacts.schp_labels is not None:
+            colors = np.zeros((*artifacts.schp_labels.shape, 3), dtype=np.uint8)
+            label_colors = [
+                (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+                (0, 0, 128), (255, 0, 0), (255, 128, 0), (255, 255, 0),
+                (128, 128, 128), (0, 255, 0), (0, 128, 128), (128, 0, 128),
+                (0, 255, 255), (255, 0, 255), (128, 64, 0), (64, 128, 0),
+                (0, 64, 128), (0, 128, 64), (64, 0, 128), (128, 0, 64),
+            ]
+            for i, c in enumerate(label_colors):
+                if i < 20:
+                    colors[artifacts.schp_labels == i] = c
+            Image.fromarray(colors).save(str(debug_dir / "schp_labels.png"))
+
+        # Masks
+        for mask_arr, name in [
+            (artifacts.inpaint_mask_np, "inpaint_mask"),
+            (artifacts.protect_mask_np, "protect_mask"),
+            (artifacts.final_mask_np, "final_mask"),
+        ]:
+            if mask_arr is not None:
+                Image.fromarray(mask_arr, mode="L").save(str(debug_dir / f"{name}.png"))
+
+        # Mask overlay
+        if person_img is not None and artifacts.final_mask_np is not None:
+            bg = person_img.convert("RGB").copy()
+            if bg.size != (artifacts.final_mask_np.shape[1], artifacts.final_mask_np.shape[0]):
+                bg = bg.resize((artifacts.final_mask_np.shape[1], artifacts.final_mask_np.shape[0]), Image.LANCZOS)
+            arr = np.array(bg, dtype=np.uint8)
+            m = artifacts.final_mask_np > 127
+            arr[m, 0] = (arr[m, 0].astype(np.uint16) + 255) // 2
+            arr[m, 1] = (arr[m, 1].astype(np.uint16) + 80) // 2
+            arr[m, 2] = (arr[m, 2].astype(np.uint16) + 80) // 2
+            Image.fromarray(arr).save(str(debug_dir / "mask_overlay.png"))
+
+        # Person and garment inputs
+        if person_img is not None:
+            person_img.convert("RGB").save(str(debug_dir / "person_input.png"))
+        if garment_img is not None:
+            garment_img.convert("RGB").save(str(debug_dir / "garment_input.png"))
+
+        # Raw and final output
+        if artifacts.raw_output is not None:
+            artifacts.raw_output.save(str(debug_dir / "raw_output.png"))
+        if artifacts.final_output is not None:
+            artifacts.final_output.save(str(debug_dir / "final_output.png"))
+
+        # Timing
+        if artifacts.timing_ms:
+            (debug_dir / "timing.json").write_text(json.dumps(artifacts.timing_ms, indent=2))
+
+        # Candidate scores
+        if artifacts.candidate_scores:
+            (debug_dir / "candidate_scores.json").write_text(
+                json.dumps(artifacts.candidate_scores, indent=2, default=str)
+            )
+
+        # Routing decision
+        routing_data = {
+            "decision": artifacts.routing_decision,
+            "source_cloth_type": artifacts.source_cloth_type,
+            "target_cloth_type": artifacts.target_cloth_type,
+            "warnings": artifacts.warnings,
+        }
+        (debug_dir / "routing_decision.json").write_text(json.dumps(routing_data, indent=2))
+
+        logger.info("debug_artifacts_v2_saved dir=%s", debug_dir)
+        return str(debug_dir)
+
+    except Exception as exc:
+        logger.warning("debug_artifacts_v2_failed error=%s", exc)
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 8 — Production Safety
+# ═══════════════════════════════════════════════════════════════════════
+
+def validate_pipeline_inputs(
+    schp_labels: np.ndarray | None,
+    cloth_type: str,
+    garment_subtype: str,
+    source_cloth_type: str,
+) -> list[str]:
+    """Validate all pipeline inputs before processing. Returns list of warnings."""
+    warnings: list[str] = []
+
+    if schp_labels is None:
+        warnings.append("schp_labels_none")
+    elif schp_labels.ndim != 2:
+        warnings.append(f"schp_labels_wrong_ndim:{schp_labels.ndim}")
+    elif schp_labels.shape[0] < 10 or schp_labels.shape[1] < 10:
+        warnings.append(f"schp_labels_degenerate:{schp_labels.shape}")
+
+    valid_cloth_types = {"upper_body", "lower_body", "dresses", "full_body"}
+    if cloth_type not in valid_cloth_types:
+        warnings.append(f"invalid_cloth_type:{cloth_type}")
+
+    if garment_subtype and len(garment_subtype) > 100:
+        warnings.append(f"garment_subtype_too_long:{len(garment_subtype)}")
+
+    valid_source_types = {"upper_body", "lower_body", "dresses", "full_body", "unknown", ""}
+    if source_cloth_type not in valid_source_types:
+        warnings.append(f"invalid_source_cloth_type:{source_cloth_type}")
+
+    return warnings
+
+
+def safe_build_profile(
+    garment_subtype: str,
+    cloth_type: str,
+    garment_img_info: "GarmentImageInfo | None" = None,
+) -> GarmentProfile:
+    """Build garment profile with safety fallback. Never raises."""
+    try:
+        return build_garment_profile(garment_subtype, cloth_type, garment_img_info)
+    except Exception as exc:
+        logger.warning("safe_build_profile_fallback error=%s subtype=%s", exc, garment_subtype)
+        return GarmentProfile(cloth_type=cloth_type)
+
+
+def safe_build_mask(
+    schp_labels: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str,
+    source_cloth_type: str,
+    garment_img_info: "GarmentImageInfo | None" = None,
+    profile: "GarmentProfile | None" = None,
+    trace_id: str = "",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build masks with safety fallback. Never raises."""
+    try:
+        if profile is None:
+            profile = safe_build_profile(garment_subtype, cloth_type, garment_img_info)
+
+        inpaint = build_schp_inpaint_mask(
+            schp_labels, cloth_type, garment_subtype, source_cloth_type,
+            garment_img_info, profile=profile,
+        )
+        protect = build_schp_protect_mask(
+            schp_labels, cloth_type, garment_subtype, profile=profile,
+        )
+        h, w = schp_labels.shape
+        scale = max(1.0, h / 512.0)
+        ks = max(3, int(5 * scale))
+        if ks % 2 == 0:
+            ks += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+        inpaint_dilated = cv2.dilate(inpaint, kernel, iterations=1)
+        final = apply_protection_binary(inpaint_dilated, protect)
+
+        return final, inpaint_dilated, protect
+
+    except Exception as exc:
+        logger.warning("safe_build_mask_fallback error=%s trace_id=%s", exc, trace_id)
+        h, w = schp_labels.shape
+        # Fallback: full body mask (safest — lets model generate everything)
+        fallback = np.ones((h, w), dtype=np.uint8) * 255
+        identity_mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
+        fallback = np.where(identity_mask > 0, 0, fallback).astype(np.uint8)
+        protect = identity_mask
+        return fallback, fallback, protect
+
+
+def validate_mask_safety(
+    final_mask: np.ndarray,
+    inpaint_mask: np.ndarray,
+    protect_mask: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str = "",
+    trace_id: str = "",
+) -> list[str]:
+    """Validate mask outputs for production safety. Returns list of issues."""
+    issues: list[str] = []
+
+    try:
+        validate_mask_integrity(final_mask, "final_mask")
+    except ValueError as e:
+        issues.append(f"final_mask_invalid:{e}")
+
+    try:
+        validate_mask_integrity(inpaint_mask, "inpaint_mask")
+    except ValueError as e:
+        issues.append(f"inpaint_mask_invalid:{e}")
+
+    try:
+        validate_mask_integrity(protect_mask, "protect_mask")
+    except ValueError as e:
+        issues.append(f"protect_mask_invalid:{e}")
+
+    # Check mask sizes match
+    if final_mask.shape != inpaint_mask.shape:
+        issues.append("mask_shape_mismatch:final_vs_inpaint")
+    if final_mask.shape != protect_mask.shape:
+        issues.append("mask_shape_mismatch:final_vs_protect")
+
+    # Check coverage is reasonable
+    final_coverage = float(np.mean(final_mask > 127))
+    if final_coverage < 0.01:
+        issues.append(f"final_mask_near_empty:{final_coverage:.4f}")
+    elif final_coverage > 0.95:
+        issues.append(f"final_mask_near_full:{final_coverage:.4f}")
+
+    if issues:
+        logger.warning("mask_safety_issues trace_id=%s issues=%s", trace_id, issues)
+
+    return issues

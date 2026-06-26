@@ -83,8 +83,6 @@ GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
 NEUTRAL_GARMENT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "neutral_garment.png"
 )
-CROSS_CATEGORY_ERASE_STEPS = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "20"))
-CROSS_CATEGORY_ERASE_GUIDANCE = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "3.5"))
 
 # Retry / candidate scoring thresholds
 MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
@@ -93,7 +91,6 @@ CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
 CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
 RETRY_GUIDANCE_BOOST = float(os.environ.get("RETRY_GUIDANCE_BOOST", "0.15"))
 RETRY_STEPS_BOOST = int(os.environ.get("RETRY_STEPS_BOOST", "5"))
-FACE_RESTORATION_DEFAULT = os.environ.get("ENABLE_FACE_RESTORATION", "0") == "1"
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16
@@ -297,6 +294,21 @@ def _set_torch_perf_flags():
             pass
 
 
+def _center_canvas_resize(img: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    """Resize image to fit target_size while preserving aspect ratio, centered on white canvas."""
+    tw, th = target_size
+    if img.size == target_size:
+        return img.convert("RGB")
+    iw, ih = img.size
+    scale = min(tw / iw, th / ih)
+    nw = max(1, int(iw * scale))
+    nh = max(1, int(ih * scale))
+    resized = img.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    canvas.paste(resized, ((tw - nw) // 2, (th - nh) // 2))
+    return canvas
+
+
 # =============================================================================
 # Cross-category two-stage pipeline
 # =============================================================================
@@ -353,48 +365,6 @@ def _generate_neutral_garment(target_size: tuple[int, int] = TARGET_SIZE) -> Ima
     return result
 
 
-def detect_cross_category(
-    person_img: Image.Image,
-    vton_type: str,
-    trace_id: str = "",
-) -> bool:
-    """Check whether two-stage inference is needed for this person+garment pair.
-
-    Runs a quick SCHP parse on the person image at target resolution, then
-    compares the detected garment labels against the target cloth_type's
-    editable label set.
-
-    Returns True when significant garment-label area falls outside the target
-    mask — i.e. the old garment would survive a single-stage try-on.
-    """
-    from mask_pipeline import needs_two_stage
-
-    try:
-        if parsing_model is None:
-            logger.info("cross_category_skip parsing_model_not_loaded trace_id=%s", trace_id)
-            return False
-
-        det_img = person_img.resize(TARGET_SIZE)
-        det_parse, _ = parsing_model(det_img)
-        det_schp = np.array(det_parse, dtype=np.uint8)
-        if det_schp.ndim == 3:
-            det_schp = det_schp.squeeze(0)
-        det_schp = det_schp.astype(np.uint8)
-
-        needed = needs_two_stage(det_schp, vton_type)
-
-        present_labels = sorted(int(x) for x in np.unique(det_schp) if x > 0)
-        logger.info(
-            "cross_category_detection needed=%s vton_type=%s "
-            "person_garment_labels=%s trace_id=%s",
-            needed, vton_type, present_labels, trace_id,
-        )
-        return needed
-    except Exception as exc:
-        logger.warning("cross_category_detection_failed error=%s trace_id=%s", exc, trace_id)
-        return False
-
-
 def run_cross_category_inference(
     person_img: Image.Image,
     garment_img: Image.Image,
@@ -406,6 +376,9 @@ def run_cross_category_inference(
     guidance_scale: float | None = None,
     trace_id: str = "",
     source_cloth_type: str = "",
+    pipeline_route: "PipelineRoute | None" = None,
+    alignment: "AlignmentTransform | None" = None,
+    garment_profile: "GarmentProfile | None" = None,
 ) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
     """Two-stage cross-category try-on.
 
@@ -419,8 +392,13 @@ def run_cross_category_inference(
 
     Returns (final_result, raw_output, mask_meta_from_stage2).
     """
-    erase_steps = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "50"))
-    erase_guidance = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "5.5"))
+    # Use PipelineRoute values (profile-adjusted) instead of raw env reads.
+    if pipeline_route is not None:
+        erase_steps = pipeline_route.erase_steps
+        erase_guidance = pipeline_route.erase_guidance
+    else:
+        erase_steps = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "50"))
+        erase_guidance = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "5.5"))
 
     logger.info(
         "cross_category_stage1_erase_start cloth_type=%s "
@@ -490,8 +468,11 @@ def run_cross_category_inference(
     )
 
     # ── Stage 2: apply target garment ─────────────────────────────────
-    # Use standard guidance on erased body — avoid over-guiding which causes identity drift
-    stage2_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+    # Use PipelineRoute's family-aware guidance for stage 2.
+    if pipeline_route is not None:
+        stage2_guidance = pipeline_route.apply_guidance
+    else:
+        stage2_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
     result, raw_output, mask_meta = run_idm_vton_inference(
         person_img=erased_person,
@@ -506,6 +487,8 @@ def run_cross_category_inference(
         crop_preserve_lower=True,
         source_cloth_type=source_cloth_type,
         trace_id=trace_id,
+        alignment=alignment,
+        garment_profile=garment_profile,
     )
 
     logger.info(
@@ -1110,6 +1093,8 @@ def run_idm_vton_inference(
     override_negative_prompt: str | None = None,
     source_cloth_type: str = "",
     trace_id: str = "",
+    alignment: "AlignmentTransform | None" = None,
+    garment_profile: "GarmentProfile | None" = None,
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -1133,21 +1118,30 @@ def run_idm_vton_inference(
         detect_inference_failures,
         analyze_garment_image,
         save_mask_debug_artifacts,
+        build_garment_profile,
+        compute_pipeline_route,
+        compute_garment_alignment,
+        AlignmentTransform,
+        DebugArtifacts,
+        save_debug_artifacts_v2,
+        validate_pipeline_inputs,
+        safe_build_profile,
+        safe_build_mask,
+        validate_mask_safety,
     )
 
-    # Trust preprocessing canvas when garment is already at target resolution.
+    # Apply geometry-aware alignment to garment image, then resize to target.
+    # alignment is computed by compute_garment_alignment() in run_inference().
     garm_img = garment_img.convert("RGB")
-    if garm_img.size != TARGET_SIZE:
-        gw, gh = garm_img.size
-        scale = min(TARGET_W / gw, TARGET_H / gh)
-        nw = max(1, int(gw * scale))
-        nh = max(1, int(gh * scale))
-        garm_resized = garm_img.resize((nw, nh), Image.LANCZOS)
-        garm_canvas = Image.new("RGB", TARGET_SIZE, (255, 255, 255))
-        garm_canvas.paste(garm_resized, ((TARGET_W - nw) // 2, (TARGET_H - nh) // 2))
-        garm_img = garm_canvas
+    if alignment is not None:
+        try:
+            from mask_pipeline import apply_garment_alignment
+            garm_img = apply_garment_alignment(garm_img, alignment, TARGET_SIZE)
+        except Exception as exc:
+            logger.warning("alignment_apply_failed_falling_back_to_center error=%s trace_id=%s", exc, trace_id)
+            garm_img = _center_canvas_resize(garm_img, TARGET_SIZE)
     else:
-        garm_img = garm_img.convert("RGB")
+        garm_img = _center_canvas_resize(garm_img, TARGET_SIZE)
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -1215,13 +1209,41 @@ def run_idm_vton_inference(
     schp_np = schp_np.astype(np.uint8)
 
     garment_img_info = analyze_garment_image(garment_img)
-    final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
-        schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
-        garment_img_info=garment_img_info, trace_id=trace_id,
-    )
+    try:
+        final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
+            schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
+            garment_img_info=garment_img_info, trace_id=trace_id,
+            profile=garment_profile,
+        )
+    except Exception as exc:
+        logger.warning(
+            "build_final_inpaint_mask_failed_using_safe_fallback error=%s trace_id=%s",
+            exc, trace_id,
+        )
+        final_mask_np, inpaint_mask_np, protect_mask_np = safe_build_mask(
+            schp_np, cloth_type, garment_subtype, source_cloth_type,
+            garment_img_info=garment_img_info, profile=garment_profile, trace_id=trace_id,
+        )
+
     draped = is_draped_garment(cloth_type, garment_subtype)
     assert_binary_mask(final_mask_np, "final_mask before inference")
     validate_mask_integrity(final_mask_np, "final_mask")
+
+    # ── Mask safety validation ────────────────────────────────────────
+    mask_safety_issues = validate_mask_safety(
+        final_mask_np, inpaint_mask_np, protect_mask_np,
+        cloth_type, garment_subtype, trace_id=trace_id,
+    )
+    if mask_safety_issues:
+        logger.warning(
+            "mask_safety_issues_found Using safe fallback issues=%s trace_id=%s",
+            mask_safety_issues, trace_id,
+        )
+        final_mask_np, inpaint_mask_np, protect_mask_np = safe_build_mask(
+            schp_np, cloth_type, garment_subtype, source_cloth_type,
+            garment_img_info=garment_img_info, profile=garment_profile, trace_id=trace_id,
+        )
+
     # Smooth upscale: LANCZOS + threshold to 255/0 gives anti-aliased
     # mask boundaries instead of the jagged pixel blocks from NEAREST.
     final_mask = Image.fromarray(final_mask_np, mode="L")
@@ -1408,6 +1430,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         validate_mask_coverage,
         InferenceQualityReport,
         detect_source_cloth_type,
+        safe_build_profile,
+        safe_build_mask,
+        validate_mask_safety,
+        compute_pipeline_route,
+        save_debug_artifacts_v2,
+        DebugArtifacts,
+        validate_pipeline_inputs,
+        compute_garment_alignment,
+        analyze_garment_image,
     )
 
     job_start = time.perf_counter()
@@ -1536,12 +1567,16 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     retry_count = 0
     failure_reasons: list[str] = []
     best_candidate_score: float = -1.0
+    candidate_count = 1
+    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+
+    # ── Debug artifacts collection ──────────────────────────────────────
+    debug = DebugArtifacts(trace_id=trace_id, target_cloth_type=vton_type)
+    debug.timing_ms["job_start"] = time.perf_counter() * 1000
 
     # ── Detect source garment type from SCHP ────────────────────────────
-    # Run SCHP on person image to determine what the person is currently wearing.
-    # This enables target-aware mask expansion: when target covers different
-    # body regions than source, the mask expands to include them.
     source_cloth_type = ""
+    det_schp = None
     try:
         det_img = person_img.convert("RGB").resize(TARGET_SIZE)
         det_parse, _ = parsing_model(det_img)
@@ -1552,6 +1587,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             det_schp = det_schp.squeeze(0)
         det_schp = det_schp.astype(np.uint8)
         source_cloth_type = detect_source_cloth_type(det_schp)
+        debug.source_cloth_type = source_cloth_type
+        debug.schp_labels = det_schp
         logger.info(
             "source_cloth_type_detected source=%s target=%s trace_id=%s",
             source_cloth_type, vton_type, trace_id,
@@ -1560,13 +1597,40 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         logger.warning("source_cloth_type_detection_failed error=%s trace_id=%s", exc, trace_id)
         source_cloth_type = ""
 
-    # ── Cross-category detection —───────────────────────────────────────
-    # If the person's current garment covers label categories outside the
-    # target cloth_type's editable mask, two-stage erase+apply is needed.
-    # Same-category swaps (shirt→shirt, dress→dress) skip this path entirely.
-    cross_category_needed = detect_cross_category(person_img, vton_type, trace_id)
+    # ── Input validation (now with actual SCHP labels) ──────────────────
+    input_warnings = validate_pipeline_inputs(det_schp, vton_type, garment_subtype, source_cloth_type)
+    if input_warnings:
+        logger.warning("input_validation_warnings trace_id=%s warnings=%s", trace_id, input_warnings)
 
-    if cross_category_needed:
+    # ── Build GarmentProfile ────────────────────────────────────────────
+    garment_img_info = analyze_garment_image(garment_img)
+    garment_profile = safe_build_profile(garment_subtype, vton_type, garment_img_info)
+    debug.garment_profile = garment_profile
+    debug.garment_img_info = garment_img_info
+
+    # ── Compute alignment transform ─────────────────────────────────────
+    alignment = compute_garment_alignment(garment_img, garment_profile, det_schp)
+    debug.alignment_transform = alignment
+
+    # ── Compute pipeline route ──────────────────────────────────────────
+    pipeline_route = compute_pipeline_route(
+        source_cloth_type, vton_type, garment_profile, det_schp,
+        requested_steps=steps, requested_guidance=guidance_scale,
+    )
+    debug.pipeline_route = pipeline_route
+    debug.routing_decision = pipeline_route.pipeline
+
+    logger.info(
+        "pipeline_routing route=%s family=%s is_cross=%s is_draped=%s "
+        "is_structured=%s needs_erase=%s trace_id=%s",
+        pipeline_route.pipeline, pipeline_route.family,
+        pipeline_route.is_cross, pipeline_route.is_draped,
+        pipeline_route.is_structured, pipeline_route.needs_erase,
+        trace_id,
+    )
+
+    # ── Routing decision ────────────────────────────────────────────────
+    if pipeline_route.needs_erase:
         logger.info(
             "cross_category_routing_two_stage vton_type=%s "
             "person_img_size=%s garment_desc=%s trace_id=%s",
@@ -1584,21 +1648,22 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             guidance_scale=guidance_scale,
             trace_id=trace_id,
             source_cloth_type=source_cloth_type,
+            pipeline_route=pipeline_route,
+            alignment=alignment,
+            garment_profile=garment_profile,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_start) * 1000
+        debug.timing_ms["cross_category_inference_ms"] = inference_ms
 
-        # Score cross-category output with garment-aware weights
         quality_report = InferenceQualityReport(
             passed=True, identity_drift_score=0.0, failure_reasons=(),
         )
         retry_count = 0
         best_candidate_score = 0.0
-        candidate_count = 1
         failure_reasons = []
-        effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
-        draped_request = False
+        effective_guidance = pipeline_route.apply_guidance
 
         if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
             try:
@@ -1611,6 +1676,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     schp_labels=mask_meta.get("schp_labels"),
                     garment_subtype=garment_subtype,
                     source_cloth_type=source_cloth_type,
+                    target_cloth_type=vton_type,
                     trace_id=trace_id,
                 )
                 best_candidate_score = cc_vresult.score
@@ -1625,6 +1691,24 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     cc_vresult.score, cc_vresult.face_quality, cc_vresult.garment_quality,
                     cc_vresult.identity_drift, cc_vresult.garment_replacement, trace_id,
                 )
+                debug.candidate_scores.append({
+                    "candidate": 0,
+                    "score": round(cc_vresult.score, 4),
+                    "face_quality": round(cc_vresult.face_quality, 4),
+                    "garment_quality": round(cc_vresult.garment_quality, 4),
+                    "identity_drift": round(cc_vresult.identity_drift, 2),
+                    "garment_replacement": round(cc_vresult.garment_replacement, 4),
+                    "sharpness": round(cc_vresult.sharpness, 2),
+                    "ssim": round(cc_vresult.ssim, 4),
+                    "region_edit": round(cc_vresult.region_edit, 4),
+                    "boundary_quality": round(cc_vresult.boundary_quality, 4),
+                    "pose_consistency": round(cc_vresult.pose_consistency, 4),
+                    "geometry_correctness": round(cc_vresult.geometry_correctness, 4),
+                    "leakage_penalty": round(cc_vresult.leakage_penalty, 4),
+                    "color_coherence": round(cc_vresult.color_coherence, 4),
+                    "passed": cc_vresult.passed,
+                    "failure_reasons": cc_vresult.failure_reasons[:5],
+                })
             except Exception as e:
                 logger.warning("cross_category_scoring_failed error=%s trace_id=%s", e, trace_id)
 
@@ -1634,21 +1718,17 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         )
     else:
         logger.info(
-            "cross_category_not_needed single_stage vton_type=%s trace_id=%s",
-            vton_type, trace_id,
+            "single_stage_routing route=%s vton_type=%s trace_id=%s",
+            pipeline_route.pipeline, vton_type, trace_id,
         )
 
     # ── Single-stage path ─────────────────────────────────────────────────
-    if not cross_category_needed:
+    if not pipeline_route.needs_erase:
         inference_start = time.perf_counter()
 
-        # Guidance/step tuning — use frontend preset if provided, else env default
-        effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
-        effective_steps = steps
-        draped_request = is_draped_garment(vton_type, garment_subtype)
-        if draped_request or vton_type in ("dresses", "full_body"):
-            effective_steps = max(steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
-            effective_guidance = max(effective_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
+        # Use pipeline route guidance/steps (family-aware)
+        effective_guidance = pipeline_route.apply_guidance
+        effective_steps = pipeline_route.apply_steps
         if garm_mean_all < 80.0:
             effective_guidance = GUIDANCE_SCALE * 1.15
             logger.info(
@@ -1693,6 +1773,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     crop_preserve_lower=True,
                     source_cloth_type=source_cloth_type,
                     trace_id=trace_id,
+                    alignment=alignment,
+                    garment_profile=garment_profile,
                 )
 
                 # Validate + score candidate
@@ -1710,6 +1792,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                         schp_labels=c_schp_labels,
                         garment_subtype=garment_subtype,
                         source_cloth_type=source_cloth_type,
+                        target_cloth_type=vton_type,
                         trace_id=trace_id,
                     )
                     logger.info(
@@ -1744,6 +1827,28 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 best_candidate_score = 0.0
             else:
                 raise RuntimeError("No candidates generated — inference produced no output")
+
+            # ── Populate debug candidate scores ──────────────────────────
+            for ci_idx, (_cr, _cro, _cm, cv) in enumerate(candidates):
+                if cv is not None:
+                    debug.candidate_scores.append({
+                        "candidate": ci_idx,
+                        "score": round(cv.score, 4),
+                        "face_quality": round(cv.face_quality, 4),
+                        "garment_quality": round(cv.garment_quality, 4),
+                        "identity_drift": round(cv.identity_drift, 2),
+                        "garment_replacement": round(cv.garment_replacement, 4),
+                        "sharpness": round(cv.sharpness, 2),
+                        "ssim": round(cv.ssim, 4),
+                        "region_edit": round(cv.region_edit, 4),
+                        "boundary_quality": round(cv.boundary_quality, 4),
+                        "pose_consistency": round(cv.pose_consistency, 4),
+                        "geometry_correctness": round(cv.geometry_correctness, 4),
+                        "leakage_penalty": round(cv.leakage_penalty, 4),
+                        "color_coherence": round(cv.color_coherence, 4),
+                        "passed": cv.passed,
+                        "failure_reasons": cv.failure_reasons[:5],
+                    })
 
             retry_count = retry_round
 
@@ -1783,6 +1888,21 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_start) * 1000
+
+    debug.timing_ms["inference_ms"] = inference_ms
+    debug.timing_ms["download_ms"] = download_ms
+
+    # ── Save complete debug artifacts ────────────────────────────────────
+    debug.raw_output = raw_output
+    debug.final_output = result
+    debug.inpaint_mask_np = mask_meta.get("inpaint_mask_np")
+    debug.protect_mask_np = mask_meta.get("protect_mask_np")
+    debug.final_mask_np = mask_meta.get("final_mask_np")
+    debug.warnings = input_warnings
+    try:
+        save_debug_artifacts_v2(debug, person_img, garment_img)
+    except Exception as exc:
+        logger.warning("debug_artifacts_save_failed error=%s trace_id=%s", exc, trace_id)
 
     # ── DEBUG SAVE: raw output before face restoration ─────────────────────
     _debug_dir = Path("/tmp/idm-vton-debug")
@@ -1861,6 +1981,14 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "candidate_count": candidate_count,
         "trace_id": trace_id,
         "warnings": input_warnings,
+        # Pipeline metadata
+        "pipeline_route": pipeline_route.pipeline if pipeline_route else "unknown",
+        "garment_family": garment_profile.family if garment_profile else "unknown",
+        "source_cloth_type": source_cloth_type,
+        "is_cross_category": pipeline_route.is_cross if pipeline_route else False,
+        "is_draped": pipeline_route.is_draped if pipeline_route else False,
+        "is_structured": pipeline_route.is_structured if pipeline_route else False,
+        "alignment_center_y": alignment.center_y_ratio if alignment else 0.5,
     }
 
 
@@ -1956,6 +2084,7 @@ def _startup_diagnostics():
             assert_binary_mask,
             validate_mask_coverage,
             detect_inference_failures,
+            build_garment_profile,
         )
         logger.info("STARTUP_DIAG: import mask_pipeline OK")
         return True

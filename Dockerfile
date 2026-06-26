@@ -296,6 +296,7 @@ PY
 
 COPY handler.py /workspace/handler.py
 COPY mask_pipeline.py /workspace/mask_pipeline.py
+COPY quality_validation.py /workspace/quality_validation.py
 COPY post_processing.py /workspace/post_processing.py
 COPY face_restoration.py /workspace/face_restoration.py
 
@@ -340,6 +341,12 @@ try:
     print(f"  detect_inference_failures: {callable(detect_inference_failures)}")
 except Exception as exc:
     raise RuntimeError(f"Failed to import mask_pipeline: {exc}") from exc
+
+try:
+    from quality_validation import score_candidate
+    print(f"import quality_validation OK — score_candidate: {callable(score_candidate)}")
+except Exception as exc:
+    raise RuntimeError(f"Failed to import quality_validation: {exc}") from exc
 
 print("Mask pipeline validation passed")
 PY

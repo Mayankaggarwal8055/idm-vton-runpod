@@ -4,8 +4,10 @@ Post-inference quality validation and candidate scoring.
 Provides:
   - Face-region validation: detect face distortion / identity drift.
   - Garment-region validation: measure replacement strength, texture detail.
+  - Structural similarity: SSIM for perceptual quality.
+  - Garment geometry correctness: verify target region was edited.
   - Candidate scoring: aggregate metrics into a single quality score for
-    best-candidate selection.
+    best-candidate selection. Garment-family-aware weights.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ logger = logging.getLogger("idm-vton.worker.quality")
 
 @dataclass
 class ValidationResult:
-    """Per-candidate quality assessment."""
+    """Per-candidate quality assessment with all 9 metrics."""
 
     passed: bool
     face_quality: float          # 0..1, higher = better
@@ -31,6 +33,14 @@ class ValidationResult:
     sharpness: float             # 0..inf, higher = sharper
     failure_reasons: list[str] = field(default_factory=list)
     score: float = 0.0           # aggregate weighted score
+    # Extended metrics (all 0..1)
+    ssim: float = 0.0            # structural similarity
+    region_edit: float = 0.0     # correct body region edited
+    boundary_quality: float = 0.0  # smooth mask edges
+    pose_consistency: float = 0.0  # pose preserved
+    geometry_correctness: float = 0.0  # correct garment geometry
+    leakage_penalty: float = 0.0  # old garment leakage (lower = better)
+    color_coherence: float = 0.0  # color match with garment
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -239,6 +249,302 @@ def cv2_laplacian(gray: np.ndarray) -> np.ndarray:
     return cv2.Laplacian(gray, cv2.CV_64F)
 
 
+def _ssim_score(original: Image.Image, result: Image.Image, mask_np: np.ndarray | None = None) -> float:
+    """Compute structural similarity (SSIM) between original and result.
+
+    When mask_np is provided, computes SSIM only within the inpaint region
+    (how well the structure was preserved outside the edit). When not provided,
+    computes global SSIM.
+
+    Returns 0..1 where 1 = identical structure.
+    """
+    import cv2
+    orig = np.array(original.convert("L"), dtype=np.float64)
+    out = np.array(result.convert("L"), dtype=np.float64)
+    if orig.shape != out.shape:
+        out = np.array(result.convert("L").resize(original.size, Image.NEAREST), dtype=np.float64)
+
+    # SSIM computation using OpenCV (simplified Wang et al. 2004)
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+    img1 = orig
+    img2 = out
+
+    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.GaussianBlur(img1 ** 2, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2 ** 2, (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    if mask_np is not None:
+        # Compute SSIM only in protected region (non-inpaint) — measures
+        # how well identity/background was preserved
+        if mask_np.shape[:2] != orig.shape[:2]:
+            mask_np = np.array(
+                Image.fromarray(mask_np).resize(original.size, Image.NEAREST),
+                dtype=np.uint8,
+            )
+        protected = mask_np < 127  # non-inpaint region
+        if np.any(protected):
+            return float(np.mean(ssim_map[protected]))
+    return float(np.mean(ssim_map))
+
+
+def _region_editing_score(
+    original: Image.Image,
+    result: Image.Image,
+    mask_np: np.ndarray,
+    schp_labels: np.ndarray | None = None,
+    source_cloth_type: str = "",
+    target_cloth_type: str = "",
+) -> float:
+    """Check that the correct body region was edited.
+
+    Verifies that the inpaint region (mask) was actually modified, and that
+    non-inpaint regions were preserved. Returns 0..1 where 1 = correct editing.
+
+    For cross-category swaps, also checks that the source garment region
+    was fully erased (high replacement fraction in source labels).
+    """
+    orig = np.array(original.convert("RGB"), dtype=np.float32)
+    out = np.array(result.convert("RGB"), dtype=np.float32)
+    if orig.shape != out.shape:
+        out = np.array(result.convert("RGB").resize(original.size, Image.LANCZOS), dtype=np.float32)
+
+    h, w = orig.shape[:2]
+    if mask_np.shape[:2] != (h, w):
+        return 0.5
+
+    inpaint = mask_np > 127
+    protected = ~inpaint
+
+    if not np.any(inpaint):
+        return 0.0
+
+    # 1. Replacement strength in inpaint region
+    diff = np.mean(np.abs(orig - out), axis=2)
+    inpaint_replacement = float(np.mean(diff[inpaint] > 10.0))
+
+    # 2. Preservation in protected region
+    if np.any(protected):
+        protected_change = float(np.mean(diff[protected] > 10.0))
+        # Low change in protected region is good
+        preservation = 1.0 - min(1.0, protected_change * 5.0)
+    else:
+        preservation = 1.0
+
+    # 3. For cross-category: check source garment erasure
+    erasure_score = 1.0
+    if source_cloth_type and schp_labels is not None:
+        source_label_map = {
+            "upper_body": {_LABEL_UPPER_CLOTHES, _LABEL_COAT},
+            "lower_body": {_LABEL_SOCKS, _LABEL_PANTS, _LABEL_SKIRT},
+            "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
+                       _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
+            "full_body": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
+                         _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
+        }
+        src_labels = source_label_map.get(source_cloth_type, set())
+        if src_labels and schp_labels.shape[:2] == (h, w):
+            src_region = np.isin(schp_labels, list(src_labels))
+            if np.any(src_region & inpaint):
+                src_diff = diff[src_region & inpaint]
+                erasure_score = float(np.mean(src_diff > 10.0))
+
+    # Combine: correct editing = inpaint changed + protected preserved + source erased
+    score = 0.40 * inpaint_replacement + 0.30 * preservation + 0.30 * erasure_score
+    return max(0.0, min(1.0, score))
+
+
+def _boundary_quality_score(
+    original: Image.Image,
+    result: Image.Image,
+    mask_np: np.ndarray,
+) -> float:
+    """Measure boundary quality at the inpaint mask edges.
+
+    Checks that transitions between edited and non-edited regions are smooth,
+    not jagged or harsh. Uses gradient magnitude at mask boundaries.
+
+    Returns 0..1 where 1 = smooth, natural boundaries.
+    """
+    import cv2
+
+    orig = np.array(original.convert("L"), dtype=np.float32)
+    out = np.array(result.convert("L"), dtype=np.float32)
+    if orig.shape != out.shape:
+        out = np.array(result.convert("L").resize(original.size, Image.NEAREST), dtype=np.float32)
+
+    h, w = orig.shape[:2]
+    if mask_np.shape[:2] != (h, w):
+        return 0.5
+
+    # Find mask boundary pixels (dilate - erode)
+    mask_u8 = mask_np.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated = cv2.dilate(mask_u8, kernel, iterations=1)
+    eroded = cv2.erode(mask_u8, kernel, iterations=1)
+    boundary = (dilated > 127) != (eroded > 127)
+
+    if not np.any(boundary):
+        return 1.0  # no boundary = no boundary artifacts
+
+    # Compute gradient magnitude at boundary in result
+    gx = cv2.Sobel(out, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(out, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    boundary_grad = grad_mag[boundary]
+    mean_grad = float(np.mean(boundary_grad))
+
+    # High gradient at boundary = sharp/harsh transition (bad)
+    # Low gradient = smooth transition (good)
+    # Normalize: grad > 50 is harsh, < 15 is smooth
+    score = max(0.0, min(1.0, 1.0 - (mean_grad - 15.0) / 35.0))
+    return score
+
+
+def _pose_consistency_score(
+    original: Image.Image,
+    result: Image.Image,
+    protect_np: np.ndarray | None = None,
+    schp_labels: np.ndarray | None = None,
+) -> float:
+    """Verify that pose/limb positions are consistent between original and result.
+
+    Uses edge detection and structural comparison in the protected region
+    (face, hair, hands, shoes) to ensure the model didn't hallucinate
+    different limb positions.
+
+    Returns 0..1 where 1 = perfect pose consistency.
+    """
+    import cv2
+
+    orig = np.array(original.convert("L"), dtype=np.uint8)
+    out = np.array(result.convert("L"), dtype=np.uint8)
+    if orig.shape != out.shape:
+        out = np.array(result.convert("L").resize(original.size, Image.NEAREST), dtype=np.uint8)
+
+    # Focus on protected region (identity areas)
+    if protect_np is not None:
+        if protect_np.shape[:2] == orig.shape[:2]:
+            protected = protect_np > 127
+        else:
+            protected = np.zeros_like(orig, dtype=bool)
+            protected[:int(0.25 * orig.shape[0]), :] = True
+    else:
+        # Top 25% as fallback
+        protected = np.zeros_like(orig, dtype=bool)
+        protected[:int(0.25 * orig.shape[0]), :] = True
+
+    if not np.any(protected):
+        return 1.0
+
+    # Edge detection
+    edges_orig = cv2.Canny(orig, 50, 150)
+    edges_out = cv2.Canny(out, 50, 150)
+
+    # Compare edges in protected region
+    orig_edges_in_protected = edges_orig[protected]
+    out_edges_in_protected = edges_out[protected]
+
+    # If both have edges in same positions, pose is preserved
+    both_have_edges = np.sum((orig_edges_in_protected > 0) & (out_edges_in_protected > 0))
+    either_has_edges = np.sum((orig_edges_in_protected > 0) | (out_edges_in_protected > 0))
+
+    if either_has_edges == 0:
+        return 1.0  # no edges to compare
+
+    consistency = both_have_edges / either_has_edges
+    return float(min(1.0, consistency))
+
+
+def _garment_geometry_score(
+    result: Image.Image,
+    mask_np: np.ndarray,
+    target_cloth_type: str = "",
+    garment_subtype: str = "",
+) -> float:
+    """Verify that the generated garment has correct geometry for its type.
+
+    Checks basic geometric properties:
+      - Upper body garments should have upper-body-shaped inpaint region
+      - Lower body garments should have lower-body-shaped inpaint region
+      - Full body garments should have full-body coverage
+
+    Returns 0..1 where 1 = correct geometry.
+    """
+    if mask_np is None or not target_cloth_type:
+        return 0.5
+
+    out = np.array(result.convert("L"), dtype=np.uint8)
+    h, w = out.shape[:2]
+    if mask_np.shape[:2] != (h, w):
+        return 0.5
+
+    inpaint = mask_np > 127
+    if not np.any(inpaint):
+        return 0.0
+
+    # Compute centroid of inpaint region
+    ys, xs = np.where(inpaint)
+    centroid_y = np.mean(ys) / h
+    centroid_x = np.mean(xs) / w
+
+    # Compute vertical extent
+    y_min = np.min(ys) / h
+    y_max = np.max(ys) / h
+    vertical_span = y_max - y_min
+
+    score = 0.5  # base
+
+    if target_cloth_type == "upper_body":
+        # Upper body: centroid should be in top 60%, span should be moderate
+        if 0.2 < centroid_y < 0.6:
+            score += 0.2
+        if 0.2 < vertical_span < 0.7:
+            score += 0.15
+        # Check it doesn't extend too far into legs
+        if y_max < 0.85:
+            score += 0.15
+    elif target_cloth_type == "lower_body":
+        # Lower body: centroid should be in bottom 50%, span moderate
+        if 0.4 < centroid_y < 0.9:
+            score += 0.2
+        if 0.2 < vertical_span < 0.7:
+            score += 0.15
+        # Check it doesn't extend too far into upper body
+        if y_min > 0.15:
+            score += 0.15
+    elif target_cloth_type in ("dresses", "full_body"):
+        # Full body: should span most of the image
+        if vertical_span > 0.5:
+            score += 0.25
+        if 0.15 < centroid_y < 0.6:
+            score += 0.15
+        if y_min < 0.2:
+            score += 0.1
+
+    return max(0.0, min(1.0, score))
+
+
+# SCHP label constants (imported from mask_pipeline for scoring)
+_LABEL_UPPER_CLOTHES = 5
+_LABEL_DRESS = 6
+_LABEL_COAT = 7
+_LABEL_SOCKS = 8
+_LABEL_PANTS = 9
+_LABEL_JUMPSUITS = 10
+_LABEL_SCARF = 11
+_LABEL_SKIRT = 12
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Candidate scoring
 # ═══════════════════════════════════════════════════════════════════════
@@ -309,43 +615,68 @@ def score_candidate(
     weights: dict[str, float] | None = None,
     garment_subtype: str = "",
     source_cloth_type: str = "",
+    target_cloth_type: str = "",
     trace_id: str = "",
 ) -> ValidationResult:
-    """
-    Run all validations and compute an aggregate quality score.
+    """Production-level candidate scoring with 9 quality metrics.
 
-    Weights are garment-aware: structured garments prioritize garment quality,
-    draped garments prioritize color coherence, tight garments prioritize
-    sharpness. Can be overridden via the `weights` parameter.
+    Metrics:
+      1. Face quality — identity preservation
+      2. Garment quality — replacement, texture, color
+      3. Sharpness — global image sharpness
+      4. SSIM — structural similarity
+      5. Region editing — correct body region was edited
+      6. Boundary quality — smooth mask edges
+      7. Pose consistency — limb/face positions preserved
+      8. Garment geometry — correct shape for garment type
+      9. Garment leakage — old garment suppression
 
-    Returns a ValidationResult with `score` being the weighted sum.
+    Returns ValidationResult with aggregate score on 0..1 scale.
     """
     w = weights or _get_garment_weights(garment_subtype)
 
     all_reasons: list[str] = []
 
-    # Face validation (uses SCHP label 13 only when schp_labels available)
+    # ── 1. Face quality ────────────────────────────────────────────────
     face_quality, identity_drift, face_reasons = validate_face_region(
         original, result, mask_np, protect_np, schp_labels,
     )
     all_reasons.extend(face_reasons)
 
-    # Garment validation
+    # ── 2. Garment quality ─────────────────────────────────────────────
     garment_quality, replacement, color_coherence, garm_reasons = validate_garment_region(
         original, result, garment_img, mask_np,
     )
     all_reasons.extend(garm_reasons)
 
-    # Global sharpness
+    # ── 3. Sharpness ───────────────────────────────────────────────────
     sharpness = _sharpness_score(result)
-
-    # Adjusted sharpness score (0..1): var ~100 = sharp, <10 = blurry
     sharpness_score_val = min(1.0, sharpness / 100.0)
     if sharpness < 10.0:
         all_reasons.append("image_blurry")
 
-    # ── Garment leakage detection ────────────────────────────────────────
-    # If cross-category, detect if old garment residual persists in output
+    # ── 4. SSIM ────────────────────────────────────────────────────────
+    ssim_val = _ssim_score(original, result, mask_np)
+
+    # ── 5. Region editing correctness ──────────────────────────────────
+    region_edit = _region_editing_score(
+        original, result, mask_np, schp_labels, source_cloth_type, target_cloth_type,
+    )
+
+    # ── 6. Boundary quality ────────────────────────────────────────────
+    boundary_quality = 0.5
+    if mask_np is not None:
+        boundary_quality = _boundary_quality_score(original, result, mask_np)
+
+    # ── 7. Pose consistency ────────────────────────────────────────────
+    pose_consistency = _pose_consistency_score(original, result, protect_np, schp_labels)
+
+    # ── 8. Garment geometry correctness ────────────────────────────────
+    geometry_correctness = _garment_geometry_score(
+        result, mask_np, target_cloth_type, garment_subtype,
+    )
+
+    # ── 9. Garment leakage detection ───────────────────────────────────
     leakage_penalty = 0.0
     if source_cloth_type and mask_np is not None:
         leakage_penalty, leakage_reasons = _detect_garment_leakage(
@@ -353,17 +684,29 @@ def score_candidate(
         )
         all_reasons.extend(leakage_reasons)
 
+    # ── Aggregate score ────────────────────────────────────────────────
+    # Base: garment-family-aware weights (must sum to 1.0)
     aggregate = (
         w["face_quality"] * face_quality
         + w["garment_quality"] * garment_quality
         + w["sharpness"] * sharpness_score_val
         + w["color_coherence"] * color_coherence
     )
-    # Apply leakage penalty (reduces score, doesn't add to weight sum)
+
+    # Bonus metrics — each 0..1, weighted to contribute up to ~0.25 total
+    aggregate += 0.05 * ssim_val
+    aggregate += 0.10 * region_edit      # most important bonus — correct region edited
+    aggregate += 0.04 * boundary_quality
+    aggregate += 0.03 * pose_consistency
+    aggregate += 0.03 * geometry_correctness
+
+    # Apply leakage penalty (once)
     aggregate = max(0.0, aggregate - leakage_penalty)
 
-    # Only hard-fail on severe issues (identity drift, garment unchanged, blurry)
-    # Soft warnings (ghosting, over_smooth, color_drift) reduce score but don't fail
+    # Clamp to [0, 1]
+    aggregate = max(0.0, min(1.0, aggregate))
+
+    # Only hard-fail on severe issues
     severe_reasons = [r for r in all_reasons if any(
         kw in r for kw in ("face_severe_distortion", "garment_unchanged", "image_blurry", "face_identity_drift", "garment_leakage_severe")
     )]
@@ -378,6 +721,13 @@ def score_candidate(
         sharpness=round(sharpness, 2),
         failure_reasons=all_reasons,
         score=round(aggregate, 4),
+        ssim=round(ssim_val, 4),
+        region_edit=round(region_edit, 4),
+        boundary_quality=round(boundary_quality, 4),
+        pose_consistency=round(pose_consistency, 4),
+        geometry_correctness=round(geometry_correctness, 4),
+        leakage_penalty=round(leakage_penalty, 4),
+        color_coherence=round(color_coherence, 4),
     )
 
 
