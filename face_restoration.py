@@ -187,8 +187,8 @@ def _apply_gfpgan(face_rgb: np.ndarray, trace_id: str) -> np.ndarray | None:
         cropped, restored, _ = _restoration_model.enhance(
             face_bgr, has_aligned=False, only_center_face=True, paste_back=False,
         )
-        if restored is not None:
-            return cv2.cvtColor(restored, cv2.COLOR_BGR2RGB)
+        if restored and len(restored) > 0:
+            return cv2.cvtColor(restored[0], cv2.COLOR_BGR2RGB)
     except Exception as exc:
         logger.warning("gfpgan_enhance_failed error=%s trace_id=%s", exc, trace_id)
     return None

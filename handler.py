@@ -1368,6 +1368,29 @@ def run_idm_vton_inference(
                 )
             )
             garm_silhouette_mask = (garm_silhouette_mask > 127).astype(np.uint8) * 255
+
+        # BACKGROUND LEAKAGE GUARD:
+        # Erode silhouette to shrink it away from background boundaries.
+        # Then AND with SCHP body mask so only body-region pixels are included.
+        h_s, w_s = garm_silhouette_mask.shape[:2]
+        erode_ks = max(3, int(min(h_s, w_s) * 0.01))  # ~1% of smallest dimension
+        if erode_ks % 2 == 0:
+            erode_ks += 1
+        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_ks, erode_ks))
+        garm_silhouette_mask = cv2.erode(garm_silhouette_mask, erode_kernel, iterations=1)
+
+        # AND with SCHP body mask: only include pixels that SCHP labels as body
+        _body_labels = {4, 5, 6, 7, 12, 13, 14, 15, 16, 17}  # garment + limb labels
+        _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
+        if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
+            _schp_body = np.array(
+                Image.fromarray(_schp_body).resize(
+                    (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                )
+            )
+            _schp_body = (_schp_body > 127).astype(np.uint8) * 255
+        garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
+
         # Add garment silhouette to inpaint mask
         enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
         # Re-apply protection so identity is never overwritten
@@ -1449,8 +1472,28 @@ def run_idm_vton_inference(
 
     mask = final_mask
 
+    # Apply feathered edges for smoother blending at mask boundaries.
+    # This converts the binary mask to a soft gradient mask (0.0-1.0)
+    # that the diffusion model uses to blend inpainted and original pixels.
+    # Applied AFTER all binary safety checks, right before inference.
+    try:
+        from mask_pipeline import feather_mask_edges
+        mask_np_final = np.array(final_mask, dtype=np.uint8)
+        soft_mask = feather_mask_edges(mask_np_final, feather_px=4)
+        # Convert float [0,1] to PIL image with values [0,255]
+        soft_mask_pil = Image.fromarray((soft_mask * 255).astype(np.uint8), mode="L")
+        if soft_mask_pil.size != TARGET_SIZE:
+            soft_mask_pil = soft_mask_pil.resize(TARGET_SIZE, Image.LANCZOS)
+        mask = soft_mask_pil
+        logger.info(
+            "feathered_mask_applied feather_px=4 trace_id=%s", trace_id,
+        )
+    except Exception as exc:
+        logger.warning("feathered_mask_failed_fallback_to_binary error=%s", exc)
+        mask = final_mask
+
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
-    human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
+    human_img_arg = _apply_exif_orientation(human_img.resize(TARGET_SIZE, Image.LANCZOS))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
     with torch.no_grad():
@@ -1476,7 +1519,7 @@ def run_idm_vton_inference(
             gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
             pose_img = vis.visualize(gray_img, data)
             pose_img = pose_img[:, :, ::-1]
-            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE, Image.NEAREST)
+            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE, Image.LANCZOS)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
@@ -1568,7 +1611,7 @@ def run_idm_vton_inference(
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
         final_img = human_img_orig.copy()
-        final_img.paste(out_img, (int(left), int(top)))
+        final_img.paste(out_img, (round(left), round(top)))
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta
@@ -1902,8 +1945,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         # Use pipeline route guidance/steps (family-aware)
         effective_guidance = pipeline_route.apply_guidance
         effective_steps = pipeline_route.apply_steps
-        if garm_mean_all < 80.0:
-            effective_guidance *= 1.15
+        if garm_mean_all < 60.0:
+            effective_guidance *= 1.10
             logger.info(
                 "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
                 "boosting_guidance from %.1f to %.1f",

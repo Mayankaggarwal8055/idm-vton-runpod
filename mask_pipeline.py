@@ -1683,6 +1683,47 @@ def build_schp_inpaint_mask(
             arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
             mask = np.maximum(mask, arm_mask)
 
+        # Garment geometry expansion: if the target garment extends beyond
+        # the source shape (e.g. short sleeve → long sleeve, cropped → long),
+        # expand the mask to include adjacent body regions.
+        geo = get_garment_geometry(garment_subtype)
+        h, w = schp_labels.shape
+        if geo.expansion_down > 0 or geo.expansion_up > 0 or geo.expansion_width > 0:
+            # Find the bounding box of the current mask
+            mask_ys, mask_xs = np.where(mask > 127)
+            if len(mask_ys) > 0:
+                y_min, y_max = int(mask_ys.min()), int(mask_ys.max())
+                x_min, x_max = int(mask_xs.min()), int(mask_xs.max())
+
+                # Expand vertically
+                y_min_exp = max(0, y_min - geo.expansion_up)
+                y_max_exp = min(h, y_max + geo.expansion_down)
+
+                # Expand horizontally
+                x_min_exp = max(0, x_min - geo.expansion_width)
+                x_max_exp = min(w, x_max + geo.expansion_width)
+
+                # Create expansion zone: pixels in expanded bbox that are
+                # body labels (not background, not identity) and not already masked
+                expansion_zone = np.zeros_like(mask)
+                expansion_zone[y_min_exp:y_max_exp, x_min_exp:x_max_exp] = 255
+
+                # Only include body-region pixels in the expansion
+                body_labels = set(range(4, 19)) - _IDENTITY_PROTECT_LABELS
+                body_mask = np.isin(schp_labels, list(body_labels)).astype(np.uint8) * 255
+                expansion_body = np.minimum(expansion_zone, body_mask)
+
+                # Add expansion to mask, but only where source wasn't already covering
+                mask = np.maximum(mask, expansion_body)
+
+                if np.any(expansion_body > 127):
+                    logger.info(
+                        "garment_geometry_expansion subtype=%s down=%d up=%d width=%d "
+                        "expanded_px=%d",
+                        garment_subtype, geo.expansion_down, geo.expansion_up,
+                        geo.expansion_width, int(np.sum(expansion_body > 127)),
+                    )
+
     # Always exclude identity labels from the inpaint mask
     identity_mask = np.isin(schp_labels, list(_IDENTITY_PROTECT_LABELS)).astype(np.uint8) * 255
     mask = np.where(identity_mask > 0, 0, mask).astype(np.uint8)
@@ -1694,7 +1735,7 @@ def build_schp_protect_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
     garment_subtype: str = "",
-    dilate_px: int = 13,
+    dilate_px: int = 7,
     profile: "GarmentProfile | None" = None,
 ) -> np.ndarray:
     """Build binary protect mask using GarmentProfile.
@@ -1731,7 +1772,7 @@ def build_schp_protect_mask(
     # else: sleeveless garment — arms NOT protected
 
     if profile.is_draped:
-        dilate_px = max(11, dilate_px - 2)
+        dilate_px = max(5, dilate_px - 2)
 
     mask = _dilate_mask(mask, dilate_px, iterations=1)
     return mask
@@ -1867,6 +1908,43 @@ def apply_protection_binary(inpaint_mask: np.ndarray, protect_mask: np.ndarray) 
     prot = (protect_mask > 127).astype(np.int16)
     result = np.clip(inp - prot, 0, 1).astype(np.uint8) * 255
     assert_binary_mask(result, "final_mask (post apply_protection_binary)")
+    return result
+
+
+def feather_mask_edges(binary_mask: np.ndarray, feather_px: int = 4) -> np.ndarray:
+    """Create a soft gradient at mask boundaries for smoother blending.
+
+    Takes a binary mask (0/255) and produces a float mask (0.0-1.0) with
+    a Gaussian feather at the transition zone. The interior stays 1.0,
+    the exterior stays 0.0, and the boundary gets a smooth gradient.
+
+    This is applied AFTER all binary safety checks, just before passing
+    the mask to the diffusion model. The diffusion model uses this soft
+    mask to blend inpainted and original pixels at the boundary.
+
+    Args:
+        binary_mask: uint8 array with values 0 or 255.
+        feather_px: Half-width of the feather zone in pixels.
+
+    Returns:
+        float32 array with values in [0.0, 1.0].
+    """
+    if feather_px < 1:
+        return (binary_mask > 127).astype(np.float32)
+
+    binary = (binary_mask > 127).astype(np.float32)
+
+    # Gaussian blur creates natural feathering at mask boundaries.
+    # The sigma is chosen so the blur radius ≈ feather_px pixels.
+    sigma = feather_px / 2.0
+    ks = max(3, int(feather_px * 2 + 1))
+    if ks % 2 == 0:
+        ks += 1
+
+    blurred = cv2.GaussianBlur(binary, (ks, ks), sigma)
+
+    # Clamp to [0, 1] — Gaussian can produce slight overshoot
+    result = np.clip(blurred, 0.0, 1.0).astype(np.float32)
     return result
 
 

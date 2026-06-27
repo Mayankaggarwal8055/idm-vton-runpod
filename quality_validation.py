@@ -63,7 +63,7 @@ def validate_face_region(
       - identity_drift = mean pixel diff in face zone (0 = identical)
       - failure_reasons = list of issues found
 
-    When schp_labels is available, uses only SCHP label 13 (FACE) to
+    When schp_labels is available, uses only SCHP label 11 (FACE) to
     define the face zone — excludes hair/glasses/shoes from identity
     measurement. Falls back to protect_np, then top 25% of image.
     """
@@ -78,8 +78,8 @@ def validate_face_region(
     h = orig.shape[0]
     reasons: list[str] = []
 
-    # ── Face zone: SCHP label 13 (FACE) only when available —────────────
-    #    Using label 13 isolates face pixels from hair/sunglasses which
+    # ── Face zone: SCHP label 11 (FACE) only when available —────────────
+    #    Using label 11 isolates face pixels from hair/sunglasses which
     #    change naturally without indicating identity drift.
     face_mask = np.zeros(orig.shape[:2], dtype=bool)
     if schp_labels is not None:
@@ -92,7 +92,7 @@ def validate_face_region(
             )
         else:
             schp_resized = schp_labels.astype(np.int32)
-        face_mask = schp_resized == 13  # SCHP FACE label only
+        face_mask = schp_resized == 11  # SCHP FACE label = 11
     elif protect_np is not None:
         if protect_np.shape[:2] != orig.shape[:2]:
             protect_np = np.array(
@@ -115,8 +115,8 @@ def validate_face_region(
         face_diff = float(np.mean(np.abs(orig[:top_zone, :] - out[:top_zone, :])))
     identity_drift = face_diff
 
-    # Normalize to quality score: 30.0 pixel diff = 0.0 quality
-    face_quality = max(0.0, min(1.0, 1.0 - identity_drift / 30.0))
+    # Normalize to quality score: 40.0 pixel diff = 0.0 quality (softer than 30.0)
+    face_quality = max(0.0, min(1.0, 1.0 - identity_drift / 40.0))
 
     if identity_drift > 20.0:
         reasons.append(f"face_identity_drift:{identity_drift:.1f}")
@@ -195,7 +195,7 @@ def validate_garment_region(
 
     if replacement < 0.20:
         reasons.append(f"garment_ghosting:{replacement:.2f}")
-    if replacement < 0.05:
+    if replacement < 0.03:
         reasons.append("garment_unchanged")
 
     # ── 2. Texture detail (local contrast in garment region) ─────────────
@@ -203,12 +203,13 @@ def validate_garment_region(
     if np.any(inpaint_region):
         garm_gray = gray_out[inpaint_region]
         texture_var = float(np.var(garm_gray))
-        # Normalise: variance of 2000+ = detailed, <500 = smooth/plastic
+        # Normalise: variance of 2000+ = detailed, <800 = smooth/plastic
+        # (raised from 500 to avoid rejecting naturally smooth fabrics like silk/satin)
         texture_detail = min(1.0, texture_var / 2000.0)
     else:
         texture_detail = 0.5
 
-    if texture_detail < 0.2:
+    if texture_detail < 0.15:
         reasons.append("garment_over_smooth")
 
     # ── 3. Colour coherence with input garment (mask region only) ───────
@@ -220,7 +221,7 @@ def validate_garment_region(
         color_diff = float(np.linalg.norm(garm_mean - out_mean))
     else:
         color_diff = 0.0
-    color_coherence = max(0.0, min(1.0, 1.0 - color_diff / 150.0))
+    color_coherence = max(0.0, min(1.0, 1.0 - color_diff / 200.0))
 
     if color_coherence < 0.4:
         reasons.append(f"garment_color_drift:{color_diff:.0f}")
@@ -770,14 +771,16 @@ def _detect_garment_leakage(
 
     # High correlation = old garment leaked (colors are too similar)
     # Tiered penalties (mutually exclusive)
-    if hist_similarity > 0.92:
+    # Raised thresholds from 0.92/0.85/0.75 to reduce false positives
+    # for same-color garment replacements (e.g. navy replacing blue)
+    if hist_similarity > 0.96:
         penalty += 0.15
         reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
         reasons.append("garment_leakage_severe")
-    elif hist_similarity > 0.85:
-        penalty += 0.10
+    elif hist_similarity > 0.92:
+        penalty += 0.08
         reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
-    elif hist_similarity > 0.75:
+    elif hist_similarity > 0.88:
         penalty += 0.03
 
     # Check for duplicate garment regions (repeated pattern = hallucination)
