@@ -297,7 +297,7 @@ def _set_torch_perf_flags():
 
 
 def _center_canvas_resize(img: Image.Image, target_size: tuple[int, int]) -> Image.Image:
-    """Resize image to fit target_size while preserving aspect ratio, centered on white canvas."""
+    """Resize image to fit target_size while preserving aspect ratio, centered on mid-gray canvas."""
     tw, th = target_size
     if img.size == target_size:
         return img.convert("RGB")
@@ -306,7 +306,8 @@ def _center_canvas_resize(img: Image.Image, target_size: tuple[int, int]) -> Ima
     nw = max(1, int(iw * scale))
     nh = max(1, int(ih * scale))
     resized = img.resize((nw, nh), Image.LANCZOS)
-    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    # mid-gray (128) matches the preprocessing service.
+    canvas = Image.new("RGB", target_size, (128, 128, 128))
     canvas.paste(resized, ((tw - nw) // 2, (th - nh) // 2))
     return canvas
 
@@ -319,7 +320,7 @@ def _center_canvas_resize(img: Image.Image, target_size: tuple[int, int]) -> Ima
 def _generate_neutral_garment(target_size: tuple[int, int] = TARGET_SIZE) -> Image.Image:
     """Generate a plain neutral undergarment reference image for erase stage.
 
-    Creates a simple beige/cream tank top + shorts silhouette on white canvas
+    Creates a simple beige/cream tank top + shorts silhouette on mid-gray canvas
     using only PIL primitives.  The image is deliberately low-detail — the
     IP-Adapter receives a colour-and-shape reference with no texture, so the
     text prompt (high guidance) dominates the erase generation.
@@ -333,7 +334,7 @@ def _generate_neutral_garment(target_size: tuple[int, int] = TARGET_SIZE) -> Ima
     w, h = target_size
     cx = w // 2  # 384
 
-    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    canvas = Image.new("RGB", target_size, (128, 128, 128))
     pixels = canvas.load()
 
     # Neutral beige/cream — visually reads as "plain undergarment"
@@ -1273,8 +1274,8 @@ def run_idm_vton_inference(
     already_target = human_img_orig.size == TARGET_SIZE
 
     if auto_crop and not already_target:
-        target_width = int(min(width, height * (TARGET_W / TARGET_H)))
         target_height = int(min(height, width * (TARGET_H / TARGET_W)))
+        target_width = round(target_height * TARGET_W / TARGET_H)
 
         # Determine crop anchor based on cloth_type:
         #   - lower_body / dresses: BOTTOM-anchored to preserve legs/feet
@@ -1318,7 +1319,6 @@ def run_idm_vton_inference(
         human_img = human_img_orig.resize(TARGET_SIZE)
 
     # SCHP is the single authoritative mask source.
-    keypoints = openpose_model(human_img.resize((384, 512)))
     # SCHP at full TARGET_SIZE resolution so mask boundaries are native-res,
     # not interpolated from 384x512. The ONNX models internally affine-warp
     # to 512x512, so the compute cost is identical — only the output label
@@ -1356,8 +1356,9 @@ def run_idm_vton_inference(
     # covers the garment's actual shape, not just the body region.
     try:
         garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
-        # Canvas is mid-gray (128,128,128) — foreground deviates from gray
-        garm_silhouette = ~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 40, axis=2)
+        # Canvas is mid-gray (128,128,128) — foreground deviates from gray.
+        # Tight threshold (20) prevents gray garments from being misclassified.
+        garm_silhouette = ~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 20, axis=2)
         garm_silhouette_mask = garm_silhouette.astype(np.uint8) * 255
         # Resize to match mask dimensions
         if garm_silhouette_mask.shape[:2] != inpaint_mask_np.shape[:2]:
@@ -1386,7 +1387,7 @@ def run_idm_vton_inference(
     try:
         if _p0_probe is not None:
             _garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
-            _garm_sil = (~np.all(np.abs(_garm_arr.astype(np.int16) - 128) < 40, axis=2)).astype(np.uint8) * 255
+            _garm_sil = (~np.all(np.abs(_garm_arr.astype(np.int16) - 128) < 20, axis=2)).astype(np.uint8) * 255
             _p0_probe.record_mask_silhouette_iou(final_mask_np, _garm_sil)
     except Exception:
         pass
@@ -1475,7 +1476,7 @@ def run_idm_vton_inference(
             gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
             pose_img = vis.visualize(gray_img, data)
             pose_img = pose_img[:, :, ::-1]
-            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
+            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE, Image.NEAREST)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
@@ -1565,7 +1566,7 @@ def run_idm_vton_inference(
     raw_output = images[0].copy()
 
     if auto_crop and crop_size is not None:
-        out_img = images[0].resize(crop_size)
+        out_img = images[0].resize(crop_size, Image.LANCZOS)
         final_img = human_img_orig.copy()
         final_img.paste(out_img, (int(left), int(top)))
         return final_img, raw_output, mask_meta
@@ -1696,7 +1697,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # monitoring — severe cases could be addressed by fallback.
     # Background is mid-gray (128,128,128) — foreground deviates from gray.
     garm_check = np.array(garment_img.convert("RGB"), dtype=np.uint8)
-    is_bg = np.all(np.abs(garm_check.astype(np.int16) - 128) < 40, axis=2)
+    is_bg = np.all(np.abs(garm_check.astype(np.int16) - 128) < 20, axis=2)
     garm_foreground_ratio = float(np.mean(~is_bg))
     logger.info(
         "garment_foreground_ratio=%.3f cloth_type=%s trace_id=%s",
@@ -1902,12 +1903,12 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         effective_guidance = pipeline_route.apply_guidance
         effective_steps = pipeline_route.apply_steps
         if garm_mean_all < 80.0:
-            effective_guidance = GUIDANCE_SCALE * 1.15
+            effective_guidance *= 1.15
             logger.info(
                 "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
-                "increasing_guidance from %.1f to %.1f",
+                "boosting_guidance from %.1f to %.1f",
                 garm_mean_r, garm_mean_g, garm_mean_b,
-                GUIDANCE_SCALE, effective_guidance,
+                pipeline_route.apply_guidance, effective_guidance,
             )
 
         min_candidate_score = CANDIDATE_MIN_SCORE
@@ -2096,7 +2097,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     _debug_garm_arr = np.array(garment_img.convert("RGB"), dtype=np.uint8) if garment_img is not None else None
     if _debug_garm_arr is not None:
         debug.garment_silhouette_np = (
-            ~np.all(np.abs(_debug_garm_arr.astype(np.int16) - 128) < 40, axis=2)
+            ~np.all(np.abs(_debug_garm_arr.astype(np.int16) - 128) < 20, axis=2)
         ).astype(np.uint8) * 255
     if vresult is not None:
         debug.quality_metrics = {

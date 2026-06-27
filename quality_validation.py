@@ -226,7 +226,9 @@ def validate_garment_region(
         reasons.append(f"garment_color_drift:{color_diff:.0f}")
 
     # ── Aggregate garment quality ───────────────────────────────────────
-    garment_quality = 0.35 * replacement + 0.35 * texture_detail + 0.30 * color_coherence
+    # NOTE: color_coherence is counted separately in the aggregate score
+    # (line 693), so it must not be included here to avoid double-counting.
+    garment_quality = 0.50 * replacement + 0.50 * texture_detail
 
     return garment_quality, replacement, color_coherence, reasons
 
@@ -343,12 +345,12 @@ def _region_editing_score(
     erasure_score = 1.0
     if source_cloth_type and schp_labels is not None:
         source_label_map = {
-            "upper_body": {_LABEL_UPPER_CLOTHES, _LABEL_COAT},
-            "lower_body": {_LABEL_SOCKS, _LABEL_PANTS, _LABEL_SKIRT},
-            "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
-                       _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
-            "full_body": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
-                         _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF},
+            "upper_body": {_LABEL_UPPER_CLOTHES},
+            "lower_body": {_LABEL_PANTS, _LABEL_SKIRT},
+            "dresses": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS,
+                       _LABEL_PANTS, _LABEL_SKIRT, _LABEL_SCARF},
+            "full_body": {_LABEL_UPPER_CLOTHES, _LABEL_DRESS,
+                          _LABEL_PANTS, _LABEL_SKIRT, _LABEL_SCARF},
         }
         src_labels = source_label_map.get(source_cloth_type, set())
         if src_labels and schp_labels.shape[:2] == (h, w):
@@ -534,15 +536,12 @@ def _garment_geometry_score(
     return max(0.0, min(1.0, score))
 
 
-# SCHP label constants (imported from mask_pipeline for scoring)
-_LABEL_UPPER_CLOTHES = 5
-_LABEL_DRESS = 6
-_LABEL_COAT = 7
-_LABEL_SOCKS = 8
-_LABEL_PANTS = 9
-_LABEL_JUMPSUITS = 10
-_LABEL_SCARF = 11
-_LABEL_SKIRT = 12
+# SCHP LIP label constants (must match mask_pipeline.py)
+_LABEL_UPPER_CLOTHES = 4
+_LABEL_DRESS = 7
+_LABEL_PANTS = 6
+_LABEL_SKIRT = 5
+_LABEL_SCARF = 17
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -770,26 +769,20 @@ def _detect_garment_leakage(
     hist_similarity = float(cv2.compareHist(orig_hist, out_hist, cv2.HISTCMP_CORREL))
 
     # High correlation = old garment leaked (colors are too similar)
-    if hist_similarity > 0.85:
+    # Tiered penalties (mutually exclusive)
+    if hist_similarity > 0.92:
+        penalty += 0.15
+        reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
+        reasons.append("garment_leakage_severe")
+    elif hist_similarity > 0.85:
         penalty += 0.10
         reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
-    if hist_similarity > 0.92:
-        penalty += 0.05
-        reasons.append("garment_leakage_severe")
     elif hist_similarity > 0.75:
-        # Mild penalty for moderate similarity
         penalty += 0.03
 
     # Check for duplicate garment regions (repeated pattern = hallucination)
-    if schp_labels is not None:
-        # Count connected components of garment label in output
-        # If more than 2x the number in original, likely duplicated
-        orig_garment_px = int(np.sum(np.isin(schp_labels, [5, 6, 7])))
-        if orig_garment_px > 0:
-            # Simple heuristic: check if garment region expanded significantly
-            out_garment_area = int(np.sum(inpaint))
-            if out_garment_area > orig_garment_px * 2.5:
-                penalty += 0.05
-                reasons.append("garment_region_duplicated")
+    # NOTE: Original check compared inpaint mask area vs garment pixel count,
+    # which are fundamentally incomparable. Removed until proper output-SCHP
+    # comparison is implemented.
 
     return penalty, reasons

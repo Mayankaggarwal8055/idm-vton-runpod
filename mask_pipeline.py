@@ -35,41 +35,40 @@ from PIL import Image
 
 logger = logging.getLogger("idm-vton.worker.mask")
 
-# SCHP 20-class ATR label constants
+# SCHP LIP 20-class label constants — must match the actual ONNX model output.
+# Verified against parsing_api.py: label 4=upper_clothes, 7=dress, 11=face, 14/15=arms.
 _LABEL_BG = 0
 _LABEL_HAT = 1
 _LABEL_HAIR = 2
-_LABEL_GLOVE = 3
-_LABEL_SUNGLASSES = 4
-_LABEL_UPPER_CLOTHES = 5
-_LABEL_DRESS = 6
-_LABEL_COAT = 7
-_LABEL_SOCKS = 8
-_LABEL_PANTS = 9
-_LABEL_JUMPSUITS = 10
-_LABEL_SCARF = 11
-_LABEL_SKIRT = 12
-_LABEL_FACE = 13
+_LABEL_SUNGLASSES = 3
+_LABEL_UPPER_CLOTHES = 4
+_LABEL_SKIRT = 5
+_LABEL_PANTS = 6
+_LABEL_DRESS = 7
+_LABEL_BELT = 8
+_LABEL_LEFT_SHOE = 9
+_LABEL_RIGHT_SHOE = 10
+_LABEL_FACE = 11
+_LABEL_LEFT_LEG = 12
+_LABEL_RIGHT_LEG = 13
 _LABEL_LEFT_ARM = 14
 _LABEL_RIGHT_ARM = 15
-_LABEL_LEFT_LEG = 16
-_LABEL_RIGHT_LEG = 17
-_LABEL_LEFT_SHOE = 18
-_LABEL_RIGHT_SHOE = 19
+_LABEL_BAG = 16
+_LABEL_SCARF = 17
+_LABEL_NECK = 18
 
-# Clothing label sets per cloth_type
+# Clothing label sets per cloth_type — using corrected LIP label values.
+# LIP: 4=upper_clothes, 5=skirt, 6=pants, 7=dress
 _DRESSES_LABELS = {
     _LABEL_UPPER_CLOTHES,
     _LABEL_DRESS,
-    _LABEL_COAT,
     _LABEL_PANTS,
-    _LABEL_JUMPSUITS,
     _LABEL_SKIRT,
     _LABEL_SCARF,
 }
 _CLOTHING_LABELS = {
-    "upper_body": {_LABEL_UPPER_CLOTHES, _LABEL_COAT},
-    "lower_body": {_LABEL_SOCKS, _LABEL_PANTS, _LABEL_SKIRT},
+    "upper_body": {_LABEL_UPPER_CLOTHES},
+    "lower_body": {_LABEL_PANTS, _LABEL_SKIRT},
     "dresses": _DRESSES_LABELS,
     "full_body": _DRESSES_LABELS,
 }
@@ -80,22 +79,23 @@ _CLOTHING_LABELS = {
 _ALL_GARMENT_LABELS = {
     _LABEL_UPPER_CLOTHES,
     _LABEL_DRESS,
-    _LABEL_COAT,
-    _LABEL_SOCKS,
     _LABEL_PANTS,
-    _LABEL_JUMPSUITS,
-    _LABEL_SCARF,
     _LABEL_SKIRT,
+    _LABEL_SCARF,
+    _LABEL_BELT,
+    _LABEL_BAG,
 }
 
+# Identity labels that must never be edited — face, hair, accessories, shoes.
 _IDENTITY_PROTECT_LABELS = {
     _LABEL_HAIR,
     _LABEL_FACE,
     _LABEL_HAT,
-    _LABEL_GLOVE,
     _LABEL_SUNGLASSES,
     _LABEL_LEFT_SHOE,
     _LABEL_RIGHT_SHOE,
+    _LABEL_NECK,
+    _LABEL_BELT,
 }
 
 _DRAPE_ARM_LABELS = (_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM)
@@ -259,23 +259,19 @@ def get_garment_geometry(garment_subtype: str) -> GarmentGeometry:
 EDITABLE_BODY_REGIONS: dict[str, set[int]] = {
     "upper_body": {
         _LABEL_UPPER_CLOTHES,
-        _LABEL_COAT,
         _LABEL_LEFT_ARM,
         _LABEL_RIGHT_ARM,
     },
     "lower_body": {
         _LABEL_PANTS,
         _LABEL_SKIRT,
-        _LABEL_SOCKS,
         _LABEL_LEFT_LEG,
         _LABEL_RIGHT_LEG,
     },
     "dresses": {
         _LABEL_UPPER_CLOTHES,
         _LABEL_DRESS,
-        _LABEL_COAT,
         _LABEL_PANTS,
-        _LABEL_JUMPSUITS,
         _LABEL_SKIRT,
         _LABEL_SCARF,
         _LABEL_LEFT_ARM,
@@ -286,9 +282,7 @@ EDITABLE_BODY_REGIONS: dict[str, set[int]] = {
     "full_body": {
         _LABEL_UPPER_CLOTHES,
         _LABEL_DRESS,
-        _LABEL_COAT,
         _LABEL_PANTS,
-        _LABEL_JUMPSUITS,
         _LABEL_SKIRT,
         _LABEL_SCARF,
         _LABEL_LEFT_ARM,
@@ -1067,6 +1061,7 @@ def compute_garment_alignment(
     h, w = arr.shape[:2]
 
     # Find garment foreground (non-white region)
+    # Raw garment images have white (255) backgrounds — use white threshold.
     is_white = np.all(arr > 240, axis=2)
     fg = (~is_white).astype(np.uint8) * 255
 
@@ -1098,18 +1093,20 @@ def compute_garment_alignment(
         # Standard upper: garment in upper half
         center_y_ratio = 0.45
 
-    # Scale factor: garment bbox should fill ~70% of target canvas
+    # Scale factor: garment bbox should fill ~70% of target canvas.
+    # Use uniform scaling to preserve garment aspect ratio.
     target_fill = 0.70
     scale_x = (w * target_fill) / max(cw, 1)
     scale_y = (h * target_fill) / max(ch, 1)
+    uniform_scale = min(scale_x, scale_y)
 
     # Offset to center garment horizontally
     offset_x = (w - cw) // 2 - x
     offset_y = int(h * center_y_ratio - (y + ch // 2))
 
     return AlignmentTransform(
-        scale_x=round(scale_x, 3),
-        scale_y=round(scale_y, 3),
+        scale_x=round(uniform_scale, 3),
+        scale_y=round(uniform_scale, 3),
         offset_x=offset_x,
         offset_y=offset_y,
         flip_horizontal=False,
@@ -1139,8 +1136,9 @@ def apply_garment_alignment(
     if new_w != w or new_h != h:
         arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-    # Create canvas and paste
-    canvas = np.full((th, tw, 3), 255, dtype=np.uint8)
+    # Create canvas and paste — mid-gray (128) matches the preprocessing service.
+    # handler.py silhouette detection uses abs(pixel-128) < 40 for background.
+    canvas = np.full((th, tw, 3), 128, dtype=np.uint8)
     paste_x = max(0, min(tw - new_w, (tw - new_w) // 2 + transform.offset_x))
     paste_y = max(0, min(th - new_h, int(th * transform.center_y_ratio - new_h // 2) + transform.offset_y))
 
@@ -1168,10 +1166,10 @@ def get_profile_editable_labels(profile: GarmentProfile) -> set[int]:
     labels: set[int] = set()
 
     if profile.covers_upper:
-        labels |= {_LABEL_UPPER_CLOTHES, _LABEL_COAT}
+        labels |= {_LABEL_UPPER_CLOTHES}
 
     if profile.covers_lower:
-        labels |= {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_SOCKS,
+        labels |= {_LABEL_PANTS, _LABEL_SKIRT,
                     _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
 
     if profile.covers_arms or profile.expose_arms:
@@ -1180,10 +1178,10 @@ def get_profile_editable_labels(profile: GarmentProfile) -> set[int]:
     # Full body garments cover everything
     if profile.cloth_type in ("dresses", "full_body"):
         labels |= {
-            _LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT,
-            _LABEL_PANTS, _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF,
+            _LABEL_UPPER_CLOTHES, _LABEL_DRESS,
+            _LABEL_PANTS, _LABEL_SKIRT, _LABEL_SCARF,
             _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
-            _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG, _LABEL_SOCKS,
+            _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
         }
 
     return labels
@@ -1196,10 +1194,10 @@ def get_profile_protect_labels(profile: GarmentProfile) -> set[int]:
     """
     labels: set[int] = set(_IDENTITY_PROTECT_LABELS)
 
-    # All garment labels
+    # All garment labels — using corrected LIP labels.
     all_garment = (
-        {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_COAT, _LABEL_PANTS,
-         _LABEL_JUMPSUITS, _LABEL_SKIRT, _LABEL_SCARF, _LABEL_SOCKS}
+        {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_PANTS,
+         _LABEL_SKIRT, _LABEL_SCARF}
         | {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
         | {_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
     )
@@ -1294,37 +1292,32 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
     if garment_px == 0:
         return "unknown"
 
-    # Check for coat/outerwear (label 7) — high confidence indicator
-    coat_px = label_counts.get(_LABEL_COAT, 0)
+    # Check for coat/outerwear (LIP label 4 = upper_clothes) — high confidence indicator
+    coat_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
     if coat_px / max(garment_px, 1) > 0.15:
         return "upper_body"
 
-    # Check for dress (label 6) — covers most of body
+    # Check for dress (LIP label 7) — covers most of body
     dress_px = label_counts.get(_LABEL_DRESS, 0)
     if dress_px / max(garment_px, 1) > 0.30:
         return "dresses"
 
-    # Check for scarf (label 11) — indicates draped garment
+    # Check for scarf (LIP label 17) — indicates draped garment
     scarf_px = label_counts.get(_LABEL_SCARF, 0)
     if scarf_px / max(garment_px, 1) > 0.10:
         return "dresses"
 
-    # Check for pants (label 9) — lower body dominant
+    # Check for pants (LIP label 6) — lower body dominant
     pants_px = label_counts.get(_LABEL_PANTS, 0)
     skirt_px = label_counts.get(_LABEL_SKIRT, 0)
-    lower_px = pants_px + skirt_px + label_counts.get(_LABEL_SOCKS, 0)
+    lower_px = pants_px + skirt_px
     if lower_px / max(garment_px, 1) > 0.40:
         return "lower_body"
 
-    # Check for upper clothes (label 5) — upper body dominant
+    # Check for upper clothes (LIP label 4) — upper body dominant
     upper_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
     if upper_px / max(garment_px, 1) > 0.40:
         return "upper_body"
-
-    # Check for jumpsuit (label 10) — full body
-    jumpsuit_px = label_counts.get(_LABEL_JUMPSUITS, 0)
-    if jumpsuit_px / max(garment_px, 1) > 0.20:
-        return "dresses"
 
     # Default: if mostly upper clothing, assume upper_body
     if upper_px >= dress_px and upper_px >= lower_px:

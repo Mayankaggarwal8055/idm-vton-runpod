@@ -85,7 +85,7 @@ def align_garment(
       2. Orientation check — landscape garments are rotated 90° for a
          vertical canvas.
       3. Aspect-ratio-preserving resize to fit within target_size.
-      4. Centre-paste on white canvas.
+      4. Centre-paste on mid-gray canvas (128,128,128).
 
     Returns aligned PIL Image in RGB mode.
     """
@@ -120,8 +120,9 @@ def align_garment(
     nh = max(1, int(gh * scale))
     img_resized = img.resize((nw, nh), Image.LANCZOS)
 
-    # ── Step 4: centre-paste on white canvas ────────────────────────────
-    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    # ── Step 4: centre-paste on mid-gray canvas ─────────────────────────
+    # mid-gray (128) matches the preprocessing service.
+    canvas = Image.new("RGB", target_size, (128, 128, 128))
     x_offset = (tgt_w - nw) // 2
     y_offset = (tgt_h - nh) // 2
     canvas.paste(img_resized, (x_offset, y_offset))

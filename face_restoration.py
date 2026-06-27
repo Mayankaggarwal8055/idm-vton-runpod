@@ -233,14 +233,13 @@ def _blend_face(
     feather_pixels = max(2, int(min(fh, fw) * feather_fraction))
     feather_mask = np.ones((fh, fw), dtype=np.float32)
     if feather_pixels > 2:
-        kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3)
-        kernel_1d = kernel_1d[feather_pixels:-feather_pixels].flatten()
+        kernel_1d = cv2.getGaussianKernel(feather_pixels * 2 + 1, sigma=feather_pixels / 3).flatten()
         h_grad = np.ones(fw, dtype=np.float32)
-        h_grad[:feather_pixels] = kernel_1d[:min(feather_pixels, len(kernel_1d))]
-        h_grad[-feather_pixels:] = kernel_1d[-min(feather_pixels, len(kernel_1d)):][::-1]
+        h_grad[:feather_pixels] = kernel_1d[:feather_pixels]
+        h_grad[-feather_pixels:] = kernel_1d[-feather_pixels:][::-1]
         v_grad = np.ones(fh, dtype=np.float32)
-        v_grad[:feather_pixels] = kernel_1d[:min(feather_pixels, len(kernel_1d))]
-        v_grad[-feather_pixels:] = kernel_1d[-min(feather_pixels, len(kernel_1d)):][::-1]
+        v_grad[:feather_pixels] = kernel_1d[:feather_pixels]
+        v_grad[-feather_pixels:] = kernel_1d[-feather_pixels:][::-1]
         feather_mask = np.outer(v_grad, h_grad)
 
     feather_mask_3d = np.stack([feather_mask] * 3, axis=-1)

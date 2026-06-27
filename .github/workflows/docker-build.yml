@@ -5,8 +5,8 @@ on:
     branches:
       - main
     paths:
-      - "idm-vton-runpod/**"
-      - ".github/workflows/**"
+      - "**"
+      - "!*.md"
   workflow_dispatch:
 
 jobs:
@@ -30,8 +30,14 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: mayankaggarwal8055/idm-vton-runpod:v24
           build-args: GIT_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha
+            type=registry,ref=mayankaggarwal8055/idm-vton-runpod:cache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=mayankaggarwal8055/idm-vton-runpod:cache,mode=max
+          provenance: false

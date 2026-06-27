@@ -76,32 +76,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "detectron2@git+https://github.com/facebookresearch/detectron2.git@02b5c4e295e990042a714712c21dc79b731e8833"
 
 # =============================================================================
-# Layer 4 — Clone IDM-VTON repo + download ALL binary checkpoints
+# Layer 4 — Download all model weights first (no dep on GIT_REVISION)
+# These layers are stable and will use Docker cache every build.
 # =============================================================================
 
-# 4a — Clone the repository, download OpenPose checkpoint, and verify
-# The GIT_REVISION build arg acts as a cache buster — pass the latest commit SHA
-# at build time to invalidate this layer when the repo changes.
-#   docker build --build-arg GIT_REVISION=$(git rev-parse HEAD) ...
-ARG GIT_REVISION=unknown
-RUN git lfs install && \
-    echo "Cloning IDM-VTON at revision: ${GIT_REVISION}" && \
-    git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR && \
-    mkdir -p $IDM_VTON_DIR/ckpt/openpose/ckpts && \
-    curl -L \
-        -o $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
-        https://huggingface.co/spaces/yisol/IDM-VTON/resolve/main/ckpt/openpose/ckpts/body_pose_model.pth && \
-    ln -sf \
-        $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth \
-        $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth && \
-    python -c "import os,sys; p='$IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth'; sz=os.path.getsize(p)/1024/1024; print(f'body_pose_model.pth = {sz:.1f} MB'); sys.exit(0 if sz>=10 else 1)"
-
-# 4b — Download ONNX humanparsing models (bypasses git LFS issues)
-RUN python - <<'PY'
+# 4a — ONNX humanparsing models → /tmp/checkpoints/ (avoids creating IDM_VTON_DIR before clone)
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    python - <<'PY'
 from huggingface_hub import hf_hub_download
 import os, shutil, sys
 
-dest = os.environ["IDM_VTON_DIR"] + "/ckpt/humanparsing"
+dest = "/tmp/checkpoints/humanparsing"
 os.makedirs(dest, exist_ok=True)
 
 for fname in ["parsing_atr.onnx", "parsing_lip.onnx"]:
@@ -109,7 +94,6 @@ for fname in ["parsing_atr.onnx", "parsing_lip.onnx"]:
     cached = hf_hub_download(
         repo_id="levihsu/OOTDiffusion",
         filename=f"checkpoints/humanparsing/{fname}",
-        cache_dir="/tmp/hf_onnx_cache",
     )
     final = os.path.join(dest, fname)
     shutil.copy2(cached, final)
@@ -119,16 +103,16 @@ for fname in ["parsing_atr.onnx", "parsing_lip.onnx"]:
         sys.exit(1)
     print(f"  OK: {fname} = {size_mb:.1f} MB")
 
-shutil.rmtree("/tmp/hf_onnx_cache", ignore_errors=True)
 print("humanparsing ONNX downloads complete")
 PY
 
-# 4c — Download DensePose checkpoint (model_final_162be9.pkl)
-RUN python3 - <<'PY'
+# 4b — DensePose checkpoint → /tmp/checkpoints/
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    python3 - <<'PY'
 from huggingface_hub import hf_hub_download
 import os, shutil, sys
 
-dest = os.environ["IDM_VTON_DIR"] + "/ckpt/densepose"
+dest = "/tmp/checkpoints/densepose"
 os.makedirs(dest, exist_ok=True)
 
 fname = "model_final_162be9.pkl"
@@ -136,7 +120,6 @@ print(f"Downloading {fname}...")
 cached = hf_hub_download(
     repo_id="yisol/IDM-VTON",
     filename=f"densepose/{fname}",
-    cache_dir="/tmp/hf_densepose_cache",
 )
 final = os.path.join(dest, fname)
 shutil.copy2(cached, final)
@@ -146,40 +129,28 @@ print(f"{fname} = {size_mb:.1f} MB")
 if size_mb < 100:
     sys.exit("DensePose checkpoint looks truncated or is a pointer file")
 
-shutil.rmtree("/tmp/hf_densepose_cache", ignore_errors=True)
 print("DensePose download complete")
 PY
 
-# =============================================================================
-# Layer 5 — Download full IDM-VTON SDXL weights + cleanup + verify
-# =============================================================================
-
-RUN python - <<'PY'
+# 4c — Full IDM-VTON SDXL weights (goes to /workspace/models/, no conflict)
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    python - <<'PY'
 from huggingface_hub import snapshot_download
 import os, sys, shutil
 
-# --- Download ---
 target_dir = "/workspace/models/yisol/IDM-VTON"
 os.makedirs(target_dir, exist_ok=True)
 
 print("Downloading IDM-VTON weights...")
-
 snapshot_download(
     repo_id="yisol/IDM-VTON",
     local_dir=target_dir,
     local_dir_use_symlinks=False,
 )
-
 print("Download complete")
 
-# --- Cleanup HuggingFace cache (~7-10 GB) to avoid image bloat ---
-import shutil as _shutil
-_shutil.rmtree("/root/.cache/huggingface", ignore_errors=True)
-print("HuggingFace cache cleaned")
-
-# --- Verify required weight files exist (not just directories) ---
+# --- Verify ---
 target = target_dir
-
 size_checked = {
     "unet/diffusion_pytorch_model.bin": 1000,
     "vae/diffusion_pytorch_model.safetensors": 50,
@@ -193,9 +164,7 @@ config_files = [
     "text_encoder_2/config.json",
     "unet_encoder/config.json",
 ]
-
 all_ok = True
-
 for rel_path, min_mb in size_checked.items():
     full = os.path.join(target, rel_path)
     if not os.path.isfile(full):
@@ -203,16 +172,15 @@ for rel_path, min_mb in size_checked.items():
         all_ok = False
         continue
     if os.path.islink(full):
-        print(f"FATAL: {full} is a symlink — local_dir_use_symlinks did not work")
+        print(f"FATAL: {full} is a symlink")
         all_ok = False
         continue
     size_mb = os.path.getsize(full) / 1024 / 1024
     if size_mb < min_mb:
-        print(f"FATAL: {rel_path} too small ({size_mb:.2f} MB < {min_mb} MB) — truncated or pointer file")
+        print(f"FATAL: {rel_path} too small ({size_mb:.2f} MB)")
         all_ok = False
         continue
     print(f"  OK: {rel_path} = {size_mb:.1f} MB")
-
 for rel_path in config_files:
     full = os.path.join(target, rel_path)
     if not os.path.isfile(full):
@@ -221,7 +189,6 @@ for rel_path in config_files:
     else:
         size_kb = os.path.getsize(full) / 1024
         print(f"  OK: {rel_path} = {size_kb:.1f} KB")
-
 for sub in ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
             "image_encoder", "text_encoder", "text_encoder_2", "unet_encoder"]:
     path = os.path.join(target, sub)
@@ -230,17 +197,46 @@ for sub in ["unet", "vae", "scheduler", "tokenizer", "tokenizer_2",
         all_ok = False
     else:
         print(f"  OK: {sub}/")
-
 total, used, free = shutil.disk_usage("/workspace")
 print(f"DISK: total_gb={total / (1024**3):.1f} used_gb={used / (1024**3):.1f} free_gb={free / (1024**3):.1f}")
-
 if not all_ok:
     sys.exit(1)
-print("All model weight files verified — Layer 5 complete")
+print("All model weight files verified")
 PY
 
+# 4d — Body pose checkpoint → /tmp/checkpoints/ (avoids creating IDM_VTON_DIR before clone)
+RUN mkdir -p /tmp/checkpoints/openpose && \
+    curl -L \
+        -o /tmp/checkpoints/openpose/body_pose_model.pth \
+        https://huggingface.co/spaces/yisol/IDM-VTON/resolve/main/ckpt/openpose/ckpts/body_pose_model.pth
+
 # =============================================================================
-# Layer 6 — Build validation (IDM-VTON pipeline)
+# Layer 5 — Clone IDM-VTON repo (GIT_REVISION changes on every commit)
+# IDM_VTON_DIR does not exist yet — no conflicts.
+# =============================================================================
+
+ARG GIT_REVISION=unknown
+RUN git lfs install && \
+    echo "Cloning IDM-VTON at revision: ${GIT_REVISION}" && \
+    git clone --depth 1 https://github.com/Mayankaggarwal8055/IDM-VTON.git $IDM_VTON_DIR
+
+# =============================================================================
+# Layer 6 — Symlink checkpoints into repo-expected paths
+# =============================================================================
+# Checkpoints live in /tmp/checkpoints/ (stable layers 4a/4b/4d) to avoid
+# creating IDM_VTON_DIR before the clone. After the clone, symlinks make
+# them appear at the paths the repo code expects.
+
+RUN mkdir -p $IDM_VTON_DIR/ckpt/humanparsing $IDM_VTON_DIR/ckpt/densepose $IDM_VTON_DIR/ckpt/openpose/ckpts && \
+    ln -sf /tmp/checkpoints/humanparsing/parsing_atr.onnx $IDM_VTON_DIR/ckpt/humanparsing/parsing_atr.onnx && \
+    ln -sf /tmp/checkpoints/humanparsing/parsing_lip.onnx $IDM_VTON_DIR/ckpt/humanparsing/parsing_lip.onnx && \
+    ln -sf /tmp/checkpoints/densepose/model_final_162be9.pkl $IDM_VTON_DIR/ckpt/densepose/model_final_162be9.pkl && \
+    ln -sf /tmp/checkpoints/openpose/body_pose_model.pth $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth && \
+    ln -sf $IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth $IDM_VTON_DIR/ckpt/openpose/body_pose_model.pth && \
+    python -c "import os; p='$IDM_VTON_DIR/ckpt/openpose/ckpts/body_pose_model.pth'; sz=os.path.getsize(p)/1024/1024; print(f'body_pose_model.pth = {sz:.1f} MB'); assert sz>=10, f'too small: {sz:.1f} MB'"
+
+# =============================================================================
+# Layer 7 — Build validation (IDM-VTON pipeline)
 # =============================================================================
 
 RUN python - <<'PY'
@@ -299,10 +295,9 @@ COPY mask_pipeline.py /workspace/mask_pipeline.py
 COPY quality_validation.py /workspace/quality_validation.py
 COPY post_processing.py /workspace/post_processing.py
 COPY face_restoration.py /workspace/face_restoration.py
-COPY p0_diagnostics.py /workspace/p0_diagnostics.py
 
 # =============================================================================
-# Layer 7 — Validate worker module (mask_pipeline.py)
+# Layer 8 — Validate worker module (mask_pipeline.py)
 # =============================================================================
 # NOTE: This runs AFTER the COPY layer above, so /workspace/mask_pipeline.py exists.
 
