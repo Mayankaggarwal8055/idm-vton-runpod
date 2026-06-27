@@ -1658,12 +1658,21 @@ def build_schp_inpaint_mask(
             source_tight = cv2.erode(source_dilated, kernel_e, iterations=1)
             mask = np.maximum(mask, source_tight)
 
-        # Include arm labels if source is draped
-        if source_cloth_type in ("dresses", "full_body"):
-            src_key = (garment_subtype or "").lower()
-            if any(kw in src_key for kw in _DRAPE_KEYWORDS):
-                arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
-                mask = np.maximum(mask, arm_mask)
+        # Include arm labels if source OR target is draped
+        _drape_ct = cloth_type if cloth_type in ("dresses", "full_body") else (
+            source_cloth_type if source_cloth_type in ("dresses", "full_body") else ""
+        )
+        if _drape_ct:
+            arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
+            mask = np.maximum(mask, arm_mask)
+            # For draped cross-category, also include leg labels since saree/lehenga
+            # covers lower body. This ensures the mask covers pallu drape over legs.
+            leg_labels = {_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+            leg_mask = np.isin(schp_labels, list(leg_labels)).astype(np.uint8) * 255
+            mask = np.maximum(mask, leg_mask)
+            # Include scarf label for pallu/dupatta drape over shoulder
+            scarf_mask = (schp_labels == _LABEL_SCARF).astype(np.uint8) * 255
+            mask = np.maximum(mask, scarf_mask)
 
         # Include body regions where source overlaps but target doesn't cover
         # This ensures old garment regions that are outside target coverage
@@ -1678,10 +1687,14 @@ def build_schp_inpaint_mask(
         source_labels = _CLOTHING_LABELS.get(source_cloth, _CLOTHING_LABELS.get(cloth_type, set()))
         mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
 
-        # Include arm labels for draped targets
+        # Include arm + leg + scarf labels for draped targets.
+        # Saree/lehenga/dupatta drape covers arms, legs, and has scarf/pallu
+        # components. Without legs+scarf in the mask, the model can't generate
+        # drape over legs or pallu hanging over shoulder.
         if profile.is_draped:
-            arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
-            mask = np.maximum(mask, arm_mask)
+            _drape_extra = _DRAPE_ARM_LABELS + (_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG, _LABEL_SCARF)
+            drape_mask = np.isin(schp_labels, list(_drape_extra)).astype(np.uint8) * 255
+            mask = np.maximum(mask, drape_mask)
 
         # Garment geometry expansion: if the target garment extends beyond
         # the source shape (e.g. short sleeve → long sleeve, cropped → long),
@@ -1914,17 +1927,17 @@ def apply_protection_binary(inpaint_mask: np.ndarray, protect_mask: np.ndarray) 
 def feather_mask_edges(binary_mask: np.ndarray, feather_px: int = 4) -> np.ndarray:
     """Create a soft gradient at mask boundaries for smoother blending.
 
-    Takes a binary mask (0/255) and produces a float mask (0.0-1.0) with
-    a Gaussian feather at the transition zone. The interior stays 1.0,
-    the exterior stays 0.0, and the boundary gets a smooth gradient.
+    Uses distance-transform-based feathering: interior pixels stay at 1.0,
+    exterior pixels stay at 0.0, and only the boundary zone gets a smooth
+    cosine-gradient. The gradient spans feather_px pixels on each side of
+    the boundary.
 
-    This is applied AFTER all binary safety checks, just before passing
-    the mask to the diffusion model. The diffusion model uses this soft
-    mask to blend inpainted and original pixels at the boundary.
+    Applied AFTER all binary safety checks, just before passing the mask
+    to the diffusion model.
 
     Args:
         binary_mask: uint8 array with values 0 or 255.
-        feather_px: Half-width of the feather zone in pixels.
+        feather_px: Half-width of the feather zone in pixels (each side).
 
     Returns:
         float32 array with values in [0.0, 1.0].
@@ -1932,20 +1945,26 @@ def feather_mask_edges(binary_mask: np.ndarray, feather_px: int = 4) -> np.ndarr
     if feather_px < 1:
         return (binary_mask > 127).astype(np.float32)
 
-    binary = (binary_mask > 127).astype(np.float32)
+    binary = (binary_mask > 127).astype(np.uint8)
 
-    # Gaussian blur creates natural feathering at mask boundaries.
-    # The sigma is chosen so the blur radius ≈ feather_px pixels.
-    sigma = feather_px / 2.0
-    ks = max(3, int(feather_px * 2 + 1))
-    if ks % 2 == 0:
-        ks += 1
+    # Distance from each foreground pixel to the nearest background pixel
+    dist_inside = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    # Distance from each background pixel to the nearest foreground pixel
+    dist_outside = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
 
-    blurred = cv2.GaussianBlur(binary, (ks, ks), sigma)
+    # Signed distance: positive inside, negative outside, zero at boundary
+    signed_dist = dist_inside - dist_outside
 
-    # Clamp to [0, 1] — Gaussian can produce slight overshoot
-    result = np.clip(blurred, 0.0, 1.0).astype(np.float32)
-    return result
+    # Cosine gradient within feather zone:
+    # signed_dist < -feather_px → 0.0 (exterior)
+    # signed_dist > feather_px → 1.0 (interior)
+    # Within [-feather_px, +feather_px] → smooth cosine ramp
+    t = np.clip(signed_dist / max(feather_px, 1), -1.0, 1.0)
+    # Map [-1, 1] to [0, 1] then apply cosine smoothing
+    t_01 = (t + 1.0) * 0.5  # [0, 1]
+    result = 0.5 * (1.0 - np.cos(np.pi * t_01))
+
+    return result.astype(np.float32)
 
 
 def validate_mask_coverage(

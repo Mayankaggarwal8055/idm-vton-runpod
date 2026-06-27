@@ -86,7 +86,7 @@ NEUTRAL_GARMENT_PATH = os.path.join(
 )
 
 # Retry / candidate scoring thresholds
-MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "1"))
+MULTI_CANDIDATE_COUNT = int(os.environ.get("MULTI_CANDIDATE_COUNT", "3"))
 CANDIDATE_MIN_SCORE = float(os.environ.get("CANDIDATE_MIN_SCORE", "0.55"))
 CANDIDATE_GUIDANCE_VARY = os.environ.get("CANDIDATE_GUIDANCE_VARY", "1") == "1"
 CANDIDATE_STEPS_VARY = os.environ.get("CANDIDATE_STEPS_VARY", "1") == "1"
@@ -1158,6 +1158,62 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
                      "structure", "drape", "material", "fabric_behavior"):
         if attr_key in attrs:
             parts.append(attrs[attr_key])
+
+    # Fabric-specific realism cues — these help the diffusion model produce
+    # more realistic cloth texture, folds, and material behavior.
+    _FABRIC_CUES: dict[str, str] = {
+        "saree": "flowing silk or cotton drape, natural pallu fall over shoulder, "
+                 "soft pleats at waist, fabric tension at wrap points, "
+                 "realistic cloth behavior with gravity",
+        "sari": "flowing silk or cotton drape, natural pallu fall over shoulder, "
+                "soft pleats at waist, fabric tension at wrap points",
+        "lehenga": "flowing skirt fabric, rich embroidery texture, "
+                   "natural flare at hem, fabric weight visible in drape",
+        "dress": "soft flowing fabric, natural waist gathering, "
+                 "realistic hem drape, fabric weight visible in folds",
+        "shirt": "woven cotton fabric, crisp collar, button placket detail, "
+                 "natural sleeve wrinkles, fabric tension at shoulders",
+        "blouse": "fitted fabric, subtle gathering, natural chest drape, "
+                  "realistic neckline shape",
+        "jacket": "structured outerwear fabric, lapel definition, "
+                  "realistic sleeve creases, visible seam construction",
+        "hoodie": "soft cotton jersey, hood volume, kangaroo pocket, "
+                  "natural shoulder droop, ribbed cuffs texture",
+        "jeans": "denim texture with visible stitching, realistic wash pattern, "
+                 "natural creasing at knees and hips",
+        "pants": "woven or knit fabric, natural creasing at seat and knees, "
+                 "realistic hem break at shoes",
+        "skirt": "flowing fabric with natural hem movement, "
+                 "realistic drape from waist",
+        "sweater": "knit fabric texture, natural ribbing at hem and cuffs, "
+                   "realistic weight and drape of knitwear",
+        "tshirt": "soft cotton jersey, natural shoulder seams, "
+                  "realistic chest drape, subtle fabric texture",
+        "crop_top": "fitted knit fabric, natural hem line, "
+                    "realistic tension across chest",
+        "tank_top": "lightweight fabric, natural armhole drape, "
+                    "realistic fabric tension",
+        "coat": "heavy structured fabric, realistic weight in drape, "
+                "visible collar and button construction",
+        "blazer": "tailored wool or blend, sharp lapel edges, "
+                  "realistic structured shoulder, natural sleeve break",
+        "dupatta": "lightweight flowing fabric, natural drape over shoulders, "
+                   "realistic edge curling and fabric movement",
+    }
+
+    # Look up fabric cues by subtype
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    fabric_cue = _FABRIC_CUES.get(key, "")
+    if not fabric_cue:
+        # Fuzzy match
+        for cue_key, cue_val in _FABRIC_CUES.items():
+            if cue_key in key or key in cue_key:
+                fabric_cue = cue_val
+                break
+
+    if fabric_cue:
+        parts.append(fabric_cue)
+
     parts.append("detailed fabric texture, natural garment folds")
     return ", ".join(parts)
 
@@ -1372,8 +1428,10 @@ def run_idm_vton_inference(
         # BACKGROUND LEAKAGE GUARD:
         # Erode silhouette to shrink it away from background boundaries.
         # Then AND with SCHP body mask so only body-region pixels are included.
+        # Use smaller erosion (0.5%) to avoid eating into garment pixels,
+        # especially for dark garments where the silhouette is already tight.
         h_s, w_s = garm_silhouette_mask.shape[:2]
-        erode_ks = max(3, int(min(h_s, w_s) * 0.01))  # ~1% of smallest dimension
+        erode_ks = max(3, int(min(h_s, w_s) * 0.005))  # ~0.5% of smallest dimension
         if erode_ks % 2 == 0:
             erode_ks += 1
         erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_ks, erode_ks))
@@ -1607,6 +1665,66 @@ def run_idm_vton_inference(
                 raise RuntimeError("Pipeline returned empty images list — inference produced no output")
 
     raw_output = images[0].copy()
+
+    # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
+    # Mask-driven blending: the inpaint mask is the ground truth for what
+    # the diffusion model should replace vs what should stay original.
+    # Where mask=0: keep original (protected region).
+    # Where mask=1: keep diffusion output (inpaint region).
+    # Gaussian blur at boundaries creates smooth transitions.
+    #
+    # This replaces the old SCHP-label-based approach which incorrectly
+    # preserved arms/legs even when the mask said they should be inpainted
+    # (e.g. saree drape over arms, dress covering legs).
+    try:
+        result_arr = np.array(images[0], dtype=np.float32)
+        person_arr = np.array(human_img, dtype=np.float32)
+
+        # The feathered mask (already applied) is the ground truth.
+        # Values 0.0-1.0 where 1.0 = fully inpainted, 0.0 = fully protected.
+        mask_arr = np.array(mask, dtype=np.float32) / 255.0
+
+        # For body shape: use a tighter blend mask based on the binary mask,
+        # not the feathered one. This ensures the full diffusion output is
+        # used inside the mask, while identity is preserved outside.
+        final_mask_np_arr = np.array(final_mask, dtype=np.float32) / 255.0
+
+        # Gaussian blur for smooth transition at mask boundaries.
+        # final_mask=1.0 means inpaintable (garment region), 0.0 means protected.
+        # body_preserve=1.0 means "keep original person", 0.0 means "use diffusion".
+        # So we INVERT after blur: garment region → 0.0 (use diffusion),
+        # protected region → 1.0 (keep original).
+        ks = 11
+        body_preserve = 1.0 - cv2.GaussianBlur(final_mask_np_arr, (ks, ks), 3.5)
+        body_preserve = np.clip(body_preserve, 0.0, 1.0)
+
+        # For identity regions (face, hair, shoes, hat, sunglasses, bag),
+        # always preserve the original with higher strength.
+        # These labels must never be altered by the diffusion model.
+        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
+        _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
+
+        # Dilate hard protect by a few pixels to cover boundary zones
+        ks_hp = 7
+        kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
+        _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
+
+        # Where hard_protect=1, always preserve original (override body_preserve)
+        # Where hard_protect=0, use the mask-driven body_preserve
+        body_preserve = np.maximum(body_preserve, _hard_mask)
+
+        # Gaussian-blur the final combined mask for smooth transition
+        body_preserve = cv2.GaussianBlur(body_preserve, (7, 7), 2.5)
+        body_preserve = np.clip(body_preserve, 0.0, 1.0)
+
+        # Blend: where body_preserve=1 keep original, where=0 keep inpainted
+        body_preserve_3ch = body_preserve[:, :, np.newaxis]
+        result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
+        images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
+        logger.info("body_shape_preservation_applied preserve_ratio=%.3f trace_id=%s",
+                     float(np.mean(body_preserve)), trace_id)
+    except Exception as exc:
+        logger.warning("body_shape_preservation_failed error=%s", exc)
 
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
