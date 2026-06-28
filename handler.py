@@ -132,6 +132,7 @@ _WARM = threading.Event()
 _WARMUP_LOCK = threading.Lock()
 _STARTUP_TIME = time.perf_counter()
 _REUSE_COUNT: int = 0
+_MODELS_LOADED: bool = False
 _REUSE_LOCK = threading.Lock()
 
 _SESSION: requests.Session | None = None
@@ -560,8 +561,9 @@ def run_cross_category_inference(
 def load_models():
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
+    global _MODELS_LOADED
 
-    if pipe is not None:
+    if _MODELS_LOADED:
         logger.info("Models already loaded — skipping")
         return
 
@@ -874,6 +876,8 @@ def load_models():
     get_mask_location_fn = _get_mask_location
 
     load_ms = (time.perf_counter() - load_start) * 1000
+
+    _MODELS_LOADED = True
 
     logger.info("=" * 60)
     logger.info("MODELS READY")
@@ -1317,6 +1321,7 @@ def run_idm_vton_inference(
         analyze_garment_image,
         save_mask_debug_artifacts,
         build_garment_profile,
+        feather_mask_edges,
         compute_pipeline_route,
         compute_garment_alignment,
         AlignmentTransform,
@@ -1504,17 +1509,10 @@ def run_idm_vton_inference(
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
         garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
-        # AND with SCHP body mask: only include pixels that SCHP labels as body
-        # 4=UPPER_CLOTHES, 5=SKIRT, 6=PANTS, 7=DRESS, 8=BELT (garment-adjacent)
-        # 12=LEFT_LEG, 13=RIGHT_LEG, 14=LEFT_ARM, 15=RIGHT_ARM, 17=SCARF
-        # NOTE: 16=BAG excluded — bags are accessories, not body/garment regions.
-        #
-        # EXCEPTION for draped garments (saree, lehenga, dupatta):
-        # The drape extends BEYOND SCHP body labels into background regions
-        # (pallu over shoulder, fabric flowing past body silhouette).  ANDing
-        # with body labels would block these extended drape areas from the mask,
-        # preventing the model from generating garment in those regions.
-        # For draped garments, use the silhouette directly without body-label AND.
+        # AND with SCHP body mask for non-draped garments: only include
+        # pixels that SCHP labels as body/garment.
+        # 4=UPPER_CLOTHES, 5=SKIRT, 6=PANTS, 7=DRESS, 8=BELT, 12-15=limbs, 17=SCARF
+        # EXCEPTION for draped garments: drape extends beyond body labels.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
         if not _is_draped_garment:
             _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
@@ -1530,9 +1528,6 @@ def run_idm_vton_inference(
         else:
             # Draped: use silhouette directly — drape extends BEYOND body labels
             # into background regions (pallu over shoulder, fabric flowing past body).
-            # Any AND with body/non-identity labels clips the drape zones.
-            # The dilation above already provides sufficient buffer.
-            pass
             logger.info(
                 "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
                 int(np.sum(garm_silhouette_mask > 127)), trace_id,
@@ -1633,7 +1628,6 @@ def run_idm_vton_inference(
     # wider transitions to avoid visible seams at drape boundaries. Tight
     # garments (t-shirt, jeans) need narrower transitions to preserve fit.
     try:
-        from mask_pipeline import feather_mask_edges
         mask_np_final = np.array(final_mask, dtype=np.uint8)
         # Adaptive feather: flowing garments get wider transitions
         _feather_px = 4  # default
@@ -1851,20 +1845,11 @@ def run_idm_vton_inference(
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
-        # ── FACE-NECK PROTECT ZONE WIDENING ──────────────────────────
-        # White shoulder patches and neckline artifacts appear at the
-        # face/neck/shoulder boundary where the feathered mask transitions
-        # from protected (0) to inpaint (1). The 3px hard_protect dilation
-        # is narrower than feather_px (4-6), so diffusion-generated garment
-        # pixels bleed into the face zone during the body_preserve blend.
-        # Fix: add extra protection specifically for face (11) and neck (18)
-        # labels with wider dilation to cover the full feather transition.
-        _face_neck_labels = {11, 18}  # FACE, NECK
-        _fn_mask = np.isin(schp_np, list(_face_neck_labels)).astype(np.float32)
-        _ks_fn = 13
-        _kernel_fn = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_fn, _ks_fn))
-        _fn_mask = cv2.dilate(_fn_mask, _kernel_fn, iterations=1)
-        _hard_mask = np.maximum(_hard_mask, _fn_mask)
+        # NOTE: Do NOT add extra dilation for face/neck labels here.
+        # The 3px hard_protect is sufficient for face (label 11).
+        # Neck (label 18) is intentionally NOT protected — it is part of
+        # the garment neckline. Extra dilation here preserves original garment
+        # pixels near the chest/neck, causing source clothing leakage.
 
         # Where hard_protect=1, always preserve original (override body_preserve)
         # Where hard_protect=0, use the mask-driven body_preserve
@@ -1913,46 +1898,6 @@ def run_idm_vton_inference(
             logger.warning("garment_texture_recovery_failed error=%s", _tex_exc)
     except Exception as exc:
         logger.warning("body_shape_preservation_failed error=%s", exc)
-
-    # ── SKIN RESTORATION SAFEGUARD ────────────────────────────────────
-    # The diffusion model may incorrectly regenerate exposed skin (arms,
-    # legs) inside the inpaint mask, producing masculine or distorted
-    # limbs. Detect where the model changed skin regions significantly
-    # and blend back the original person pixels.
-    try:
-        _skin_labels = {12, 13, 14, 15}  # left_leg, right_leg, left_arm, right_arm
-        _skin_bin = np.isin(schp_np, list(_skin_labels)).astype(np.uint8)
-        _ks_s = 5
-        _kernel_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_s, _ks_s))
-        _skin_dilated = cv2.dilate(_skin_bin, _kernel_s, iterations=1)
-
-        _res_np = np.array(images[0], dtype=np.float32)
-        _per_np = np.array(human_img, dtype=np.float32)
-        _pixel_diff = np.mean(np.abs(_res_np - _per_np), axis=2)
-
-        # Where skin label present AND model changed pixel by >20 intensity
-        _skin_regen = (_skin_dilated > 0) & (_pixel_diff > 20)
-
-        # Skin labels (arms, legs) deep inside the inpaint mask are still
-        # skin, not garment texture. The model regenerates them incorrectly
-        # (masculine, distorted) regardless of position inside the mask.
-        # Restore wherever skin label + significant change — no boundary filter.
-
-        if np.any(_skin_regen):
-            _restore_mask = feather_mask_edges(
-                (_skin_regen.astype(np.uint8) * 255), feather_px=4
-            )
-            _r3 = _restore_mask[:, :, np.newaxis]
-            _res_np = _res_np * (1.0 - _r3) + _per_np * _r3
-            images[0] = Image.fromarray(
-                np.clip(_res_np, 0, 255).astype(np.uint8)
-            )
-            logger.info(
-                "skin_restoration_applied pixels=%d trace_id=%s",
-                int(np.sum(_skin_regen)), trace_id,
-            )
-    except Exception as _skin_exc:
-        logger.warning("skin_restoration_failed error=%s", _skin_exc)
 
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
@@ -2525,22 +2470,25 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         person_ref = person_img
         if person_ref.size != result.size:
             person_ref = person_ref.resize(result.size, Image.LANCZOS)
-        result, face_meta_out = _do_enhance_face(result, person_original=person_ref, trace_id=trace_id)
-        debug.face_restoration_output = result
-        debug.final_output = result
-        logger.info(
-            "face_restoration_applied method=%s face_detected=%s "
-            "sharp_before=%s sharp_after=%s sharp_delta=%s "
-            "identity_sim_before=%s identity_sim_after=%s trace_id=%s",
-            face_meta_out.get("restoration_method", "unknown"),
-            face_meta_out.get("face_detected", "unknown"),
-            face_meta_out.get("face_sharpness_before"),
-            face_meta_out.get("face_sharpness_after"),
-            face_meta_out.get("face_sharpness_delta"),
-            face_meta_out.get("identity_similarity_before"),
-            face_meta_out.get("identity_similarity_after"),
-            trace_id,
-        )
+        try:
+            result, face_meta_out = _do_enhance_face(result, person_original=person_ref, trace_id=trace_id)
+            debug.face_restoration_output = result
+            debug.final_output = result
+            logger.info(
+                "face_restoration_applied method=%s face_detected=%s "
+                "sharp_before=%s sharp_after=%s sharp_delta=%s "
+                "identity_sim_before=%s identity_sim_after=%s trace_id=%s",
+                face_meta_out.get("restoration_method", "unknown"),
+                face_meta_out.get("face_detected", "unknown"),
+                face_meta_out.get("face_sharpness_before"),
+                face_meta_out.get("face_sharpness_after"),
+                face_meta_out.get("face_sharpness_delta"),
+                face_meta_out.get("identity_similarity_before"),
+                face_meta_out.get("identity_similarity_after"),
+                trace_id,
+            )
+        except Exception as exc:
+            logger.warning("face_restoration_failed error=%s trace_id=%s", exc, trace_id)
         result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
     else:
         logger.info("face_restoration_skipped available=%s enabled=%s trace_id=%s",
