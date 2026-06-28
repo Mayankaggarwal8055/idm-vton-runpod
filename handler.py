@@ -1491,17 +1491,18 @@ def run_idm_vton_inference(
             )
             garm_silhouette_mask = (garm_silhouette_mask > 127).astype(np.uint8) * 255
 
-        # BACKGROUND LEAKAGE GUARD:
-        # Erode silhouette to shrink it away from background boundaries.
-        # Then AND with SCHP body mask so only body-region pixels are included.
-        # Use smaller erosion (0.5%) to avoid eating into garment pixels,
-        # especially for dark garments where the silhouette is already tight.
+        # GARMENT SILHOUETTE BOUNDARY SOFTENING:
+        # Dilate silhouette to give buffer room at body-label boundaries.
+        # The previous erosion + AND created double-clipping at jeans/garment
+        # outer edges, producing a visible hard seam. Dilating before AND
+        # ensures the silhouette covers the full garment boundary while the
+        # AND with body labels still prevents background leakage.
         h_s, w_s = garm_silhouette_mask.shape[:2]
-        erode_ks = max(3, int(min(h_s, w_s) * 0.005))  # ~0.5% of smallest dimension
-        if erode_ks % 2 == 0:
-            erode_ks += 1
-        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_ks, erode_ks))
-        garm_silhouette_mask = cv2.erode(garm_silhouette_mask, erode_kernel, iterations=1)
+        dilate_ks = max(3, int(min(h_s, w_s) * 0.008))  # ~0.8% of smallest dimension
+        if dilate_ks % 2 == 0:
+            dilate_ks += 1
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
+        garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
         # AND with SCHP body mask: only include pixels that SCHP labels as body
         # 4=UPPER_CLOTHES, 5=SKIRT, 6=PANTS, 7=DRESS, 8=BELT (garment-adjacent)
@@ -1527,25 +1528,11 @@ def run_idm_vton_inference(
                 _schp_body = (_schp_body > 127).astype(np.uint8) * 255
             garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
         else:
-            # Draped: use broader body+background mask to include drape zones
-            # Include all non-identity labels (body + background near body)
-            _non_identity = set(range(0, 19)) - {0, 1, 2, 3, 9, 10, 11, 18}
-            _schp_all = np.isin(schp_np, list(_non_identity)).astype(np.uint8) * 255
-            # Dilate the non-identity mask to catch background regions adjacent
-            # to body (where drape extends beyond body silhouette)
-            _dilate_ks = max(5, int(min(h_s, w_s) * 0.01))
-            if _dilate_ks % 2 == 0:
-                _dilate_ks += 1
-            _dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_dilate_ks, _dilate_ks))
-            _schp_all = cv2.dilate(_schp_all, _dilate_kernel, iterations=1)
-            if _schp_all.shape[:2] != garm_silhouette_mask.shape[:2]:
-                _schp_all = np.array(
-                    Image.fromarray(_schp_all).resize(
-                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
-                    )
-                )
-                _schp_all = (_schp_all > 127).astype(np.uint8) * 255
-            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_all)
+            # Draped: use silhouette directly — drape extends BEYOND body labels
+            # into background regions (pallu over shoulder, fabric flowing past body).
+            # Any AND with body/non-identity labels clips the drape zones.
+            # The dilation above already provides sufficient buffer.
+            pass
             logger.info(
                 "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
                 int(np.sum(garm_silhouette_mask > 127)), trace_id,
@@ -1659,7 +1646,7 @@ def run_idm_vton_inference(
             _feather_px = 6
         elif any(kw in _st for kw in ("tshirt", "t_shirt", "tank", "crop",
                                        "tube", "camisole", "bralette")):
-            _feather_px = 3
+            _feather_px = 4
         soft_mask = feather_mask_edges(mask_np_final, feather_px=_feather_px)
         # Convert float [0,1] to PIL image with values [0,255]
         soft_mask_pil = Image.fromarray((soft_mask * 255).astype(np.uint8), mode="L")
@@ -1864,9 +1851,33 @@ def run_idm_vton_inference(
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
+        # ── FACE-NECK PROTECT ZONE WIDENING ──────────────────────────
+        # White shoulder patches and neckline artifacts appear at the
+        # face/neck/shoulder boundary where the feathered mask transitions
+        # from protected (0) to inpaint (1). The 3px hard_protect dilation
+        # is narrower than feather_px (4-6), so diffusion-generated garment
+        # pixels bleed into the face zone during the body_preserve blend.
+        # Fix: add extra protection specifically for face (11) and neck (18)
+        # labels with wider dilation to cover the full feather transition.
+        _face_neck_labels = {11, 18}  # FACE, NECK
+        _fn_mask = np.isin(schp_np, list(_face_neck_labels)).astype(np.float32)
+        _ks_fn = 13
+        _kernel_fn = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_fn, _ks_fn))
+        _fn_mask = cv2.dilate(_fn_mask, _kernel_fn, iterations=1)
+        _hard_mask = np.maximum(_hard_mask, _fn_mask)
+
         # Where hard_protect=1, always preserve original (override body_preserve)
         # Where hard_protect=0, use the mask-driven body_preserve
         body_preserve = np.maximum(body_preserve, _hard_mask)
+
+        # ── BACKGROUND PRESERVATION SAFEGUARD ─────────────────────────
+        # feather_inv may not reach 1.0 at image edges where the inpaint
+        # mask extends to the boundary (distanceTransform can't compute
+        # distances beyond the image). This allows diffusion-generated
+        # background to leak through, causing mirror/kaleidoscope artifacts.
+        # Fix: force body_preserve=1.0 wherever binary mask says background.
+        _bin_bg = (final_mask_np_arr < 0.5)
+        body_preserve[_bin_bg] = 1.0
 
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
@@ -1902,6 +1913,46 @@ def run_idm_vton_inference(
             logger.warning("garment_texture_recovery_failed error=%s", _tex_exc)
     except Exception as exc:
         logger.warning("body_shape_preservation_failed error=%s", exc)
+
+    # ── SKIN RESTORATION SAFEGUARD ────────────────────────────────────
+    # The diffusion model may incorrectly regenerate exposed skin (arms,
+    # legs) inside the inpaint mask, producing masculine or distorted
+    # limbs. Detect where the model changed skin regions significantly
+    # and blend back the original person pixels.
+    try:
+        _skin_labels = {12, 13, 14, 15}  # left_leg, right_leg, left_arm, right_arm
+        _skin_bin = np.isin(schp_np, list(_skin_labels)).astype(np.uint8)
+        _ks_s = 5
+        _kernel_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_s, _ks_s))
+        _skin_dilated = cv2.dilate(_skin_bin, _kernel_s, iterations=1)
+
+        _res_np = np.array(images[0], dtype=np.float32)
+        _per_np = np.array(human_img, dtype=np.float32)
+        _pixel_diff = np.mean(np.abs(_res_np - _per_np), axis=2)
+
+        # Where skin label present AND model changed pixel by >20 intensity
+        _skin_regen = (_skin_dilated > 0) & (_pixel_diff > 20)
+
+        # Skin labels (arms, legs) deep inside the inpaint mask are still
+        # skin, not garment texture. The model regenerates them incorrectly
+        # (masculine, distorted) regardless of position inside the mask.
+        # Restore wherever skin label + significant change — no boundary filter.
+
+        if np.any(_skin_regen):
+            _restore_mask = feather_mask_edges(
+                (_skin_regen.astype(np.uint8) * 255), feather_px=4
+            )
+            _r3 = _restore_mask[:, :, np.newaxis]
+            _res_np = _res_np * (1.0 - _r3) + _per_np * _r3
+            images[0] = Image.fromarray(
+                np.clip(_res_np, 0, 255).astype(np.uint8)
+            )
+            logger.info(
+                "skin_restoration_applied pixels=%d trace_id=%s",
+                int(np.sum(_skin_regen)), trace_id,
+            )
+    except Exception as _skin_exc:
+        logger.warning("skin_restoration_failed error=%s", _skin_exc)
 
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)

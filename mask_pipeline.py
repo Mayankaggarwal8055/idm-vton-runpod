@@ -1756,10 +1756,13 @@ def build_schp_inpaint_mask(
             source_only_mask = np.isin(schp_labels, list(source_only_labels)).astype(np.uint8) * 255
             mask = np.maximum(mask, source_only_mask)
     else:
-        # Same-category: source garment labels
+        # Same-category: source garment labels + target labels for full coverage.
+        # When source and target shapes differ (e.g., short sleeve → long sleeve),
+        # source labels alone miss areas the target will change.
         source_cloth = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else cloth_type
         source_labels = _CLOTHING_LABELS.get(source_cloth, _CLOTHING_LABELS.get(cloth_type, set()))
         mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
+        mask = np.maximum(mask, np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255)
 
         # Include arm + leg + scarf labels for draped targets.
         # Saree/lehenga/dupatta drape covers arms, legs, and has scarf/pallu
