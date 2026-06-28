@@ -78,7 +78,11 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
 DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "50"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
+# Guidance scale: 3.5 balances garment faithfulness vs artifact risk.
+# 2.5 was too conservative — model generated soft/over-smoothed texture
+# because it didn't follow garment conditioning strongly enough.
+# 5.0+ causes over-saturation and color artifacts.
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "3.5"))
 
 # Cross-category two-stage pipeline constants
 NEUTRAL_GARMENT_PATH = os.path.join(
@@ -1120,6 +1124,12 @@ _SOURCE_NEGATIVES: dict[str, list[str]] = {
     "abaya":   ["loose flowing fabric", "wide sleeves"],
     "kaftan":  ["wide sleeves", "loose tunic"],
     "sherwani": ["embroidery", "long hem", "mandarin collar"],
+    # Dresses/lower_body source types — generic garment-transition negatives
+    # for same-category replacement (saree→saree, dress→dress).
+    "dresses": ["original dress", "old dress color", "previous garment pattern",
+                "residual embroidery", "old fabric texture"],
+    "lower_body": ["original pants", "old trouser color", "previous garment"],
+    "upper_body": ["original shirt", "old top color", "previous garment"],
 }
 
 
@@ -1222,7 +1232,12 @@ def _build_source_specific_negative(
     source_cloth_type: str = "",
     target_subtype: str = "",
 ) -> str:
-    """Build negative prompt that suppresses source garment residual."""
+    """Build negative prompt that suppresses source garment residual.
+
+    For same-category replacements (e.g. saree→saree), includes stronger
+    suppression terms to prevent the old garment's color/features from
+    bleeding into the output.
+    """
     base = (
         "worst quality, low quality, "
         "ugly, blurry, watermark, signature, text, logo"
@@ -1242,7 +1257,19 @@ def _build_source_specific_negative(
     # Also add generic garment-transition negatives
     transition_terms = ["original clothing", "old garment", "residual fabric"]
 
-    all_terms = source_terms + transition_terms
+    # ── Same-category garment transition enforcement ────────────────────
+    # When source and target are the same cloth_type (e.g. saree→saree),
+    # the model tends to keep the old garment's color/features because the
+    # structural change is minimal.  Add aggressive suppression terms to
+    # force complete replacement of the old garment.
+    _same_category_terms = [
+        "mixed clothing", "partial garment", "mismatched colors",
+        "original color bleeding", "old garment residual",
+        "two different garments", "split garment appearance",
+        "inconsistent fabric", "blended old and new",
+    ]
+
+    all_terms = source_terms + transition_terms + _same_category_terms
     if all_terms:
         base += ", " + ", ".join(all_terms)
 
@@ -1413,8 +1440,47 @@ def run_idm_vton_inference(
     try:
         garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
         # Canvas is mid-gray (128,128,128) — foreground deviates from gray.
-        # Tight threshold (20) prevents gray garments from being misclassified.
+        # Start with tight threshold (20), then fall back to connected-component
+        # analysis if the garment is gray-toned (threshold misses too many pixels).
         garm_silhouette = ~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 20, axis=2)
+        fg_ratio = float(np.mean(garm_silhouette))
+        if fg_ratio < 0.05:
+            # Very little foreground detected — garment may be gray-toned.
+            # Use tighter threshold (10) + connected-component analysis:
+            # take the largest connected component as foreground.
+            garm_tight = ~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 10, axis=2)
+            if np.mean(garm_tight) > 0.02:
+                # Use the tight threshold
+                garm_silhouette = garm_tight
+            else:
+                # Even tight threshold fails — use edge-based detection.
+                # Compute gradient magnitude; strong edges = garment boundary.
+                gray = cv2.cvtColor(garm_arr, cv2.COLOR_RGB2GRAY)
+                sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+                grad_mag = np.sqrt(sobelx**2 + sobely**2)
+                # Threshold at strong edges, dilate to fill interior
+                edge_mask = (grad_mag > 30).astype(np.uint8) * 255
+                dilate_ks = max(5, int(min(garm_arr.shape[:2]) * 0.02))
+                if dilate_ks % 2 == 0:
+                    dilate_ks += 1
+                dilate_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks)
+                )
+                garm_silhouette_mask = cv2.dilate(edge_mask, dilate_kernel, iterations=2)
+                # Flood fill from center to fill interior
+                h_g, w_g = garm_silhouette_mask.shape
+                flood_mask = np.zeros((h_g + 2, w_g + 2), dtype=np.uint8)
+                cv2.floodFill(
+                    garm_silhouette_mask, flood_mask,
+                    (w_g // 2, h_g // 2), 255,
+                )
+                garm_silhouette = garm_silhouette_mask > 127
+                logger.info(
+                    "garment_foreground_edge_fallback fg_ratio=%.3f "
+                    "edge_fg_ratio=%.3f trace_id=%s",
+                    fg_ratio, float(np.mean(garm_silhouette)), trace_id,
+                )
         garm_silhouette_mask = garm_silhouette.astype(np.uint8) * 255
         # Resize to match mask dimensions
         if garm_silhouette_mask.shape[:2] != inpaint_mask_np.shape[:2]:
@@ -1438,16 +1504,52 @@ def run_idm_vton_inference(
         garm_silhouette_mask = cv2.erode(garm_silhouette_mask, erode_kernel, iterations=1)
 
         # AND with SCHP body mask: only include pixels that SCHP labels as body
-        _body_labels = {4, 5, 6, 7, 12, 13, 14, 15, 16, 17}  # garment + limb labels
-        _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
-        if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
-            _schp_body = np.array(
-                Image.fromarray(_schp_body).resize(
-                    (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+        # 4=UPPER_CLOTHES, 5=SKIRT, 6=PANTS, 7=DRESS, 8=BELT (garment-adjacent)
+        # 12=LEFT_LEG, 13=RIGHT_LEG, 14=LEFT_ARM, 15=RIGHT_ARM, 17=SCARF
+        # NOTE: 16=BAG excluded — bags are accessories, not body/garment regions.
+        #
+        # EXCEPTION for draped garments (saree, lehenga, dupatta):
+        # The drape extends BEYOND SCHP body labels into background regions
+        # (pallu over shoulder, fabric flowing past body silhouette).  ANDing
+        # with body labels would block these extended drape areas from the mask,
+        # preventing the model from generating garment in those regions.
+        # For draped garments, use the silhouette directly without body-label AND.
+        _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
+        if not _is_draped_garment:
+            _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
+            _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
+            if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
+                _schp_body = np.array(
+                    Image.fromarray(_schp_body).resize(
+                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                    )
                 )
+                _schp_body = (_schp_body > 127).astype(np.uint8) * 255
+            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
+        else:
+            # Draped: use broader body+background mask to include drape zones
+            # Include all non-identity labels (body + background near body)
+            _non_identity = set(range(0, 19)) - {0, 1, 2, 3, 9, 10, 11, 18}
+            _schp_all = np.isin(schp_np, list(_non_identity)).astype(np.uint8) * 255
+            # Dilate the non-identity mask to catch background regions adjacent
+            # to body (where drape extends beyond body silhouette)
+            _dilate_ks = max(5, int(min(h_s, w_s) * 0.01))
+            if _dilate_ks % 2 == 0:
+                _dilate_ks += 1
+            _dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_dilate_ks, _dilate_ks))
+            _schp_all = cv2.dilate(_schp_all, _dilate_kernel, iterations=1)
+            if _schp_all.shape[:2] != garm_silhouette_mask.shape[:2]:
+                _schp_all = np.array(
+                    Image.fromarray(_schp_all).resize(
+                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                    )
+                )
+                _schp_all = (_schp_all > 127).astype(np.uint8) * 255
+            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_all)
+            logger.info(
+                "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
+                int(np.sum(garm_silhouette_mask > 127)), trace_id,
             )
-            _schp_body = (_schp_body > 127).astype(np.uint8) * 255
-        garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
 
         # Add garment silhouette to inpaint mask
         enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
@@ -1530,21 +1632,43 @@ def run_idm_vton_inference(
 
     mask = final_mask
 
+    # Default feather_px — used by both feathering and body_preserve.
+    # Must be defined before the try block so body_preserve can reference it
+    # even if feathering fails.
+    _feather_px = 4
+
     # Apply feathered edges for smoother blending at mask boundaries.
     # This converts the binary mask to a soft gradient mask (0.0-1.0)
     # that the diffusion model uses to blend inpainted and original pixels.
     # Applied AFTER all binary safety checks, right before inference.
+    #
+    # Adaptive feather radius: flowing/draped garments (saree, dress) need
+    # wider transitions to avoid visible seams at drape boundaries. Tight
+    # garments (t-shirt, jeans) need narrower transitions to preserve fit.
     try:
         from mask_pipeline import feather_mask_edges
         mask_np_final = np.array(final_mask, dtype=np.uint8)
-        soft_mask = feather_mask_edges(mask_np_final, feather_px=4)
+        # Adaptive feather: flowing garments get wider transitions
+        _feather_px = 4  # default
+        _st = (garment_subtype or "").strip().lower().replace("-", "_").replace(" ", "_")
+        _ct = (cloth_type or "").strip().lower()
+        if _ct in ("dresses", "full_body") or any(
+            kw in _st for kw in ("saree", "sari", "lehenga", "gown", "dress",
+                                  "kimono", "abaya", "dupatta", "drape")
+        ):
+            _feather_px = 6
+        elif any(kw in _st for kw in ("tshirt", "t_shirt", "tank", "crop",
+                                       "tube", "camisole", "bralette")):
+            _feather_px = 3
+        soft_mask = feather_mask_edges(mask_np_final, feather_px=_feather_px)
         # Convert float [0,1] to PIL image with values [0,255]
         soft_mask_pil = Image.fromarray((soft_mask * 255).astype(np.uint8), mode="L")
         if soft_mask_pil.size != TARGET_SIZE:
             soft_mask_pil = soft_mask_pil.resize(TARGET_SIZE, Image.LANCZOS)
         mask = soft_mask_pil
         logger.info(
-            "feathered_mask_applied feather_px=4 trace_id=%s", trace_id,
+            "feathered_mask_applied feather_px=%d subtype=%s cloth_type=%s trace_id=%s",
+            _feather_px, garment_subtype, cloth_type, trace_id,
         )
     except Exception as exc:
         logger.warning("feathered_mask_failed_fallback_to_binary error=%s", exc)
@@ -1601,6 +1725,26 @@ def run_idm_vton_inference(
             )
 
             prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
+            # Enrich garment condition prompt with subtype-specific attributes
+            # for better garment structure and fabric conditioning.
+            # Coverage/fit/silhouette tell the model HOW the garment sits on the body.
+            _gc_attrs = _GARMENT_PROMPT_ATTRS.get(
+                (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_"), {}
+            )
+            _gc_parts = [prompt_c]
+            for _gc_key in ("coverage", "fit", "silhouette", "material",
+                            "fabric_behavior", "drape"):
+                if _gc_key in _gc_attrs:
+                    _gc_parts.append(_gc_attrs[_gc_key])
+            # ── Same-category draped garment dominance ──────────────────
+            # For same-category replacement (saree→saree), the garment
+            # condition prompt must explicitly assert the new garment's
+            # identity to override the old garment's conditioning.
+            if source_cloth_type and source_cloth_type == cloth_type:
+                _gc_parts.append("complete garment replacement")
+                _gc_parts.append("entire garment matches reference")
+                _gc_parts.append("uniform color throughout")
+            prompt_c = ", ".join(_gc_parts)
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
@@ -1689,23 +1833,34 @@ def run_idm_vton_inference(
         # used inside the mask, while identity is preserved outside.
         final_mask_np_arr = np.array(final_mask, dtype=np.float32) / 255.0
 
-        # Gaussian blur for smooth transition at mask boundaries.
-        # final_mask=1.0 means inpaintable (garment region), 0.0 means protected.
-        # body_preserve=1.0 means "keep original person", 0.0 means "use diffusion".
-        # So we INVERT after blur: garment region → 0.0 (use diffusion),
-        # protected region → 1.0 (keep original).
-        ks = 11
-        body_preserve = 1.0 - cv2.GaussianBlur(final_mask_np_arr, (ks, ks), 3.5)
-        body_preserve = np.clip(body_preserve, 0.0, 1.0)
+        # The feathered mask controls the boundary transition between
+        # "use diffusion output" (feathered=1.0) and "keep original" (feathered=0.0).
+        # body_preserve should be the EXACT COMPLEMENT: where feathered=1.0,
+        # body_preserve=0.0 (use diffusion). Where feathered=0.0, body_preserve=1.0
+        # (keep original). This ensures no overlap/conflict at boundaries.
+        #
+        # The feathered mask was computed from final_mask using signed-distance
+        # cosine gradient. We compute its complement directly from final_mask
+        # using the SAME feather function and feather_px, guaranteeing they sum
+        # to 1.0 at every pixel.
+        feather_inv = feather_mask_edges(
+            (final_mask_np_arr < 0.5).astype(np.uint8) * 255, feather_px=_feather_px
+        )
+        body_preserve = feather_inv
 
         # For identity regions (face, hair, shoes, hat, sunglasses, bag),
         # always preserve the original with higher strength.
         # These labels must never be altered by the diffusion model.
-        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
+        # NOTE: Label 18 (NECK) is NOT hard-protected — it is part of the
+        # garment neckline. Protecting it prevents the model from generating
+        # proper dress/top necklines (V-neck, scoop, collar). The feathered
+        # mask boundary already provides smooth transition around the neck.
+        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16}
         _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
 
-        # Dilate hard protect by a few pixels to cover boundary zones
-        ks_hp = 7
+        # Dilate hard protect by 3px to cover boundary zones without
+        # bleeding into the feathered garment transition area.
+        ks_hp = 3
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
@@ -1713,16 +1868,38 @@ def run_idm_vton_inference(
         # Where hard_protect=0, use the mask-driven body_preserve
         body_preserve = np.maximum(body_preserve, _hard_mask)
 
-        # Gaussian-blur the final combined mask for smooth transition
-        body_preserve = cv2.GaussianBlur(body_preserve, (7, 7), 2.5)
-        body_preserve = np.clip(body_preserve, 0.0, 1.0)
-
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
         logger.info("body_shape_preservation_applied preserve_ratio=%.3f trace_id=%s",
                      float(np.mean(body_preserve)), trace_id)
+
+        # ── GARMENT TEXTURE RECOVERY ────────────────────────────────────
+        # Apply mild unsharp mask to the inpaint region to recover fabric
+        # texture detail lost by the diffusion model's denoising process.
+        # Uses the feathered mask as a soft spatial weight so the sharpening
+        # fades at boundaries, avoiding hard edges.
+        try:
+            result_np = np.array(images[0], dtype=np.float32)
+            # Feathered mask = 1.0 in garment center, 0.0 outside
+            _fm = np.array(mask, dtype=np.float32) / 255.0
+            # Mild unsharp mask: enhance local contrast in garment region
+            _gray = cv2.cvtColor(
+                np.clip(result_np, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY
+            ).astype(np.float32)
+            _blurred = cv2.GaussianBlur(_gray, (0, 0), sigmaX=1.0)
+            _detail = _gray - _blurred  # high-frequency detail
+            # Boost detail by 15% in garment region, weighted by feathered mask
+            _boost = _detail * 0.15 * _fm  # only in garment region
+            # Apply boost to each RGB channel
+            for c in range(3):
+                result_np[:, :, c] += _boost
+            result_np = np.clip(result_np, 0, 255).astype(np.uint8)
+            images[0] = Image.fromarray(result_np)
+            logger.info("garment_texture_recovery_applied trace_id=%s", trace_id)
+        except Exception as _tex_exc:
+            logger.warning("garment_texture_recovery_failed error=%s", _tex_exc)
     except Exception as exc:
         logger.warning("body_shape_preservation_failed error=%s", exc)
 

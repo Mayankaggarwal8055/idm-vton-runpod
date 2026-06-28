@@ -910,7 +910,7 @@ class PipelineRoute:
     erase_steps: int = 0
     erase_guidance: float = 5.5
     apply_steps: int = 50
-    apply_guidance: float = 2.5
+    apply_guidance: float = 3.5
     is_cross: bool = False
     is_draped: bool = False
     is_structured: bool = False
@@ -957,7 +957,7 @@ def compute_pipeline_route(
     erase_steps_env = int(os.environ.get("CROSS_CATEGORY_ERASE_STEPS", "50"))
     erase_guidance_env = float(os.environ.get("CROSS_CATEGORY_ERASE_GUIDANCE", "5.5"))
     apply_steps = requested_steps
-    apply_guidance = requested_guidance if requested_guidance is not None else float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
+    apply_guidance = requested_guidance if requested_guidance is not None else float(os.environ.get("IDM_VTON_GUIDANCE", "3.5"))
 
     # ── Routing decision tree ──────────────────────────────────────────
     if not is_cross:
@@ -965,7 +965,12 @@ def compute_pipeline_route(
         # But increase steps/guidance for complex families
         if is_draped:
             apply_steps = max(apply_steps, int(os.environ.get("IDM_VTON_DRESS_STEPS", "50")))
-            apply_guidance = max(apply_guidance, float(os.environ.get("IDM_VTON_DRESS_GUIDANCE", "3.1")))
+            # Use the global guidance (3.5) for same-category draped, not a
+            # lower value.  Same-category draped (saree→saree) needs strong
+            # garment conditioning to fully replace the old garment's color.
+            # The previous value (3.1) was too low, allowing the old garment
+            # to persist in some regions.
+            apply_guidance = max(apply_guidance, float(os.environ.get("IDM_VTON_GUIDANCE", "3.5")))
             route = "draped"
         elif is_structured:
             apply_steps = max(apply_steps, 40)
@@ -1277,6 +1282,15 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
     Returns one of: "upper_body", "lower_body", "dresses", "unknown".
     This is used for source-aware mask expansion: when the target garment
     covers different body regions than the source, the mask must expand.
+
+    Detection priority:
+      1. Saree/draped detection (scarf + dress combo) — must run FIRST
+         because sarees always have upper_clothes (blouse) that would
+         falsely trigger the upper_body check.
+      2. Dress detection (label 7 > 30%)
+      3. Scarf detection (label 17 > 10%)
+      4. Pants/lower detection
+      5. Upper clothes detection (label 4 > 40%)
     """
     h, w = schp_np.shape
     total = h * w
@@ -1292,34 +1306,64 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
     if garment_px == 0:
         return "unknown"
 
-    # Check for coat/outerwear (LIP label 4 = upper_clothes) — high confidence indicator
-    coat_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
-    if coat_px / max(garment_px, 1) > 0.15:
-        return "upper_body"
-
-    # Check for dress (LIP label 7) — covers most of body
+    upper_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
     dress_px = label_counts.get(_LABEL_DRESS, 0)
-    if dress_px / max(garment_px, 1) > 0.30:
-        return "dresses"
-
-    # Check for scarf (LIP label 17) — indicates draped garment
     scarf_px = label_counts.get(_LABEL_SCARF, 0)
-    if scarf_px / max(garment_px, 1) > 0.10:
-        return "dresses"
-
-    # Check for pants (LIP label 6) — lower body dominant
     pants_px = label_counts.get(_LABEL_PANTS, 0)
     skirt_px = label_counts.get(_LABEL_SKIRT, 0)
     lower_px = pants_px + skirt_px
-    if lower_px / max(garment_px, 1) > 0.40:
+    arm_px = label_counts.get(_LABEL_LEFT_ARM, 0) + label_counts.get(_LABEL_RIGHT_ARM, 0)
+    leg_px = label_counts.get(_LABEL_LEFT_LEG, 0) + label_counts.get(_LABEL_RIGHT_LEG, 0)
+
+    # ── 1. Saree / draped detection (HIGHEST PRIORITY) ───────────────
+    # Sarees ALWAYS have upper_clothes (blouse) AND scarf (pallu) labels.
+    # The old code checked upper_clothes first at 15% threshold, which
+    # misclassified sarees as "upper_body" because the blouse alone
+    # exceeds 15%.  By checking for the saree pattern FIRST (scarf +
+    # dress/upper combo), we catch sarees before the upper_body check.
+    #
+    # Key insight: a genuine upper_body garment (t-shirt, jacket) has
+    # upper_clothes but NO scarf and NO dress labels.  A saree has ALL
+    # three.  The scarf+upper_clothes combo is the fingerprint.
+    garment_ratio = max(garment_px, 1)
+    has_scarf = scarf_px / garment_ratio > 0.05
+    has_upper = upper_px / garment_ratio > 0.10
+    has_dress = dress_px / garment_ratio > 0.15
+    has_arms = arm_px / garment_ratio > 0.08
+    has_legs = leg_px / garment_ratio > 0.08
+
+    # Saree pattern: scarf present + upper clothes (blouse) + body coverage
+    # This catches sarees even when the pallu is small (5-10% of garment px)
+    if has_scarf and has_upper:
+        return "dresses"
+    # Dress+saree pattern: large dress region + scarf (pallu over shoulder)
+    if has_dress and has_scarf:
+        return "dresses"
+    # Full-body draped: arms + legs covered + upper clothes = saree/dress
+    # This catches sarees where the scarf is not visible (pallu behind back)
+    if has_upper and has_arms and has_legs and (dress_px + scarf_px) / garment_ratio > 0.10:
+        return "dresses"
+
+    # ── 2. Dress detection (label 7 dominates) ──────────────────────
+    if dress_px / garment_ratio > 0.30:
+        return "dresses"
+
+    # ── 3. Scarf detection (draped garment indicator) ───────────────
+    if scarf_px / garment_ratio > 0.10:
+        return "dresses"
+
+    # ── 4. Pants / lower body detection ─────────────────────────────
+    if lower_px / garment_ratio > 0.40:
         return "lower_body"
 
-    # Check for upper clothes (LIP label 4) — upper body dominant
-    upper_px = label_counts.get(_LABEL_UPPER_CLOTHES, 0)
-    if upper_px / max(garment_px, 1) > 0.40:
+    # ── 5. Upper body detection (ONLY for genuine upper garments) ────
+    # Raised threshold from 0.15 to 0.40 to avoid false positives from
+    # saree blouses.  A genuine upper_body garment has upper_clothes
+    # as the DOMINANT label (>40%) with no scarf or dress labels.
+    if upper_px / garment_ratio > 0.40:
         return "upper_body"
 
-    # Default: if mostly upper clothing, assume upper_body
+    # ── 6. Default fallback ─────────────────────────────────────────
     if upper_px >= dress_px and upper_px >= lower_px:
         return "upper_body"
     if lower_px >= upper_px and lower_px >= dress_px:
@@ -1673,6 +1717,36 @@ def build_schp_inpaint_mask(
             # Include scarf label for pallu/dupatta drape over shoulder
             scarf_mask = (schp_labels == _LABEL_SCARF).astype(np.uint8) * 255
             mask = np.maximum(mask, scarf_mask)
+
+            # Garment geometry expansion for cross-category draped targets.
+            # The label-based mask covers SCHP body regions, but draped garments
+            # (saree pallu, dupatta, lehenga flare) extend BEYOND body labels.
+            # Expand the mask using garment geometry to cover these drape zones.
+            geo = get_garment_geometry(garment_subtype)
+            h, w = schp_labels.shape
+            if geo.expansion_down > 0 or geo.expansion_up > 0 or geo.expansion_width > 0:
+                mask_ys, mask_xs = np.where(mask > 127)
+                if len(mask_ys) > 0:
+                    y_min, y_max = int(mask_ys.min()), int(mask_ys.max())
+                    x_min, x_max = int(mask_xs.min()), int(mask_xs.max())
+                    y_min_exp = max(0, y_min - geo.expansion_up)
+                    y_max_exp = min(h, y_max + geo.expansion_down)
+                    x_min_exp = max(0, x_min - geo.expansion_width)
+                    x_max_exp = min(w, x_max + geo.expansion_width)
+                    expansion_zone = np.zeros_like(mask)
+                    expansion_zone[y_min_exp:y_max_exp, x_min_exp:x_max_exp] = 255
+                    # Only include body-region pixels in expansion
+                    body_labels = set(range(4, 19)) - _IDENTITY_PROTECT_LABELS
+                    body_mask = np.isin(schp_labels, list(body_labels)).astype(np.uint8) * 255
+                    expansion_body = np.minimum(expansion_zone, body_mask)
+                    mask = np.maximum(mask, expansion_body)
+                    if np.any(expansion_body > 127):
+                        logger.info(
+                            "cross_category_drape_expansion subtype=%s down=%d up=%d "
+                            "width=%d expanded_px=%d",
+                            garment_subtype, geo.expansion_down, geo.expansion_up,
+                            geo.expansion_width, int(np.sum(expansion_body > 127)),
+                        )
 
         # Include body regions where source overlaps but target doesn't cover
         # This ensures old garment regions that are outside target coverage

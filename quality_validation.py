@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
+import cv2
 from PIL import Image
 
 logger = logging.getLogger("idm-vton.worker.quality")
@@ -199,17 +200,37 @@ def validate_garment_region(
         reasons.append("garment_unchanged")
 
     # ── 2. Texture detail (local contrast in garment region) ─────────────
+    # Use LOCAL contrast (mean of per-pixel local std) instead of global
+    # variance. Global variance is inflated by color gradients across the
+    # garment (e.g., a gradient from light to dark), while local contrast
+    # measures actual fabric texture (wrinkles, weave, seams).
     gray_out = np.array(result.convert("L"), dtype=np.float32)
     if np.any(inpaint_region):
-        garm_gray = gray_out[inpaint_region]
-        texture_var = float(np.var(garm_gray))
-        # Normalise: variance of 2000+ = detailed, <800 = smooth/plastic
-        # (raised from 500 to avoid rejecting naturally smooth fabrics like silk/satin)
-        texture_detail = min(1.0, texture_var / 2000.0)
+        # Compute local standard deviation using a 7x7 window
+        kernel_size = 7
+        pad = kernel_size // 2
+        padded = cv2.copyMakeBorder(
+            gray_out, pad, pad, pad, pad, cv2.BORDER_REFLECT
+        )
+        local_sum = np.zeros_like(gray_out)
+        local_sq_sum = np.zeros_like(gray_out)
+        for dy in range(kernel_size):
+            for dx in range(kernel_size):
+                local_sum += padded[dy:dy + gray_out.shape[0],
+                                    dx:dx + gray_out.shape[1]]
+                local_sq_sum += padded[dy:dy + gray_out.shape[0],
+                                       dx:dx + gray_out.shape[1]] ** 2
+        local_mean = local_sum / (kernel_size ** 2)
+        local_var = local_sq_sum / (kernel_size ** 2) - local_mean ** 2
+        local_std = np.sqrt(np.maximum(local_var, 0.0))
+        # Average local std within the inpaint region
+        texture_var = float(np.mean(local_std[inpaint_region]))
+        # Normalise: local_std of 15+ = detailed, <5 = smooth/plastic
+        texture_detail = min(1.0, texture_var / 15.0)
     else:
         texture_detail = 0.5
 
-    if texture_detail < 0.15:
+    if texture_detail < 0.25:
         reasons.append("garment_over_smooth")
 
     # ── 3. Colour coherence with input garment (mask region only) ───────
@@ -297,6 +318,47 @@ def _ssim_score(original: Image.Image, result: Image.Image, mask_np: np.ndarray 
         if np.any(protected):
             return float(np.mean(ssim_map[protected]))
     return float(np.mean(ssim_map))
+
+
+def _background_artifact_score(
+    original: Image.Image,
+    result: Image.Image,
+    mask_np: np.ndarray,
+) -> tuple[float, list[str]]:
+    """Check for artifacts OUTSIDE the inpaint mask (background ghosting, bleeding).
+
+    The inpaint mask defines the garment region. Any visible change in the
+    non-mask region indicates diffusion bleeding or compositing artifacts.
+    Returns (score, reasons) where score 0..1 (1 = clean background).
+    """
+    reasons: list[str] = []
+    orig = np.array(original.convert("RGB"), dtype=np.float32)
+    out = np.array(result.convert("RGB"), dtype=np.float32)
+    if out.shape[:2] != orig.shape[:2]:
+        return 0.5, []
+
+    h, w = orig.shape[:2]
+    if mask_np.shape[:2] != (h, w):
+        return 0.5, []
+
+    # Non-mask region: where mask is 0 (background/protected)
+    bg_region = mask_np < 127
+    if not np.any(bg_region):
+        return 1.0, []
+
+    # Check pixel-level change in background
+    bg_diff = np.mean(np.abs(orig - out), axis=2)
+    bg_change = float(np.mean(bg_diff[bg_region] > 8.0))
+
+    # Ghosting/bleeding: background pixels changed significantly
+    score = max(0.0, min(1.0, 1.0 - bg_change * 5.0))
+
+    if bg_change > 0.15:
+        reasons.append(f"background_ghosting:{bg_change:.2f}")
+    if bg_change > 0.30:
+        reasons.append("background_severe_bleed")
+
+    return score, reasons
 
 
 def _region_editing_score(
@@ -684,6 +746,14 @@ def score_candidate(
         )
         all_reasons.extend(leakage_reasons)
 
+    # ── 10. Background artifact detection ────────────────────────────────
+    bg_artifact_score = 0.5
+    if mask_np is not None:
+        bg_artifact_score, bg_reasons = _background_artifact_score(
+            original, result, mask_np,
+        )
+        all_reasons.extend(bg_reasons)
+
     # ── Aggregate score ────────────────────────────────────────────────
     # Base: garment-family-aware weights (must sum to 1.0)
     aggregate = (
@@ -693,12 +763,28 @@ def score_candidate(
         + w["color_coherence"] * color_coherence
     )
 
-    # Bonus metrics — each 0..1, weighted to contribute up to ~0.25 total
+    # Bonus metrics — each 0..1, weighted to contribute up to ~0.28 total
     aggregate += 0.05 * ssim_val
     aggregate += 0.10 * region_edit      # most important bonus — correct region edited
-    aggregate += 0.04 * boundary_quality
+    aggregate += 0.07 * boundary_quality  # raised from 0.04 — visible seams are user-visible
     aggregate += 0.03 * pose_consistency
     aggregate += 0.03 * geometry_correctness
+    aggregate += 0.05 * bg_artifact_score  # NEW: penalize background ghosting/bleeding
+
+    # ── GARMENT REPLACEMENT FLOOR ──────────────────────────────────────
+    # The scoring system can select a near-original output if face quality
+    # is high, even when garment replacement is weak.  Apply a hard penalty
+    # when replacement is below the minimum acceptable threshold.  This
+    # ensures that a candidate with 95% replacement always beats one with
+    # 40% replacement, regardless of face quality.
+    #
+    # Threshold: 0.45 — below this, the garment is not meaningfully replaced.
+    # Penalty scales linearly from 0 (at threshold) to -0.25 (at 0.0 replacement).
+    _REPLACEMENT_FLOOR = 0.45
+    if replacement < _REPLACEMENT_FLOOR:
+        replacement_penalty = 0.25 * (1.0 - replacement / _REPLACEMENT_FLOOR)
+        aggregate -= replacement_penalty
+        all_reasons.append(f"garment_replacement_insufficient:{replacement:.2f}")
 
     # Apply leakage penalty (once)
     aggregate = max(0.0, aggregate - leakage_penalty)
@@ -706,9 +792,13 @@ def score_candidate(
     # Clamp to [0, 1]
     aggregate = max(0.0, min(1.0, aggregate))
 
-    # Only hard-fail on severe issues
+    # Hard-fail on severe issues including over-smoothing and background bleed
     severe_reasons = [r for r in all_reasons if any(
-        kw in r for kw in ("face_severe_distortion", "garment_unchanged", "image_blurry", "face_identity_drift", "garment_leakage_severe")
+        kw in r for kw in (
+            "face_severe_distortion", "garment_unchanged", "image_blurry",
+            "face_identity_drift", "garment_leakage_severe",
+            "garment_over_smooth", "background_severe_bleed",
+        )
     )]
     passed = len(severe_reasons) == 0
 
@@ -771,16 +861,17 @@ def _detect_garment_leakage(
 
     # High correlation = old garment leaked (colors are too similar)
     # Tiered penalties (mutually exclusive)
-    # Raised thresholds from 0.92/0.85/0.75 to reduce false positives
-    # for same-color garment replacements (e.g. navy replacing blue)
-    if hist_similarity > 0.96:
+    # Lowered thresholds from 0.96/0.92/0.88 to catch partial leakage.
+    # For same-color replacements (navy→blue), leakage detection is less
+    # relevant because the color match is expected — the penalty is small.
+    if hist_similarity > 0.92:
         penalty += 0.15
         reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
         reasons.append("garment_leakage_severe")
-    elif hist_similarity > 0.92:
+    elif hist_similarity > 0.85:
         penalty += 0.08
         reasons.append(f"garment_leakage_color:{hist_similarity:.3f}")
-    elif hist_similarity > 0.88:
+    elif hist_similarity > 0.78:
         penalty += 0.03
 
     # Check for duplicate garment regions (repeated pattern = hallucination)
