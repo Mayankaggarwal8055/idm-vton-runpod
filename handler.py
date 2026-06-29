@@ -1792,76 +1792,45 @@ def run_idm_vton_inference(
     raw_output = images[0].copy()
 
     # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
-    # Mask-driven blending: the inpaint mask is the ground truth for what
-    # the diffusion model should replace vs what should stay original.
-    # Where mask=0: keep original (protected region).
-    # Where mask=1: keep diffusion output (inpaint region).
-    # Gaussian blur at boundaries creates smooth transitions.
+    # Only preserve identity (face, hair, shoes, hat, sunglasses, bag)
+    # and background. Everything else uses the diffusion output directly.
     #
-    # This replaces the old SCHP-label-based approach which incorrectly
-    # preserved arms/legs even when the mask said they should be inpainted
-    # (e.g. saree drape over arms, dress covering legs).
+    # CRITICAL: The old feathered-complement approach (body_preserve =
+    # feathered_inverse of inpaint mask) caused source garment leakage
+    # because the feather zone (4-6px transition) blended original person
+    # pixels (with source garment) back into the diffusion output at
+    # garment boundaries. This is the primary root cause of color bleeding.
+    #
+    # Fix: start with body_preserve=0 everywhere (use diffusion output),
+    # then only add hard_protect for identity + background safeguard.
     try:
         result_arr = np.array(images[0], dtype=np.float32)
         person_arr = np.array(human_img, dtype=np.float32)
 
-        # The feathered mask (already applied) is the ground truth.
-        # Values 0.0-1.0 where 1.0 = fully inpainted, 0.0 = fully protected.
-        mask_arr = np.array(mask, dtype=np.float32) / 255.0
-
-        # For body shape: use a tighter blend mask based on the binary mask,
-        # not the feathered one. This ensures the full diffusion output is
-        # used inside the mask, while identity is preserved outside.
-        final_mask_np_arr = np.array(final_mask, dtype=np.float32) / 255.0
-
-        # The feathered mask controls the boundary transition between
-        # "use diffusion output" (feathered=1.0) and "keep original" (feathered=0.0).
-        # body_preserve should be the EXACT COMPLEMENT: where feathered=1.0,
-        # body_preserve=0.0 (use diffusion). Where feathered=0.0, body_preserve=1.0
-        # (keep original). This ensures no overlap/conflict at boundaries.
-        #
-        # The feathered mask was computed from final_mask using signed-distance
-        # cosine gradient. We compute its complement directly from final_mask
-        # using the SAME feather function and feather_px, guaranteeing they sum
-        # to 1.0 at every pixel.
-        feather_inv = feather_mask_edges(
-            (final_mask_np_arr < 0.5).astype(np.uint8) * 255, feather_px=_feather_px
+        # Start with zero preservation — use diffusion output everywhere
+        body_preserve = np.zeros(
+            (final_mask_np.shape[0], final_mask_np.shape[1]), dtype=np.float32
         )
-        body_preserve = feather_inv
 
-        # For identity regions (face, hair, shoes, hat, sunglasses, bag),
-        # always preserve the original with higher strength.
+        # Identity protection: face, hair, shoes, hat, sunglasses, bag.
         # These labels must never be altered by the diffusion model.
-        # NOTE: Label 18 (NECK) is NOT hard-protected — it is part of the
-        # garment neckline. Protecting it prevents the model from generating
-        # proper dress/top necklines (V-neck, scoop, collar). The feathered
-        # mask boundary already provides smooth transition around the neck.
+        # NOTE: Label 18 (NECK) is NOT protected — it is part of the
+        # garment neckline. Protecting it prevents proper neckline generation.
         _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16}
         _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
 
-        # Dilate hard protect by 3px to cover boundary zones without
-        # bleeding into the feathered garment transition area.
-        ks_hp = 3
+        # Dilate hard protect by 2px to cover boundary zones
+        ks_hp = 2
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
-        # NOTE: Do NOT add extra dilation for face/neck labels here.
-        # The 3px hard_protect is sufficient for face (label 11).
-        # Neck (label 18) is intentionally NOT protected — it is part of
-        # the garment neckline. Extra dilation here preserves original garment
-        # pixels near the chest/neck, causing source clothing leakage.
-
-        # Where hard_protect=1, always preserve original (override body_preserve)
-        # Where hard_protect=0, use the mask-driven body_preserve
+        # Where hard_protect=1, always preserve original
         body_preserve = np.maximum(body_preserve, _hard_mask)
 
-        # ── BACKGROUND PRESERVATION SAFEGUARD ─────────────────────────
-        # feather_inv may not reach 1.0 at image edges where the inpaint
-        # mask extends to the boundary (distanceTransform can't compute
-        # distances beyond the image). This allows diffusion-generated
-        # background to leak through, causing mirror/kaleidoscope artifacts.
-        # Fix: force body_preserve=1.0 wherever binary mask says background.
-        _bin_bg = (final_mask_np_arr < 0.5)
+        # Background safeguard: force body_preserve=1.0 at true background
+        # pixels (binary mask = 0). Use the BINARY mask, not feathered,
+        # to avoid capturing garment pixels in the feather transition zone.
+        _bin_bg = (final_mask_np < 127)
         body_preserve[_bin_bg] = 1.0
 
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted

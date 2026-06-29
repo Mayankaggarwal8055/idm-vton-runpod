@@ -1943,6 +1943,18 @@ def build_final_inpaint_mask(
         schp_labels, cloth_type, garment_subtype, profile=profile,
     )
 
+    # 3b. Cross-category fix: remove SOURCE garment labels from protection.
+    # BUG: get_profile_protect_labels adds source garment labels (e.g. dress,
+    # scarf for saree source) to protection as "non-target" labels. When
+    # subtracted from the inpaint mask, this removes source garment regions
+    # from the final mask. The model then cannot inpaint those regions, and
+    # the background safeguard preserves the original source garment pixels.
+    # FIX: Remove source labels from protect so they remain in the final mask.
+    if is_cross and source_cloth_type:
+        source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
+        source_mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
+        protect = np.minimum(protect, 255 - source_mask)
+
     # 4. Mild dilation for edge blending
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
@@ -2436,6 +2448,19 @@ def safe_build_mask(
         protect = build_schp_protect_mask(
             schp_labels, cloth_type, garment_subtype, profile=profile,
         )
+
+        # Cross-category fix: remove source garment labels from protection
+        # so they remain in the final mask for erasure.
+        is_cross_sc = (
+            source_cloth_type
+            and source_cloth_type != cloth_type
+            and source_cloth_type != "unknown"
+        )
+        if is_cross_sc:
+            _src_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
+            _src_mask = np.isin(schp_labels, list(_src_labels)).astype(np.uint8) * 255
+            protect = np.minimum(protect, 255 - _src_mask)
+
         h, w = schp_labels.shape
         scale = max(1.0, h / 512.0)
         ks = max(3, int(5 * scale))
