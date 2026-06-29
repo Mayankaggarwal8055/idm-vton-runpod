@@ -27,6 +27,7 @@ Design principles:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import cv2
@@ -1994,7 +1995,7 @@ def build_final_inpaint_mask(
     final = apply_protection_binary(inpaint_dilated, protect)
 
     # 6. Debug artifacts
-    if trace_id:
+    if trace_id and os.environ.get("IDM_DEBUG", "").lower() in ("1", "true", "yes"):
         try:
             save_mask_debug_artifacts(
                 trace_id,

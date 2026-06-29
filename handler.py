@@ -78,6 +78,11 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
 DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "50"))
+IDM_VTON_SCHEDULER = os.environ.get("IDM_VTON_SCHEDULER", "ddpm").lower()
+SCHEDULER_NAMES = {"ddpm", "dpmpp"}
+if IDM_VTON_SCHEDULER not in SCHEDULER_NAMES:
+    logger.info("scheduler_unknown_fallback value=%s", IDM_VTON_SCHEDULER)
+    IDM_VTON_SCHEDULER = "ddpm"
 # Guidance scale: 3.5 balances garment faithfulness vs artifact risk.
 # 2.5 was too conservative — model generated soft/over-smoothed texture
 # because it didn't follow garment conditioning strongly enough.
@@ -98,6 +103,9 @@ RETRY_GUIDANCE_BOOST = float(os.environ.get("RETRY_GUIDANCE_BOOST", "0.15"))
 RETRY_STEPS_BOOST = int(os.environ.get("RETRY_STEPS_BOOST", "5"))
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Debug artifact saves — disable in production to eliminate ~1-5s of PNG I/O.
+_SAVE_DEBUG_ARTIFACTS = os.environ.get("IDM_DEBUG", "").lower() in ("1", "true", "yes")
 TORCH_DTYPE = torch.float16
 
 # Memory/perf knobs
@@ -388,6 +396,7 @@ def run_cross_category_inference(
     alignment: "AlignmentTransform | None" = None,
     garment_profile: "GarmentProfile | None" = None,
     input_warnings: "list[str] | None" = None,
+    schp_labels: np.ndarray | None = None,
 ) -> tuple[Image.Image, Image.Image | None, dict[str, object]]:
     """Two-stage cross-category try-on.
 
@@ -468,6 +477,7 @@ def run_cross_category_inference(
         override_negative_prompt=stage1_negative,
         source_cloth_type=source_cloth_type,
         trace_id=trace_id,
+        schp_labels=schp_labels,
     )
 
     logger.info(
@@ -524,8 +534,8 @@ def run_cross_category_inference(
         trace_id,
     )
 
-    # ── Debug saves ───────────────────────────────────────────────────
-    if trace_id:
+    # ── Debug saves (cross-category, gated by IDM_DEBUG) ────────────
+    if _SAVE_DEBUG_ARTIFACTS and trace_id:
         _debug_dir = Path("/tmp/idm-vton-debug")
         _debug_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -823,7 +833,27 @@ def load_models():
                 exc,
             )
 
-    logger.info("Pipeline fully initialized")
+    # ── Runtime scheduler selection ────────────────────────────────────
+    if IDM_VTON_SCHEDULER == "dpmpp":
+        logger.info("scheduler_swap_attempt target=dpmpp_karras")
+        try:
+            from diffusers import DPMSolverMultistepScheduler
+            dpmpp = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                algorithm_type="sde-dpmsolver++",
+                solver_order=2,
+                use_karras_sigmas=True,
+            )
+            pipe.scheduler = dpmpp
+            logger.info("scheduler_swap_success target=dpmpp_karras")
+        except Exception as exc:
+            logger.warning(
+                "scheduler_swap_failed_falling_back_to_ddpm error=%s", exc
+            )
+    else:
+        logger.info("scheduler_active name=ddpm")
+
+    logger.info("Pipeline fully initialized scheduler=%s", IDM_VTON_SCHEDULER)
 
     logger.info("Loading Parsing model...")
     from preprocess.humanparsing.run_parsing import Parsing
@@ -881,7 +911,8 @@ def load_models():
 
     logger.info("=" * 60)
     logger.info("MODELS READY")
-    logger.info("model_load_ms=%.0f", load_ms)
+    logger.info("model_load_ms=%.0f scheduler=%s steps=%d",
+                load_ms, IDM_VTON_SCHEDULER, DENOISE_STEPS)
     logger.info("=" * 60)
 
 # =============================================================================
@@ -1250,6 +1281,7 @@ def run_idm_vton_inference(
     trace_id: str = "",
     alignment: "AlignmentTransform | None" = None,
     garment_profile: "GarmentProfile | None" = None,
+    schp_labels: np.ndarray | None = None,
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -1364,14 +1396,18 @@ def run_idm_vton_inference(
     # not interpolated from 384x512. The ONNX models internally affine-warp
     # to 512x512, so the compute cost is identical — only the output label
     # map resolution increases (1024x768 vs 512x384).
-    model_parse, _ = parsing_model(human_img)
-    # Build binary masks from SCHP labels
-    schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
-    if isinstance(model_parse, torch.Tensor):
-        schp_np = model_parse.cpu().numpy()
-    if schp_np.ndim == 3:
-        schp_np = schp_np.squeeze(0)
-    schp_np = schp_np.astype(np.uint8)
+    # Use pre-computed labels if caller already ran SCHP (avoids redundant inference).
+    if schp_labels is not None and schp_labels.shape == (TARGET_H, TARGET_W):
+        schp_np = schp_labels
+        logger.info("schp_reusing_precomputed_labels trace_id=%s", trace_id)
+    else:
+        model_parse, _ = parsing_model(human_img)
+        schp_np = np.array(model_parse) if not isinstance(model_parse, np.ndarray) else model_parse
+        if isinstance(model_parse, torch.Tensor):
+            schp_np = model_parse.cpu().numpy()
+        if schp_np.ndim == 3:
+            schp_np = schp_np.squeeze(0)
+        schp_np = schp_np.astype(np.uint8)
 
     garment_img_info = analyze_garment_image(garment_img)
     try:
@@ -1395,8 +1431,8 @@ def run_idm_vton_inference(
     # garment image provides finer-grained shape information. Add the
     # garment silhouette as an additional inpaint component so the mask
     # covers the garment's actual shape, not just the body region.
+    garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
     try:
-        garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
         # Canvas is mid-gray (128,128,128) — foreground deviates from gray.
         # Start with tight threshold (20), then fall back to connected-component
         # analysis if the garment is gray-toned (threshold misses too many pixels).
@@ -1510,8 +1546,7 @@ def run_idm_vton_inference(
     # ── P0-5: Mask-silhouette IoU diagnostics ──────────────────────────
     try:
         if _p0_probe is not None:
-            _garm_arr = np.array(garm_img.convert("RGB"), dtype=np.uint8)
-            _garm_sil = (~np.all(np.abs(_garm_arr.astype(np.int16) - 128) < 20, axis=2)).astype(np.uint8) * 255
+            _garm_sil = (~np.all(np.abs(garm_arr.astype(np.int16) - 128) < 20, axis=2)).astype(np.uint8) * 255
             _p0_probe.record_mask_silhouette_iou(final_mask_np, _garm_sil)
     except Exception:
         pass
@@ -1686,7 +1721,7 @@ def run_idm_vton_inference(
                 image=human_img,
                 height=TARGET_H,
                 width=TARGET_W,
-                ip_adapter_image=garm_img.resize(TARGET_SIZE),
+                ip_adapter_image=garm_img,
                 guidance_scale=effective_guidance,
             )
             images = pipe_output[0]
@@ -1861,8 +1896,12 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # ── Garment RGB diagnostics (after download below) ────────────────
 
     download_start = time.perf_counter()
-    person_img = download_image(person_url)
-    garment_img = download_image(garment_url)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _dl_exec:
+        _person_fut = _dl_exec.submit(download_image, person_url)
+        _garment_fut = _dl_exec.submit(download_image, garment_url)
+        person_img = _person_fut.result()
+        garment_img = _garment_fut.result()
 
     # ── Pre-inference quality check ────────────────────────────────────
     q_ok, q_reason = _validate_person_quality(person_img)
@@ -1892,8 +1931,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             garm_foreground_ratio, vton_type, trace_id,
         )
 
-    # ── Garment RGB diagnostics (must run AFTER garment_img is downloaded) ─
-    garm_np = np.array(garment_img.convert("RGB"), dtype=np.float32)
+    # ── Garment RGB diagnostics (reuse garm_check as float32) ───────────────
+    garm_np = garm_check.astype(np.float32)
     garm_mean_r = float(np.mean(garm_np[:, :, 0]))
     garm_mean_g = float(np.mean(garm_np[:, :, 1]))
     garm_mean_b = float(np.mean(garm_np[:, :, 2]))
@@ -1984,6 +2023,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         trace_id,
     )
 
+    inference_ms = 0.0
+    inference_start = time.perf_counter()
+
     # ── Routing decision ────────────────────────────────────────────────
     if pipeline_route.needs_erase:
         logger.info(
@@ -2007,6 +2049,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             alignment=alignment,
             garment_profile=garment_profile,
             input_warnings=input_warnings,
+            schp_labels=det_schp,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -2098,6 +2141,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         candidate_count = max(1, MULTI_CANDIDATE_COUNT)
         max_retry_rounds = max(0, max_retries) if retry_enabled else 0
 
+        # Pre-resize person image for scoring (same every iteration)
+        _scoring_person = person_img if person_img.size == TARGET_SIZE else person_img.resize(TARGET_SIZE)
+
         retry_round = 0
         while retry_round <= max_retry_rounds:
             candidates: list[tuple[Image.Image, Image.Image | None, dict[str, object], object | None]] = []
@@ -2131,6 +2177,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     trace_id=trace_id,
                     alignment=alignment,
                     garment_profile=garment_profile,
+                    schp_labels=det_schp,
                 )
 
                 # Free GPU memory between candidate inferences
@@ -2145,7 +2192,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                 c_vresult = None
                 if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
                     c_vresult = _score_candidate(
-                        person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                        _scoring_person,
                         c_result.resize(TARGET_SIZE) if c_result.size != TARGET_SIZE else c_result,
                         garment_img,
                         mask_np=c_final_mask_np,
@@ -2263,25 +2310,31 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_start) * 1000
 
+    # ── Preprocessing timing ───────────────────────────────────────────
+    # Preprocessing covers: SCHP, source clothing detection, input
+    # validation, garment profiling, alignment, pipeline routing.
+    preproc_ms = (inference_start - download_start - download_ms / 1000) * 1000 \
+        if inference_start > 0 else 0.0
+
     debug.timing_ms["inference_ms"] = inference_ms
     debug.timing_ms["download_ms"] = download_ms
+    debug.timing_ms["preprocessing_ms"] = round(preproc_ms, 2)
 
-    # ── Save complete debug artifacts ────────────────────────────────────
-    debug.raw_output = raw_output
-    debug.final_output = result
-    debug.inpaint_mask_np = mask_meta.get("inpaint_mask_np")
-    debug.protect_mask_np = mask_meta.get("protect_mask_np")
-    debug.final_mask_np = mask_meta.get("final_mask_np")
-    debug.warnings = input_warnings
-
-    # Populate new debug fields
-    debug.processed_garment = mask_meta.get("processed_garment")
-    debug.pose_output = mask_meta.get("pose_output")
-    _debug_garm_arr = np.array(garment_img.convert("RGB"), dtype=np.uint8) if garment_img is not None else None
-    if _debug_garm_arr is not None:
-        debug.garment_silhouette_np = (
-            ~np.all(np.abs(_debug_garm_arr.astype(np.int16) - 128) < 20, axis=2)
-        ).astype(np.uint8) * 255
+    # ── Populate debug artifacts (gated — only needed for IDM_DEBUG saves) ─
+    if _SAVE_DEBUG_ARTIFACTS:
+        debug.raw_output = raw_output
+        debug.final_output = result
+        debug.inpaint_mask_np = mask_meta.get("inpaint_mask_np")
+        debug.protect_mask_np = mask_meta.get("protect_mask_np")
+        debug.final_mask_np = mask_meta.get("final_mask_np")
+        debug.warnings = input_warnings
+        debug.processed_garment = mask_meta.get("processed_garment")
+        debug.pose_output = mask_meta.get("pose_output")
+        _debug_garm_arr = np.array(garment_img.convert("RGB"), dtype=np.uint8) if garment_img is not None else None
+        if _debug_garm_arr is not None:
+            debug.garment_silhouette_np = (
+                ~np.all(np.abs(_debug_garm_arr.astype(np.int16) - 128) < 20, axis=2)
+            ).astype(np.uint8) * 255
     if vresult is not None:
         debug.quality_metrics = {
             "score": vresult.score, "face_quality": vresult.face_quality,
@@ -2299,13 +2352,14 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # Face restoration output will be captured after the face restore step below
 
-    # ── DEBUG SAVE: raw output before face restoration ─────────────────────
-    _debug_dir = Path("/tmp/idm-vton-debug")
-    _debug_dir.mkdir(parents=True, exist_ok=True)
-    if raw_output is not None:
-        raw_output.save(str(_debug_dir / f"raw_output_before_face_restoration_{trace_id}.png"))
-    else:
-        logger.warning("debug_save_raw_output raw_output_is_None trace_id=%s", trace_id)
+    # ── DEBUG SAVE: artifacts before/after face restoration (gated) ────────
+    if _SAVE_DEBUG_ARTIFACTS:
+        _debug_dir = Path("/tmp/idm-vton-debug")
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+        if raw_output is not None:
+            raw_output.save(str(_debug_dir / f"raw_output_before_face_restoration_{trace_id}.png"))
+        else:
+            logger.warning("debug_save_raw_output raw_output_is_None trace_id=%s", trace_id)
 
     # ── Face restoration — mild enhancement, no identity overwrite ────────
     face_restore_enabled = os.environ.get("ENABLE_FACE_RESTORATION", "1") != "0"
@@ -2338,21 +2392,23 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             )
         except Exception as exc:
             logger.warning("face_restoration_failed error=%s trace_id=%s", exc, trace_id)
-        result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
+        if _SAVE_DEBUG_ARTIFACTS and result is not None:
+            result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
     else:
         logger.info("face_restoration_skipped available=%s enabled=%s trace_id=%s",
                      _FACE_RESTORATION_AVAILABLE, face_restore_enabled, trace_id)
-        if result is not None:
+        if _SAVE_DEBUG_ARTIFACTS and result is not None:
             result.save(str(_debug_dir / f"output_after_face_restoration_{trace_id}.png"))
 
-    # ── Save debug artifacts (after face restoration) ────────────────────
-    try:
-        save_debug_artifacts_v2(debug, person_img, garment_img)
-    except Exception as exc:
-        logger.warning("debug_artifacts_save_failed error=%s trace_id=%s", exc, trace_id)
+    # ── Save debug artifacts (gated) ──────────────────────────────────────
+    if _SAVE_DEBUG_ARTIFACTS:
+        try:
+            save_debug_artifacts_v2(debug, person_img, garment_img)
+        except Exception as exc:
+            logger.warning("debug_artifacts_save_failed error=%s trace_id=%s", exc, trace_id)
 
-    # ── DEBUG SAVE: final returned output ─────────────────────────────────
-    if result is not None:
+    # ── DEBUG SAVE: final returned output (gated) ─────────────────────────
+    if _SAVE_DEBUG_ARTIFACTS and result is not None:
         result.save(str(_debug_dir / f"final_returned_output_{trace_id}.png"))
 
     # ── Upload ───────────────────────────────────────────────────────────
@@ -2362,11 +2418,17 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     total_ms = (time.perf_counter() - job_start) * 1000
 
+    current_scheduler = IDM_VTON_SCHEDULER
+    if pipe is not None:
+        sched_name = type(pipe.scheduler).__name__
+        if "DPM" in sched_name or "DPMSolver" in sched_name:
+            current_scheduler = "dpmpp"
     logger.info(
-        "job_complete total_ms=%.0f download_ms=%.0f inference_ms=%.0f upload_ms=%.0f "
-        "retry_count=%s trace_id=%s",
-        total_ms, download_ms, inference_ms, upload_ms,
-        retry_count,
+        "job_complete total_ms=%.0f download_ms=%.0f preproc_ms=%.0f "
+        "inference_ms=%.0f upload_ms=%.0f "
+        "scheduler=%s steps=%d retry_count=%s trace_id=%s",
+        total_ms, download_ms, preproc_ms, inference_ms, upload_ms,
+        current_scheduler, steps, retry_count,
         trace_id,
     )
 
@@ -2399,6 +2461,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "is_draped": pipeline_route.is_draped if pipeline_route else False,
         "is_structured": pipeline_route.is_structured if pipeline_route else False,
         "alignment_center_y": alignment.center_y_ratio if alignment else 0.5,
+        "scheduler": current_scheduler,
+        "steps_used": steps,
     }
 
 
