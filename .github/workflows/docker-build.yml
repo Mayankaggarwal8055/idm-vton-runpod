@@ -32,7 +32,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: mayankaggarwal8055/idm-vton-runpod:v31
+          tags: mayankaggarwal8055/idm-vton-runpod:v32
           build-args: GIT_REVISION=${{ github.sha }}
           cache-from: |
             type=gha
