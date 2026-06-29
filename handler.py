@@ -1332,6 +1332,7 @@ def run_idm_vton_inference(
         safe_build_mask,
         validate_mask_safety,
         apply_protection_binary,
+        get_profile_editable_labels,
     )
 
     # Apply geometry-aware alignment to garment image, then resize to target.
@@ -1509,14 +1510,20 @@ def run_idm_vton_inference(
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
         garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
-        # AND with SCHP body mask for non-draped garments: only include
-        # pixels that SCHP labels as body/garment.
-        # 4=UPPER_CLOTHES, 5=SKIRT, 6=PANTS, 7=DRESS, 8=BELT, 12-15=limbs, 17=SCARF
+        # AND with SCHP target-only labels for non-draped garments: only include
+        # pixels that are EDITABLE for this garment profile.
+        # For upper_body: only upper_clothes+arms (no pants/skirt/legs).
+        # For lower_body: only pants+skirt+legs (no upper_clothes/arms).
+        # This prevents source garment content from leaking into the mask.
         # EXCEPTION for draped garments: drape extends beyond body labels.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
         if not _is_draped_garment:
-            _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
-            _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
+            _target_labels = (
+                get_profile_editable_labels(garment_profile)
+                if garment_profile is not None
+                else {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
+            )
+            _schp_body = np.isin(schp_np, list(_target_labels)).astype(np.uint8) * 255
             if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
                 _schp_body = np.array(
                     Image.fromarray(_schp_body).resize(
@@ -1837,6 +1844,7 @@ def run_idm_vton_inference(
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
+        debug.body_preserve_output = images[0].copy()
         logger.info("body_shape_preservation_applied preserve_ratio=%.3f trace_id=%s",
                      float(np.mean(body_preserve)), trace_id)
 

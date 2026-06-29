@@ -1852,10 +1852,15 @@ def build_schp_protect_mask(
     mask = np.isin(schp_labels, list(protect_labels)).astype(np.uint8) * 255
 
     # Arm protection — garment-aware
+    _editable = get_profile_editable_labels(profile)
+    _arms_editable = {_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM} & _editable
     if profile.is_draped:
         # Draped: protect only HANDS (distal arm), not full forearms
         hand_zone = _hand_zones_from_arms(schp_labels)
         mask = np.maximum(mask, hand_zone)
+    elif _arms_editable:
+        # Arms are in the editable set (e.g. dress, full_body) — do NOT protect
+        pass
     elif not profile.expose_arms:
         # Standard garments: protect full arms
         mask = np.maximum(mask, np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255)
@@ -1950,6 +1955,11 @@ def build_final_inpaint_mask(
     # from the final mask. The model then cannot inpaint those regions, and
     # the background safeguard preserves the original source garment pixels.
     # FIX: Remove source labels from protect so they remain in the final mask.
+    is_cross = (
+        source_cloth_type
+        and source_cloth_type != cloth_type
+        and source_cloth_type != "unknown"
+    )
     if is_cross and source_cloth_type:
         source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
         source_mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
@@ -2171,6 +2181,7 @@ class DebugArtifacts:
     final_mask_np: "np.ndarray | None" = None
     # Results
     raw_output: "Image.Image | None" = None
+    body_preserve_output: "Image.Image | None" = None
     final_output: "Image.Image | None" = None
     # Processed images
     processed_garment: "Image.Image | None" = None
@@ -2344,6 +2355,8 @@ def save_debug_artifacts_v2(
         # Raw and final output
         if artifacts.raw_output is not None:
             artifacts.raw_output.save(str(debug_dir / "raw_output.png"))
+        if artifacts.body_preserve_output is not None:
+            artifacts.body_preserve_output.save(str(debug_dir / "body_preserve_output.png"))
         if artifacts.final_output is not None:
             artifacts.final_output.save(str(debug_dir / "final_output.png"))
 
