@@ -1291,6 +1291,9 @@ def run_idm_vton_inference(
 
     device = DEVICE
 
+    _stage_times: dict[str, float] = {}
+    _t0 = time.perf_counter()
+
     if torch.cuda.is_available():
         openpose_model.preprocessor.body_estimation.model.to(device)
         pipe.to(device)
@@ -1409,6 +1412,9 @@ def run_idm_vton_inference(
             schp_np = schp_np.squeeze(0)
         schp_np = schp_np.astype(np.uint8)
 
+    _stage_times["schp_parsing_ms"] = (time.perf_counter() - _t0) * 1000
+    _t1 = time.perf_counter()
+
     garment_img_info = analyze_garment_image(garment_img)
     try:
         final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
@@ -1498,35 +1504,28 @@ def run_idm_vton_inference(
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
         garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
-        # AND with SCHP target-only labels for non-draped garments: only include
-        # pixels that are EDITABLE for this garment profile.
-        # For upper_body: only upper_clothes+arms (no pants/skirt/legs).
-        # For lower_body: only pants+skirt+legs (no upper_clothes/arms).
-        # This prevents source garment content from leaking into the mask.
-        # EXCEPTION for draped garments: drape extends beyond body labels.
+        # Limit silhouette to the person's body silhouette so the mask doesn't
+        # bleed into pure background. Use a dilated ALL-BODY mask so SCHP
+        # boundary misclassifications don't clip valid garment pixels.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
-        if not _is_draped_garment:
-            _target_labels = (
-                get_profile_editable_labels(garment_profile)
-                if garment_profile is not None
-                else {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
-            )
-            _schp_body = np.isin(schp_np, list(_target_labels)).astype(np.uint8) * 255
-            if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
-                _schp_body = np.array(
-                    Image.fromarray(_schp_body).resize(
-                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
-                    )
+        _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18}
+        _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
+        _ks_dil = max(5, int(min(_schp_body.shape) * 0.01))
+        if _ks_dil % 2 == 0:
+            _ks_dil += 1
+        _schp_body = cv2.dilate(
+            _schp_body,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_dil, _ks_dil)),
+            iterations=1,
+        )
+        if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
+            _schp_body = np.array(
+                Image.fromarray(_schp_body).resize(
+                    (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
                 )
-                _schp_body = (_schp_body > 127).astype(np.uint8) * 255
-            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
-        else:
-            # Draped: use silhouette directly — drape extends BEYOND body labels
-            # into background regions (pallu over shoulder, fabric flowing past body).
-            logger.info(
-                "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
-                int(np.sum(garm_silhouette_mask > 127)), trace_id,
             )
+            _schp_body = (_schp_body > 127).astype(np.uint8) * 255
+        garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
 
         # Add garment silhouette to inpaint mask
         enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
@@ -1542,6 +1541,9 @@ def run_idm_vton_inference(
         )
     except Exception as exc:
         logger.warning("garment_silhouette_mask_failed error=%s trace_id=%s", exc, trace_id)
+
+    _stage_times["mask_gen_ms"] = (time.perf_counter() - _t1) * 1000
+    _t2 = time.perf_counter()
 
     # ── P0-5: Mask-silhouette IoU diagnostics ──────────────────────────
     try:
@@ -1615,6 +1617,9 @@ def run_idm_vton_inference(
     # inpainting conditioning.
     _feather_px = 0
 
+    _stage_times["densepose_start_ms"] = (time.perf_counter() - _t2) * 1000
+    _t3 = time.perf_counter()
+
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
     human_img_arg = _apply_exif_orientation(human_img.resize(TARGET_SIZE, Image.LANCZOS))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
@@ -1643,6 +1648,9 @@ def run_idm_vton_inference(
             pose_img = vis.visualize(gray_img, data)
             pose_img = pose_img[:, :, ::-1]
             pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE, Image.LANCZOS)
+
+    _stage_times["densepose_ms"] = (time.perf_counter() - _t3) * 1000
+    _t4 = time.perf_counter()
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
@@ -1673,12 +1681,28 @@ def run_idm_vton_inference(
                 negative_prompt=negative_prompt,
             )
 
+    _stage_times["prompt_encoding_ms"] = (time.perf_counter() - _t4) * 1000
+    _t5 = time.perf_counter()
+
     pose_tensor = tensor_transform(pose_img).unsqueeze(0).to(device, TORCH_DTYPE)
     garm_tensor = tensor_transform(garm_img).unsqueeze(0).to(device, TORCH_DTYPE)
 
     # Store pose output in mask_meta for debug artifacts
     mask_meta["pose_output"] = pose_img
     generator = torch.Generator(device).manual_seed(seed) if seed is not None and torch.cuda.is_available() else None
+
+    _stage_times["tensor_prep_ms"] = (time.perf_counter() - _t5) * 1000
+    _t6 = time.perf_counter()
+
+    # ── Pre-inference diagnostics ────────────────────────────────────
+    logger.info(
+        "pre_inference scheduler=%s steps=%d seed=%s guidance=%.2f "
+        "mask_editable_px=%d total_px=%d coverage=%.1f%% cloth_type=%s trace_id=%s",
+        type(pipe.scheduler).__name__, steps, seed, effective_guidance,
+        int(np.sum(final_mask_np > 127)), final_mask_np.size,
+        float(np.sum(final_mask_np > 127)) / final_mask_np.size * 100.0,
+        cloth_type, trace_id,
+    )
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -1729,20 +1753,25 @@ def run_idm_vton_inference(
                 logger.error("pipeline_returned_empty_images")
                 raise RuntimeError("Pipeline returned empty images list — inference produced no output")
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _stage_times["diffusion_inference_ms"] = (time.perf_counter() - _t6) * 1000
+    _t7 = time.perf_counter()
+
     raw_output = images[0].copy()
 
     # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
-    # Only preserve identity (face, hair, shoes, hat, sunglasses, bag)
-    # and background. Everything else uses the diffusion output directly.
+    # Preserve ORIGINAL pixels ONLY for identity-critical regions and
+    # non-target body regions (from GarmentProfile). Everything else
+    # uses the diffusion output directly.
     #
-    # CRITICAL: The old feathered-complement approach (body_preserve =
-    # feathered_inverse of inpaint mask) caused source garment leakage
-    # because the feather zone (4-6px transition) blended original person
-    # pixels (with source garment) back into the diffusion output at
-    # garment boundaries. This is the primary root cause of color bleeding.
+    # CRITICAL: Do NOT preserve background (label 0) — that was causing
+    # visible clipping seams at garment boundaries. The SDXL inpainting
+    # pipeline naturally preserves unmasked (mask=0) pixels, so background
+    # is handled correctly without explicit body_preserve.
     #
-    # Fix: start with body_preserve=0 everywhere (use diffusion output),
-    # then only add hard_protect for identity + background safeguard.
+    # Also do NOT hardcode neck (label 18) — let the GarmentProfile
+    # decide whether neck is covered (e.g., turtleneck covers neck).
     try:
         result_arr = np.array(images[0], dtype=np.float32)
         person_arr = np.array(human_img, dtype=np.float32)
@@ -1752,41 +1781,62 @@ def run_idm_vton_inference(
             (final_mask_np.shape[0], final_mask_np.shape[1]), dtype=np.float32
         )
 
-        # Identity protection: face, hair, shoes, hat, sunglasses, bag, neck.
-        # These labels must never be altered by the diffusion model.
-        # NOTE: Label 18 (NECK) IS protected — it is part of identity.
-        # The old code protected neck implicitly via ~np.isin(clothing).
-        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
-        _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
+        # Profile-driven protection from mask pipeline — covers identity +
+        # non-target body regions (e.g., arms for upper-body, torso for
+        # lower-body). This is garment-type-aware and replaces hardcoded rules.
+        if protect_mask_np is not None and protect_mask_np.shape == body_preserve.shape:
+            _profile_protect = protect_mask_np.astype(np.float32) / 255.0
+            # Dilate profile protection by 3px for boundary safety
+            _ks_pp = 3
+            if _ks_pp % 2 == 0:
+                _ks_pp += 1
+            _k_pp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_pp, _ks_pp))
+            _profile_protect = cv2.dilate(_profile_protect, _k_pp, iterations=1)
+            body_preserve = np.maximum(body_preserve, _profile_protect)
 
-        # Dilate hard protect by 2px to cover boundary zones
-        ks_hp = 2
-        kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
-        _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
-
-        # Where hard_protect=1, always preserve original
-        body_preserve = np.maximum(body_preserve, _hard_mask)
-
-        # NOTE: No background safeguard here. The old code had no body_preserve
-        # at all — the model output was the final image. Adding a background
-        # safeguard that preserves original pixels where the mask is 0 caused
-        # source garment color to bleed through at mask edges. The model
-        # already handles background correctly via the binary inpaint mask.
+        # Minimal hardcoded safety net: protect only FACE and HAIR.
+        # Everything else (hands, neck, background) is handled by the
+        # profile-driven protect mask or the model's inpainting.
+        _safety_protect = {11, 2}  # face, hair
+        _safety_mask = np.isin(schp_np, list(_safety_protect)).astype(np.float32)
+        _ks_safe = 5
+        if _ks_safe % 2 == 0:
+            _ks_safe += 1
+        _k_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_safe, _ks_safe))
+        _safety_mask = cv2.dilate(_safety_mask, _k_safe, iterations=1)
+        body_preserve = np.maximum(body_preserve, _safety_mask)
 
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
-        debug.body_preserve_output = images[0].copy()
         logger.info("body_shape_preservation_applied preserve_ratio=%.3f trace_id=%s",
                      float(np.mean(body_preserve)), trace_id)
     except Exception as exc:
         logger.warning("body_shape_preservation_failed error=%s", exc)
 
+    _stage_times["body_preserve_ms"] = (time.perf_counter() - _t7) * 1000
+    _stage_times["total_inference_ms"] = (time.perf_counter() - _t0) * 1000
+
+    logger.info(
+        "inference_timings schp=%.0fms mask=%.0fms densepose=%.0fms "
+        "prompt_enc=%.0fms tensor=%.0fms diffusion=%.0fms "
+        "body_preserve=%.0fms total=%.0fms trace_id=%s",
+        _stage_times.get("schp_parsing_ms", 0),
+        _stage_times.get("mask_gen_ms", 0),
+        _stage_times.get("densepose_ms", 0),
+        _stage_times.get("prompt_encoding_ms", 0),
+        _stage_times.get("tensor_prep_ms", 0),
+        _stage_times.get("diffusion_inference_ms", 0),
+        _stage_times.get("body_preserve_ms", 0),
+        _stage_times.get("total_inference_ms", 0),
+        trace_id,
+    )
+
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
         final_img = human_img_orig.copy()
-        final_img.paste(out_img, (round(left), round(top)))
+        final_img.paste(out_img, (int(left), int(top)))
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta
