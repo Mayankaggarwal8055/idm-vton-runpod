@@ -1965,14 +1965,30 @@ def build_final_inpaint_mask(
         source_mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
         protect = np.minimum(protect, 255 - source_mask)
 
-    # 4. Mild dilation for edge blending
+    # 4. Contour-aware dilation for edge blending
+    # Old working code used garment-shape-aware kernels:
+    #   lower_body/dresses: (19,29)×2 — wider vertically for legs/skirt
+    #   upper_body: (25,15)×1 — wider horizontally for torso
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
-    ks = max(3, int(5 * scale))
-    if ks % 2 == 0:
-        ks += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-    inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        leg_kw = max(3, int(19 * scale))
+        leg_kh = max(3, int(29 * scale))
+        if leg_kw % 2 == 0:
+            leg_kw += 1
+        if leg_kh % 2 == 0:
+            leg_kh += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
+        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=2)
+    else:
+        up_kw = max(3, int(25 * scale))
+        up_kh = max(3, int(15 * scale))
+        if up_kw % 2 == 0:
+            up_kw += 1
+        if up_kh % 2 == 0:
+            up_kh += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (up_kw, up_kh))
+        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
 
     # 5. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
