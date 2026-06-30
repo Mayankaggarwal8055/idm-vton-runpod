@@ -1357,11 +1357,20 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
     if lower_px / garment_ratio > 0.40:
         return "lower_body"
 
-    # ── 5. Upper body detection (ONLY for genuine upper garments) ────
+    # ── 4a. Pre-upper catch ────────────────────────────────────────
+    # Upper garments present but below 40% threshold (partially occluded,
+    # tucked-in, small crop top). Only when dress is not significant to
+    # avoid stealing dress labels from misclassified SCHP boundaries.
+    _upper_ratio = upper_px / garment_ratio
+    _dress_ratio = dress_px / garment_ratio
+    if _upper_ratio > 0.15 and _dress_ratio < 0.15 and _upper_ratio >= lower_px / garment_ratio:
+        return "upper_body"
+
+    # ── 5. Upper body detection (genuine upper garments) ────────────
     # Raised threshold from 0.15 to 0.40 to avoid false positives from
     # saree blouses.  A genuine upper_body garment has upper_clothes
     # as the DOMINANT label (>40%) with no scarf or dress labels.
-    if upper_px / garment_ratio > 0.40:
+    if _upper_ratio > 0.40:
         return "upper_body"
 
     # ── 6. Default fallback ─────────────────────────────────────────
@@ -1870,6 +1879,15 @@ def build_schp_protect_mask(
     if profile.is_draped:
         dilate_px = max(5, dilate_px - 2)
 
+    # Universal hand protection: always protect the distal portion of
+    # each arm (hands/wrists) regardless of garment type. This prevents
+    # the model from generating distorted hands while still allowing
+    # sleeve generation on the proximal arm. Hands do not change during
+    # a try-on and must always remain original.
+    _hand_protect = _hand_zones_from_arms(schp_labels)
+    if np.any(_hand_protect):
+        mask = np.maximum(mask, _hand_protect)
+
     mask = _dilate_mask(mask, dilate_px, iterations=1)
     return mask
 
@@ -1967,23 +1985,26 @@ def build_final_inpaint_mask(
         protect = np.minimum(protect, 255 - source_mask)
 
     # 4. Contour-aware dilation for edge blending
-    # Old working code used garment-shape-aware kernels:
-    #   lower_body/dresses: (19,29)×2 — wider vertically for legs/skirt
-    #   upper_body: (25,15)×1 — wider horizontally for torso
+    # Reduced kernels: the garment silhouette enhancement (handler.py) adds
+    # more precise mask coverage from the aligned garment foreground, so
+    # aggressive dilation here is unnecessary and causes dark patches,
+    # boundary artifacts, and body shape distortion.
+    #   lower_body/dresses: (11,17)×1 — moderate for leg/skirt boundaries
+    #   upper_body:          (9,5)×1  — tight for torso labels
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
     if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_kw = max(3, int(19 * scale))
-        leg_kh = max(3, int(29 * scale))
+        leg_kw = max(3, int(11 * scale))
+        leg_kh = max(3, int(17 * scale))
         if leg_kw % 2 == 0:
             leg_kw += 1
         if leg_kh % 2 == 0:
             leg_kh += 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
-        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=2)
+        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
     else:
-        up_kw = max(3, int(25 * scale))
-        up_kh = max(3, int(15 * scale))
+        up_kw = max(3, int(9 * scale))
+        up_kh = max(3, int(5 * scale))
         if up_kw % 2 == 0:
             up_kw += 1
         if up_kh % 2 == 0:

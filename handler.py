@@ -1794,9 +1794,13 @@ def run_idm_vton_inference(
             _profile_protect = cv2.dilate(_profile_protect, _k_pp, iterations=1)
             body_preserve = np.maximum(body_preserve, _profile_protect)
 
-        # Minimal hardcoded safety net: protect only FACE and HAIR.
-        # Everything else (hands, neck, background) is handled by the
-        # profile-driven protect mask or the model's inpainting.
+        # Hardcoded safety net: protect FACE, HAIR, and HANDS.
+        # Face and hair are dilated by 5px for boundary safety.
+        # Hands use the distal 38% of each arm (same logic as mask_pipeline
+        # _hand_zones_from_arms) — this preserves original hand pixels while
+        # allowing the model to generate sleeves on the proximal arm.
+        # Everything else (neck, background) is handled by the profile-driven
+        # protect mask or the model's inpainting.
         _safety_protect = {11, 2}  # face, hair
         _safety_mask = np.isin(schp_np, list(_safety_protect)).astype(np.float32)
         _ks_safe = 5
@@ -1804,9 +1808,28 @@ def run_idm_vton_inference(
             _ks_safe += 1
         _k_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_safe, _ks_safe))
         _safety_mask = cv2.dilate(_safety_mask, _k_safe, iterations=1)
+        # Hand zones: distal 38% of each arm label (14, 15)
+        for _arm_label in (14, 15):
+            _arm_pixels = schp_np == _arm_label
+            if np.any(_arm_pixels):
+                _ys = np.where(_arm_pixels)[0]
+                _y_min, _y_max = int(_ys.min()), int(_ys.max())
+                _span = max(1, _y_max - _y_min)
+                _hand_start = _y_max - int(_span * 0.38)
+                _safety_mask = np.maximum(_safety_mask,
+                    (_arm_pixels & (np.arange(schp_np.shape[0])[:, None] >= _hand_start)).astype(np.float32))
         body_preserve = np.maximum(body_preserve, _safety_mask)
 
-        # Blend: where body_preserve=1 keep original, where=0 keep inpainted
+        # Soft boundary blend: Gaussian-blur the body_preserve mask so the
+        # transition between preserved (original) and non-preserved (generated)
+        # regions is smooth. This eliminates visible hard seams at protection
+        # boundaries (face/hair edges, neck, arm boundaries) without affecting
+        # the model's internal inpainting (it's a post-processing blend only).
+        if 0.0 < float(np.mean(body_preserve)) < 1.0:
+            _blur_ks = max(3, int(min(body_preserve.shape) * 0.006))
+            if _blur_ks % 2 == 0:
+                _blur_ks += 1
+            body_preserve = cv2.GaussianBlur(body_preserve, (_blur_ks, _blur_ks), 0)
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
