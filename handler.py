@@ -1492,25 +1492,27 @@ def run_idm_vton_inference(
             garm_silhouette_mask = (garm_silhouette_mask > 127).astype(np.uint8) * 255
 
         # GARMENT SILHOUETTE BOUNDARY SOFTENING:
-        # Dilate silhouette to give buffer room at body-label boundaries.
-        # The previous erosion + AND created double-clipping at jeans/garment
-        # outer edges, producing a visible hard seam. Dilating before AND
-        # ensures the silhouette covers the full garment boundary while the
-        # AND with body labels still prevents background leakage.
+        # Minimal dilation — just enough to smooth contour noise without
+        # creating a "fill zone" (the root cause of visible border/halo).
+        # The previous 0.8% dilation created a band of mask pixels between
+        # the garment edge and the body edge where the model had to invent
+        # content → visible gray outline. Reducing to 0.3% eliminates the
+        # fill zone on most garments while preserving clean boundaries.
         h_s, w_s = garm_silhouette_mask.shape[:2]
-        dilate_ks = max(3, int(min(h_s, w_s) * 0.008))  # ~0.8% of smallest dimension
+        dilate_ks = max(3, int(min(h_s, w_s) * 0.003))  # ~0.3% of smallest dimension
         if dilate_ks % 2 == 0:
             dilate_ks += 1
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
         garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
         # Limit silhouette to the person's body silhouette so the mask doesn't
-        # bleed into pure background. Use a dilated ALL-BODY mask so SCHP
-        # boundary misclassifications don't clip valid garment pixels.
+        # bleed into pure background. Use a conservatively dilated body mask:
+        # enough to cover SCHP boundary misclassifications but not so much
+        # that it allows the silhouette to extend into background regions.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
         _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18}
         _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
-        _ks_dil = max(5, int(min(_schp_body.shape) * 0.01))
+        _ks_dil = max(3, int(min(_schp_body.shape) * 0.005))  # reduced from 0.01 to 0.005
         if _ks_dil % 2 == 0:
             _ks_dil += 1
         _schp_body = cv2.dilate(
@@ -1610,12 +1612,22 @@ def run_idm_vton_inference(
 
     mask = final_mask
 
-    # Binary mask — no feathering. The old working code (67d68ca) sent a
-    # hard binary mask to the model. Feathered masks create boundary
-    # artifacts: dark patches, seams, and inconsistent blending at
-    # garment edges. The model handles blending internally via its
-    # inpainting conditioning.
-    _feather_px = 0
+    # Soft feathering at mask boundaries to eliminate visible hard edges.
+    # The binary mask creates sharp transitions at garment boundaries where
+    # the model output meets preserved pixels. A 3px cosine feather zone
+    # creates a smooth gradient that eliminates the visible seam without
+    # affecting the model's internal inpainting quality.
+    _feather_px = 3
+    if _feather_px > 0:
+        try:
+            from mask_pipeline import feather_mask_edges
+            mask_float = feather_mask_edges(final_mask_np, feather_px=_feather_px)
+            # Convert float [0,1] back to PIL mask for the pipeline
+            mask = Image.fromarray((mask_float * 255).astype(np.uint8), mode="L")
+            logger.info("mask_feathered feather_px=%d trace_id=%s", _feather_px, trace_id)
+        except Exception as exc:
+            logger.warning("mask_feather_failed error=%s trace_id=%s", exc, trace_id)
+            mask = final_mask
 
     _stage_times["densepose_start_ms"] = (time.perf_counter() - _t2) * 1000
     _t3 = time.perf_counter()
@@ -1796,7 +1808,7 @@ def run_idm_vton_inference(
 
         # Hardcoded safety net: protect FACE, HAIR, and HANDS.
         # Face and hair are dilated by 5px for boundary safety.
-        # Hands use the distal 38% of each arm (same logic as mask_pipeline
+        # Hands use the distal 42% of each arm (same logic as mask_pipeline
         # _hand_zones_from_arms) — this preserves original hand pixels while
         # allowing the model to generate sleeves on the proximal arm.
         # Everything else (neck, background) is handled by the profile-driven
@@ -1808,14 +1820,16 @@ def run_idm_vton_inference(
             _ks_safe += 1
         _k_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_safe, _ks_safe))
         _safety_mask = cv2.dilate(_safety_mask, _k_safe, iterations=1)
-        # Hand zones: distal 38% of each arm label (14, 15)
+        # Hand zones: distal 42% of each arm label (14, 15)
+        # Extended from 38% to 42% to better protect wrists and prevent
+        # the model from generating distorted hand/arm transitions.
         for _arm_label in (14, 15):
             _arm_pixels = schp_np == _arm_label
             if np.any(_arm_pixels):
                 _ys = np.where(_arm_pixels)[0]
                 _y_min, _y_max = int(_ys.min()), int(_ys.max())
                 _span = max(1, _y_max - _y_min)
-                _hand_start = _y_max - int(_span * 0.38)
+                _hand_start = _y_max - int(_span * 0.42)
                 _safety_mask = np.maximum(_safety_mask,
                     (_arm_pixels & (np.arange(schp_np.shape[0])[:, None] >= _hand_start)).astype(np.float32))
         body_preserve = np.maximum(body_preserve, _safety_mask)
@@ -1826,7 +1840,7 @@ def run_idm_vton_inference(
         # boundaries (face/hair edges, neck, arm boundaries) without affecting
         # the model's internal inpainting (it's a post-processing blend only).
         if 0.0 < float(np.mean(body_preserve)) < 1.0:
-            _blur_ks = max(3, int(min(body_preserve.shape) * 0.006))
+            _blur_ks = max(3, int(min(body_preserve.shape) * 0.008))  # increased from 0.006
             if _blur_ks % 2 == 0:
                 _blur_ks += 1
             body_preserve = cv2.GaussianBlur(body_preserve, (_blur_ks, _blur_ks), 0)
@@ -2202,7 +2216,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         effective_guidance = pipeline_route.apply_guidance
         effective_steps = pipeline_route.apply_steps
         if garm_mean_all < 60.0:
-            effective_guidance *= 1.10
+            effective_guidance *= 1.05  # reduced from 1.10 to prevent oversaturation
             logger.info(
                 "dark_garment_detected mean_r=%.1f mean_g=%.1f mean_b=%.1f "
                 "boosting_guidance from %.1f to %.1f",

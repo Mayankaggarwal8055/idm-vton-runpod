@@ -148,7 +148,7 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
     "hoodie":     GarmentGeometry(expansion_down=40, expansion_up=30, body_region="upper", protect_lower=True),
     "jacket":     GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
     "blazer":     GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
-    "coat":       GarmentGeometry(expansion_down=160, body_region="upper", protect_lower=True),
+    "coat":       GarmentGeometry(expansion_down=120, body_region="upper", protect_lower=True),
     "cardigan":   GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
     "leather_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
     "denim_jacket":   GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
@@ -1397,7 +1397,7 @@ def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
 def _hand_zones_from_arms(
     schp_labels: np.ndarray,
     arm_labels: tuple[int, ...] = _DRAPE_ARM_LABELS,
-    hand_fraction: float = 0.38,
+    hand_fraction: float = 0.42,
 ) -> np.ndarray:
     """
     Protect only the distal portion of each arm (hands/wrists), not the full arm.
@@ -1504,29 +1504,32 @@ def _adaptive_buffer_ks(
     """Compute adaptive dilation kernel size for cross-category source buffer.
 
     Scales to body size, source garment coverage, and target garment geometry.
+    Conservative values: the garment silhouette enhancement provides additional
+    precise mask coverage, so aggressive buffer dilation is unnecessary and
+    creates the visible gray border artifact.
     """
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
 
-    base_ks = int(12 * scale)
+    base_ks = int(8 * scale)  # reduced from 12 to minimize border artifact
 
     if source_labels:
         source_px = sum(int(np.sum(schp_labels == lbl)) for lbl in source_labels)
         source_frac = source_px / max(h * w, 1)
         if source_frac > 0.15:
-            base_ks = int(16 * scale)
+            base_ks = int(10 * scale)  # reduced from 16
         elif source_frac > 0.08:
-            base_ks = int(14 * scale)
+            base_ks = int(9 * scale)  # reduced from 14
         else:
-            base_ks = int(10 * scale)
+            base_ks = int(7 * scale)  # reduced from 10
 
     if garment_img_info:
         if garment_img_info.is_wide:
-            base_ks = int(base_ks * 1.2)
+            base_ks = int(base_ks * 1.15)  # reduced from 1.2
         if garment_img_info.is_long:
             base_ks = int(base_ks * 1.1)
 
-    ks = max(5, min(base_ks, int(25 * scale)))
+    ks = max(5, min(base_ks, int(20 * scale)))  # reduced cap from 25 to 20
     if ks % 2 == 0:
         ks += 1
     return ks
@@ -1835,7 +1838,7 @@ def build_schp_protect_mask(
     schp_labels: np.ndarray,
     cloth_type: str,
     garment_subtype: str = "",
-    dilate_px: int = 7,
+    dilate_px: int = 5,
     profile: "GarmentProfile | None" = None,
 ) -> np.ndarray:
     """Build binary protect mask using GarmentProfile.
@@ -1898,15 +1901,16 @@ def dilate_inpaint_mask(
     garment_subtype: str = "",
     schp_height: int = 512,
 ) -> np.ndarray:
-    """Mild dilation for edge blending.
+    """Minimal dilation for edge blending.
 
-    With the full-body-silhouette architecture, the mask already covers
-    the entire body.  Dilation is only needed to smooth mask boundaries
-    so the diffusion model doesn't create hard-edge artifacts.  We use a
-    small uniform kernel regardless of garment family.
+    With the garment-silhouette-enhanced mask architecture, the mask already
+    covers the garment's actual shape. Dilation is only needed to smooth
+    mask boundaries so the diffusion model doesn't create hard-edge artifacts.
+    We use a very small uniform kernel to avoid creating the fill zone that
+    causes the visible gray border.
     """
     scale = schp_height / 512.0
-    ks = max(3, int(5 * scale))
+    ks = max(3, int(3 * scale))  # reduced from 5 to minimize border
     if ks % 2 == 0:
         ks += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
@@ -1985,17 +1989,16 @@ def build_final_inpaint_mask(
         protect = np.minimum(protect, 255 - source_mask)
 
     # 4. Contour-aware dilation for edge blending
-    # Reduced kernels: the garment silhouette enhancement (handler.py) adds
-    # more precise mask coverage from the aligned garment foreground, so
-    # aggressive dilation here is unnecessary and causes dark patches,
-    # boundary artifacts, and body shape distortion.
-    #   lower_body/dresses: (11,17)×1 — moderate for leg/skirt boundaries
-    #   upper_body:          (9,5)×1  — tight for torso labels
+    # Conservative kernels: the garment silhouette enhancement (handler.py) adds
+    # precise mask coverage from the aligned garment foreground. Over-dilation
+    # here creates dark patches, boundary artifacts, and the visible gray border.
+    #   lower_body/dresses: (9,13)×1 — moderate for leg/skirt boundaries
+    #   upper_body:          (7,4)×1  — tight for torso labels, prevents side border
     h, w = schp_labels.shape
     scale = max(1.0, h / 512.0)
     if cloth_type in ("lower_body", "dresses", "full_body"):
-        leg_kw = max(3, int(11 * scale))
-        leg_kh = max(3, int(17 * scale))
+        leg_kw = max(3, int(9 * scale))
+        leg_kh = max(3, int(13 * scale))
         if leg_kw % 2 == 0:
             leg_kw += 1
         if leg_kh % 2 == 0:
@@ -2003,8 +2006,8 @@ def build_final_inpaint_mask(
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
         inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
     else:
-        up_kw = max(3, int(9 * scale))
-        up_kh = max(3, int(5 * scale))
+        up_kw = max(3, int(7 * scale))  # reduced from 9
+        up_kh = max(3, int(4 * scale))  # reduced from 5
         if up_kw % 2 == 0:
             up_kw += 1
         if up_kh % 2 == 0:
@@ -2014,6 +2017,46 @@ def build_final_inpaint_mask(
 
     # 5. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
+
+    # 5b. Structured garment waist refinement:
+    # For jackets, blazers, coats, and structured upper garments that extend
+    # below the waist, ensure the mask doesn't create a hard boundary at the
+    # waistline. The model needs a smooth transition zone to generate the
+    # garment's lower portion (hem, button closure) without artifacts.
+    geo = get_garment_geometry(garment_subtype)
+    if geo.expansion_down > 0 and cloth_type == "upper_body":
+        # Find waist region (approximately y=45-55% of image height)
+        h, w = schp_labels.shape
+        waist_y = int(h * 0.50)
+        waist_band = max(5, int(h * 0.05))  # 5% band around waist
+        y_lo = max(0, waist_y - waist_band)
+        y_hi = min(h, waist_y + waist_band)
+        # In the waist band, include any body labels (pants, skirt, upper_clothes)
+        # so the mask covers the transition zone smoothly
+        waist_body_labels = {_LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT, _LABEL_DRESS}
+        waist_body = np.isin(schp_labels, list(waist_body_labels)).astype(np.uint8) * 255
+        waist_body = waist_body[y_lo:y_hi, :]
+        if np.any(waist_body > 127):
+            final[y_lo:y_hi, :] = np.maximum(final[y_lo:y_hi, :], waist_body)
+
+    # 5c. Draped garment pallu/shoulder refinement:
+    # For sarees, lehengas, and other draped garments, ensure the mask
+    # includes the shoulder/upper arm region where the pallu drapes.
+    # Without this, the model can't generate the pallu over the shoulder.
+    if geo.body_region == "draped" and profile and profile.has_pallu:
+        # Include shoulder region (y=10-30% of height, full width)
+        h, w = schp_labels.shape
+        shoulder_y_lo = int(h * 0.10)
+        shoulder_y_hi = int(h * 0.30)
+        # Check if there are arm labels in this region (shoulder drape zone)
+        shoulder_arms = np.isin(
+            schp_labels[shoulder_y_lo:shoulder_y_hi, :],
+            list(_DRAPE_ARM_LABELS)
+        ).astype(np.uint8) * 255
+        if np.any(shoulder_arms > 127):
+            final[shoulder_y_lo:shoulder_y_hi, :] = np.maximum(
+                final[shoulder_y_lo:shoulder_y_hi, :], shoulder_arms
+            )
 
     # 6. Debug artifacts
     if trace_id and os.environ.get("IDM_DEBUG", "").lower() in ("1", "true", "yes"):
