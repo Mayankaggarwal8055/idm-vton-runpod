@@ -12,6 +12,7 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 import runpod
 import requests
@@ -833,6 +834,14 @@ def load_models():
                 exc,
             )
 
+    # Enable VAE tiling to reduce memory pressure on 768×1024 output
+    try:
+        if hasattr(pipe, "enable_vae_tiling"):
+            pipe.enable_vae_tiling()
+            logger.info("vae_tiling_enabled=True")
+    except Exception as exc:
+        logger.warning("vae_tiling_enable_failed error=%s", exc)
+
     # ── Runtime scheduler selection ────────────────────────────────────
     if IDM_VTON_SCHEDULER == "dpmpp":
         logger.info("scheduler_swap_attempt target=dpmpp_karras")
@@ -1282,6 +1291,9 @@ def run_idm_vton_inference(
     alignment: "AlignmentTransform | None" = None,
     garment_profile: "GarmentProfile | None" = None,
     schp_labels: np.ndarray | None = None,
+    garment_img_info: dict | None = None,
+    cached_pose_img: Image.Image | None = None,
+    cached_prompt_embeds: tuple | None = None,
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     global pipe, parsing_model, openpose_model
     global densepose_predictor, densepose_cfg, tensor_transform, get_mask_location_fn
@@ -1416,7 +1428,7 @@ def run_idm_vton_inference(
     _stage_times["schp_parsing_ms"] = (time.perf_counter() - _t0) * 1000
     _t1 = time.perf_counter()
 
-    garment_img_info = analyze_garment_image(garment_img)
+    garment_img_info = garment_img_info if garment_img_info is not None else analyze_garment_image(garment_img)
     try:
         final_mask_np, inpaint_mask_np, protect_mask_np = build_final_inpaint_mask(
             schp_np, cloth_type, garment_subtype, source_cloth_type=source_cloth_type,
@@ -1516,6 +1528,12 @@ def run_idm_vton_inference(
         # For lower_body: only pants+skirt+legs (no upper_clothes/arms).
         # This prevents source garment content from leaking into the mask.
         # EXCEPTION for draped garments: drape extends beyond body labels.
+        #
+        # GEOMETRIC FALLBACK: SCHP misclassifies leg pixels as upper_clothes
+        # (label 4) on ~20-40% of jeans/trousers images. The AND creates holes
+        # in the leg region that cause the "jeans hole" artifact. Detect this
+        # by checking if the AND removed >25% of silhouette pixels, and if so,
+        # use the silhouette directly with morphological closing to fill gaps.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
         if not _is_draped_garment:
             _target_labels = (
@@ -1531,7 +1549,41 @@ def run_idm_vton_inference(
                     )
                 )
                 _schp_body = (_schp_body > 127).astype(np.uint8) * 255
-            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
+            # Check if AND would remove too many silhouette pixels (SCHP misclassification)
+            _sil_px_before = int(np.sum(garm_silhouette_mask > 127))
+            _clipped = np.minimum(garm_silhouette_mask, _schp_body)
+            _sil_px_after = int(np.sum(_clipped > 127))
+            if _sil_px_before > 0 and (_sil_px_before - _sil_px_after) / _sil_px_before > 0.25:
+                # SCHP misclassification detected — use silhouette with morphological closing
+                # to fill holes while staying within the body region
+                logger.info(
+                    "schp_misclassification_fallback before=%d after=%d lost=%.1f%% trace_id=%s",
+                    _sil_px_before, _sil_px_after,
+                    (_sil_px_before - _sil_px_after) / _sil_px_before * 100, trace_id,
+                )
+                # Use a generous body mask: dilate all body labels to cover misclassified regions
+                _all_body = np.isin(schp_np, [4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18]).astype(np.uint8) * 255
+                if _all_body.shape[:2] != garm_silhouette_mask.shape[:2]:
+                    _all_body = np.array(
+                        Image.fromarray(_all_body).resize(
+                            (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                        )
+                    )
+                    _all_body = (_all_body > 127).astype(np.uint8) * 255
+                # Dilate body mask generously to cover misclassification zones
+                _ks_body = max(5, int(min(_all_body.shape) * 0.015))
+                if _ks_body % 2 == 0:
+                    _ks_body += 1
+                _all_body = cv2.dilate(_all_body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_body, _ks_body)), iterations=1)
+                garm_silhouette_mask = np.minimum(garm_silhouette_mask, _all_body)
+                # Morphological closing to fill small holes
+                _ks_close = max(7, int(min(garm_silhouette_mask.shape) * 0.02))
+                if _ks_close % 2 == 0:
+                    _ks_close += 1
+                _kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_close, _ks_close))
+                garm_silhouette_mask = cv2.morphologyEx(garm_silhouette_mask, cv2.MORPH_CLOSE, _kernel_close)
+            else:
+                garm_silhouette_mask = _clipped
         else:
             # Draped: use silhouette directly — drape extends BEYOND body labels
             # into background regions (pallu over shoulder, fabric flowing past body).
@@ -1626,66 +1678,74 @@ def run_idm_vton_inference(
     _stage_times["densepose_start_ms"] = (time.perf_counter() - _t2) * 1000
     _t3 = time.perf_counter()
 
-    from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
-    human_img_arg = _apply_exif_orientation(human_img.resize(TARGET_SIZE, Image.LANCZOS))
-    human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
+    if cached_pose_img is not None:
+        pose_img = cached_pose_img
+        logger.info("densepose_cached trace_id=%s", trace_id)
+    else:
+        from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
+        human_img_arg = _apply_exif_orientation(human_img)
+        human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
-    with torch.no_grad():
-        densepose_pred = densepose_predictor(human_img_arg)
-        if "instances" not in densepose_pred or len(densepose_pred["instances"]) == 0:
-            logger.warning(
-                "densepose_no_instances_fallback image_shape=%s cloth_type=%s trace_id=%s",
-                human_img_arg.shape, cloth_type, trace_id,
-            )
-            mask_meta.setdefault("_runtime_warnings", []).append("densepose_no_instances_used_gray_fallback")
-            pose_img = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
-        else:
-            densepose_outputs = densepose_pred["instances"]
+        with torch.no_grad():
+            densepose_pred = densepose_predictor(human_img_arg)
+            if "instances" not in densepose_pred or len(densepose_pred["instances"]) == 0:
+                logger.warning(
+                    "densepose_no_instances_fallback image_shape=%s cloth_type=%s trace_id=%s",
+                    human_img_arg.shape, cloth_type, trace_id,
+                )
+                mask_meta.setdefault("_runtime_warnings", []).append("densepose_no_instances_used_gray_fallback")
+                pose_img = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
+            else:
+                densepose_outputs = densepose_pred["instances"]
 
-            from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
-            from densepose.vis.extractor import create_extractor
+                from densepose.vis.densepose_results import DensePoseResultsFineSegmentationVisualizer
+                from densepose.vis.extractor import create_extractor
 
-            vis = DensePoseResultsFineSegmentationVisualizer(cfg=densepose_cfg)
-            extractor = create_extractor(vis)
-            data = extractor(densepose_outputs)
+                vis = DensePoseResultsFineSegmentationVisualizer(cfg=densepose_cfg)
+                extractor = create_extractor(vis)
+                data = extractor(densepose_outputs)
 
-            gray_img = cv2.cvtColor(human_img_arg, cv2.COLOR_BGR2GRAY)
-            gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
-            pose_img = vis.visualize(gray_img, data)
-            pose_img = pose_img[:, :, ::-1]
-            pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE, Image.LANCZOS)
+                gray_img = cv2.cvtColor(human_img_arg, cv2.COLOR_BGR2GRAY)
+                gray_img = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
+                pose_img = vis.visualize(gray_img, data)
+                pose_img = pose_img[:, :, ::-1]
+                pose_img = Image.fromarray(pose_img)
 
     _stage_times["densepose_ms"] = (time.perf_counter() - _t3) * 1000
     _t4 = time.perf_counter()
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    if override_prompt is not None:
-        prompt = override_prompt
+    if cached_prompt_embeds is not None:
+        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = cached_prompt_embeds
+        logger.info("prompt_encoding_cached trace_id=%s", trace_id)
     else:
-        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
+        if override_prompt is not None:
+            prompt = override_prompt
+        else:
+            prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
 
-    if override_negative_prompt is not None:
-        negative_prompt = override_negative_prompt
-    else:
-        negative_prompt = _build_source_specific_negative(source_cloth_type, garment_subtype)
+        if override_negative_prompt is not None:
+            negative_prompt = override_negative_prompt
+        else:
+            negative_prompt = _build_source_specific_negative(source_cloth_type, garment_subtype)
 
-    with torch.inference_mode():
-        with _maybe_autocast():
-            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = pipe.encode_prompt(
-                prompt,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=True,
-                negative_prompt=negative_prompt,
-            )
+        with torch.inference_mode():
+            with _maybe_autocast():
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = pipe.encode_prompt(
+                    prompt,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                    negative_prompt=negative_prompt,
+                )
 
-            prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
-            prompt_embeds_c, _, _, _ = pipe.encode_prompt(
-                prompt_c,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=False,
-                negative_prompt=negative_prompt,
-            )
+                prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
+                prompt_embeds_c, _, _, _ = pipe.encode_prompt(
+                    prompt_c,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                    negative_prompt=negative_prompt,
+                )
 
     _stage_times["prompt_encoding_ms"] = (time.perf_counter() - _t4) * 1000
     _t5 = time.perf_counter()
@@ -1693,8 +1753,13 @@ def run_idm_vton_inference(
     pose_tensor = tensor_transform(pose_img).unsqueeze(0).to(device, TORCH_DTYPE)
     garm_tensor = tensor_transform(garm_img).unsqueeze(0).to(device, TORCH_DTYPE)
 
-    # Store pose output in mask_meta for debug artifacts
+    # Store pose output and prompt embeds in mask_meta for caching across retries
     mask_meta["pose_output"] = pose_img
+    mask_meta["_cached_pose_img"] = pose_img
+    mask_meta["_cached_prompt_embeds"] = (
+        prompt_embeds, negative_prompt_embeds,
+        pooled_prompt_embeds, negative_pooled_prompt_embeds,
+    )
     generator = torch.Generator(device).manual_seed(seed) if seed is not None and torch.cuda.is_available() else None
 
     _stage_times["tensor_prep_ms"] = (time.perf_counter() - _t5) * 1000
@@ -1717,7 +1782,7 @@ def run_idm_vton_inference(
             _garment_sz = garm_img.size
             _mask_sz = mask.size
             _pose_sz = pose_img.size
-            _ip_sz = garm_img.resize(TARGET_SIZE).size
+            _ip_sz = garm_img.size
             _all_ok = (
                 _person_sz == TARGET_SIZE
                 and _garment_sz == TARGET_SIZE
@@ -1751,7 +1816,7 @@ def run_idm_vton_inference(
                 image=human_img,
                 height=TARGET_H,
                 width=TARGET_W,
-                ip_adapter_image=garm_img.resize(TARGET_SIZE),
+                ip_adapter_image=garm_img,
                 guidance_scale=effective_guidance,
             )
             images = pipe_output[0]
@@ -1794,8 +1859,11 @@ def run_idm_vton_inference(
         _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
         _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
 
-        # Dilate hard protect by 2px to cover boundary zones
-        ks_hp = 2
+        # Dilate hard protect by 5px to cover the boundary zone where the
+        # dilated inpaint mask bleeds into background pixels. Without sufficient
+        # dilation, the diffusion model generates non-background content at the
+        # body boundary, creating a visible white/light halo against dark walls.
+        ks_hp = 5
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
@@ -1984,7 +2052,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         )
 
     # ── Garment RGB diagnostics (reuse garm_check as float32) ───────────────
-    garm_np = garm_check.astype(np.float32)
+    garm_np = garm_check
     garm_mean_r = float(np.mean(garm_np[:, :, 0]))
     garm_mean_g = float(np.mean(garm_np[:, :, 1]))
     garm_mean_b = float(np.mean(garm_np[:, :, 2]))
@@ -2124,6 +2192,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         _cc_best_meta = mask_meta
         _cc_best_vresult = None
 
+        # Pre-resize person image for scoring (same every iteration)
+        _scoring_person = person_img if person_img.size == TARGET_SIZE else person_img.resize(TARGET_SIZE)
+
         while _cc_retry_round <= max_retry_rounds:
             if _cc_retry_round > 0:
                 result, raw_output, mask_meta = run_cross_category_inference(
@@ -2150,7 +2221,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
                 try:
                     cc_vresult = _score_candidate(
-                        person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                        _scoring_person,
                         result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
                         garment_img,
                         mask_np=mask_meta.get("final_mask_np"),
@@ -2264,6 +2335,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         _scoring_person = person_img if person_img.size == TARGET_SIZE else person_img.resize(TARGET_SIZE)
 
         retry_round = 0
+        _cached_pose = None
+        _cached_embeds = None
         while retry_round <= max_retry_rounds:
             candidates: list[tuple[Image.Image, Image.Image | None, dict[str, object], object | None]] = []
             for ci in range(candidate_count):
@@ -2297,7 +2370,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
                     alignment=alignment,
                     garment_profile=garment_profile,
                     schp_labels=det_schp,
+                    garment_img_info=garment_img_info,
+                    cached_pose_img=_cached_pose,
+                    cached_prompt_embeds=_cached_embeds,
                 )
+                # Capture caches from first inference for subsequent retries
+                if _cached_pose is None:
+                    _cached_pose = c_meta.get("_cached_pose_img")
+                if _cached_embeds is None:
+                    _cached_embeds = c_meta.get("_cached_prompt_embeds")
 
                 # Free GPU memory between candidate inferences
                 if torch.cuda.is_available():
@@ -2530,10 +2611,37 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     if _SAVE_DEBUG_ARTIFACTS and result is not None:
         result.save(str(_debug_dir / f"final_returned_output_{trace_id}.png"))
 
-    # ── Upload ───────────────────────────────────────────────────────────
+    # ── Upload (async — non-blocking) ──────────────────────────────────
     upload_start = time.perf_counter()
-    result_url = _upload_to_cloudinary(result, job_id)
+    _upload_result = {"url": None, "error": None}
+
+    def _bg_upload():
+        try:
+            _upload_result["url"] = _upload_to_cloudinary(result, job_id)
+        except Exception as _e:
+            _upload_result["error"] = str(_e)
+            logger.warning("async_upload_failed error=%s trace_id=%s", _e, trace_id)
+
+    _upload_thread = threading.Thread(target=_bg_upload, daemon=True)
+    _upload_thread.start()
+    # Wait up to 3s for upload to complete; if not done, return immediately
+    _upload_thread.join(timeout=3.0)
     upload_ms = (time.perf_counter() - upload_start) * 1000
+
+    if _upload_result["url"]:
+        result_url = _upload_result["url"]
+    elif _upload_result["error"]:
+        logger.warning("async_upload_errored_fallback retrying_sync trace_id=%s", trace_id)
+        try:
+            result_url = _upload_to_cloudinary(result, job_id)
+            upload_ms = (time.perf_counter() - upload_start) * 1000
+        except Exception:
+            result_url = ""
+            logger.error("sync_upload_fallback_also_failed trace_id=%s", trace_id)
+    else:
+        # Upload still in progress — return and let RunPod retry for the URL
+        result_url = ""
+        logger.info("async_upload_still_in_background trace_id=%s", trace_id)
 
     total_ms = (time.perf_counter() - job_start) * 1000
 
