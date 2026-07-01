@@ -428,7 +428,7 @@ def run_cross_category_inference(
     # ── Stage 1: erase old garment ────────────────────────────────────
     # Use source_cloth_type for the erase mask so the mask covers the
     # source garment's body region (not the target's).
-    erase_cloth_type = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else "dresses"
+    erase_cloth_type = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else "upper_body"
     neutral = _generate_neutral_garment()
 
     # Source-garment-specific erase prompt
@@ -1320,6 +1320,7 @@ def run_idm_vton_inference(
         validate_mask_safety,
         apply_protection_binary,
         get_profile_editable_labels,
+        _hand_zones_from_arms,
     )
 
     # Apply geometry-aware alignment to garment image, then resize to target.
@@ -1508,10 +1509,30 @@ def run_idm_vton_inference(
         # bleed into pure background. Use a conservatively dilated body mask:
         # enough to cover SCHP boundary misclassifications but not so much
         # that it allows the silhouette to extend into background regions.
+        #
+        # ADAPTIVE: For loose/voluminous garments (cargo pants, palazzo,
+        # wide-leg, ball gown), skip the body clip entirely or use a very
+        # generous dilation. These garments naturally extend beyond the body
+        # silhouette — clipping them destroys the garment's true shape.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
+        _is_loose_garment = (
+            garment_profile is not None
+            and (garment_profile.is_loose or garment_profile.is_voluminous)
+        )
         _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18}
         _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
-        _ks_dil = max(3, int(min(_schp_body.shape) * 0.005))  # 0.5% — tight body clip
+        if _is_loose_garment:
+            # Loose/voluminous: use very generous body dilation (3%) to
+            # preserve garment volume. The garment extends beyond the body
+            # silhouette by design — clipping it destroys cargo pockets,
+            # wide legs, palazzo flare, etc.
+            _ks_dil = max(5, int(min(_schp_body.shape) * 0.03))
+        elif _is_draped_garment:
+            # Draped: generous dilation to cover drape zones
+            _ks_dil = max(5, int(min(_schp_body.shape) * 0.02))
+        else:
+            # Fitted: tight body clip to prevent background bleeding
+            _ks_dil = max(3, int(min(_schp_body.shape) * 0.005))
         if _ks_dil % 2 == 0:
             _ks_dil += 1
         _schp_body = cv2.dilate(
@@ -1790,9 +1811,11 @@ def run_idm_vton_inference(
 
         # Hardcoded safety net: protect FACE, HAIR, and HANDS.
         # Face and hair are dilated by 5px for boundary safety.
-        # Hands use the distal 38% of each arm (same logic as mask_pipeline
-        # _hand_zones_from_arms) — this preserves original hand pixels while
-        # allowing the model to generate sleeves on the proximal arm.
+        # Hands use the 2D spatial hand zone from mask_pipeline (imported above)
+        # — this preserves original hand pixels while allowing the model to
+        # generate sleeves on the proximal arm. The 2D logic prevents the
+        # old 1D Y-only bug where hand-on-stomach would protect a wide band
+        # across the entire torso.
         # Everything else (neck, background) is handled by the profile-driven
         # protect mask or the model's inpainting.
         _safety_protect = {11, 2}  # face, hair
@@ -1802,16 +1825,9 @@ def run_idm_vton_inference(
             _ks_safe += 1
         _k_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_safe, _ks_safe))
         _safety_mask = cv2.dilate(_safety_mask, _k_safe, iterations=1)
-        # Hand zones: distal 38% of each arm label (14, 15)
-        for _arm_label in (14, 15):
-            _arm_pixels = schp_np == _arm_label
-            if np.any(_arm_pixels):
-                _ys = np.where(_arm_pixels)[0]
-                _y_min, _y_max = int(_ys.min()), int(_ys.max())
-                _span = max(1, _y_max - _y_min)
-                _hand_start = _y_max - int(_span * 0.38)
-                _safety_mask = np.maximum(_safety_mask,
-                    (_arm_pixels & (np.arange(schp_np.shape[0])[:, None] >= _hand_start)).astype(np.float32))
+        # Hand zones: reuse mask_pipeline's 2D spatial hand detection
+        _hand_protect_u8 = _hand_zones_from_arms(schp_np)
+        _safety_mask = np.maximum(_safety_mask, _hand_protect_u8.astype(np.float32) / 255.0)
         body_preserve = np.maximum(body_preserve, _safety_mask)
 
         # Soft boundary blend: Gaussian-blur the body_preserve mask so the
@@ -1819,11 +1835,16 @@ def run_idm_vton_inference(
         # regions is smooth. This eliminates visible hard seams at protection
         # boundaries (face/hair edges, neck, arm boundaries) without affecting
         # the model's internal inpainting (it's a post-processing blend only).
+        # Use a moderate blur (0.4% of image size) to smooth the transition
+        # between preserved (original) and generated regions without bleeding
+        # original pixels into garment details.  Matches the 3-5px dilation
+        # used for profile and safety protection.
         if 0.0 < float(np.mean(body_preserve)) < 1.0:
-            _blur_ks = max(3, int(min(body_preserve.shape) * 0.006))
+            _blur_ks = max(1, int(min(body_preserve.shape) * 0.004))
             if _blur_ks % 2 == 0:
                 _blur_ks += 1
-            body_preserve = cv2.GaussianBlur(body_preserve, (_blur_ks, _blur_ks), 0)
+            if _blur_ks >= 3:
+                body_preserve = cv2.GaussianBlur(body_preserve, (_blur_ks, _blur_ks), 0)
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
@@ -2124,59 +2145,126 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         debug.timing_ms["cross_category_inference_ms"] = inference_ms
 
         quality_report = InferenceQualityReport(
-            passed=True, identity_drift_score=0.0, failure_reasons=(),
+            passed=False, identity_drift_score=0.0, failure_reasons=(),
         )
-        retry_count = 0
         best_candidate_score = 0.0
         failure_reasons = []
         effective_guidance = pipeline_route.apply_guidance
+        effective_steps = steps
+        min_candidate_score = CANDIDATE_MIN_SCORE
+        max_retry_rounds = 1
 
-        if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
-            try:
-                cc_vresult = _score_candidate(
-                    person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
-                    result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-                    garment_img,
-                    mask_np=mask_meta.get("final_mask_np"),
-                    protect_np=mask_meta.get("protect_mask_np"),
-                    schp_labels=mask_meta.get("schp_labels"),
+        _cc_retry_round = 0
+        _cc_best_result = result
+        _cc_best_raw = raw_output
+        _cc_best_meta = mask_meta
+        _cc_best_vresult = None
+
+        while _cc_retry_round <= max_retry_rounds:
+            if _cc_retry_round > 0:
+                result, raw_output, mask_meta = run_cross_category_inference(
+                    person_img=person_img,
+                    garment_img=garment_img,
+                    garment_desc=garment_desc,
+                    cloth_type=vton_type,
                     garment_subtype=garment_subtype,
-                    source_cloth_type=source_cloth_type,
-                    target_cloth_type=vton_type,
+                    steps=effective_steps + RETRY_STEPS_BOOST * _cc_retry_round,
+                    seed=seed + _cc_retry_round * 10000,
+                    guidance_scale=effective_guidance * (1.0 + RETRY_GUIDANCE_BOOST * _cc_retry_round),
                     trace_id=trace_id,
+                    source_cloth_type=source_cloth_type,
+                    pipeline_route=pipeline_route,
+                    alignment=alignment,
+                    garment_profile=garment_profile,
+                    input_warnings=input_warnings,
+                    schp_labels=det_schp,
                 )
-                best_candidate_score = cc_vresult.score
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            cc_vresult = None
+            if _QUALITY_VALIDATION_AVAILABLE and _score_candidate is not None:
+                try:
+                    cc_vresult = _score_candidate(
+                        person_img.resize(TARGET_SIZE) if person_img.size != TARGET_SIZE else person_img,
+                        result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
+                        garment_img,
+                        mask_np=mask_meta.get("final_mask_np"),
+                        protect_np=mask_meta.get("protect_mask_np"),
+                        schp_labels=mask_meta.get("schp_labels"),
+                        garment_subtype=garment_subtype,
+                        source_cloth_type=source_cloth_type,
+                        target_cloth_type=vton_type,
+                        trace_id=trace_id,
+                    )
+                    logger.info(
+                        "cross_category_scored round=%d score=%.4f face=%.4f garment=%.4f "
+                        "drift=%.1f replacement=%.4f passed=%s trace_id=%s",
+                        _cc_retry_round, cc_vresult.score, cc_vresult.face_quality,
+                        cc_vresult.garment_quality, cc_vresult.identity_drift,
+                        cc_vresult.garment_replacement, cc_vresult.passed, trace_id,
+                    )
+                    debug.candidate_scores.append({
+                        "candidate": _cc_retry_round,
+                        "score": round(cc_vresult.score, 4),
+                        "face_quality": round(cc_vresult.face_quality, 4),
+                        "garment_quality": round(cc_vresult.garment_quality, 4),
+                        "identity_drift": round(cc_vresult.identity_drift, 2),
+                        "garment_replacement": round(cc_vresult.garment_replacement, 4),
+                        "sharpness": round(cc_vresult.sharpness, 2),
+                        "ssim": round(cc_vresult.ssim, 4),
+                        "region_edit": round(cc_vresult.region_edit, 4),
+                        "boundary_quality": round(cc_vresult.boundary_quality, 4),
+                        "pose_consistency": round(cc_vresult.pose_consistency, 4),
+                        "geometry_correctness": round(cc_vresult.geometry_correctness, 4),
+                        "leakage_penalty": round(cc_vresult.leakage_penalty, 4),
+                        "color_coherence": round(cc_vresult.color_coherence, 4),
+                        "passed": cc_vresult.passed,
+                        "failure_reasons": cc_vresult.failure_reasons[:5],
+                    })
+                    if cc_vresult.score > best_candidate_score:
+                        best_candidate_score = cc_vresult.score
+                        _cc_best_result = result
+                        _cc_best_raw = raw_output
+                        _cc_best_meta = mask_meta
+                        _cc_best_vresult = cc_vresult
+                except Exception as e:
+                    logger.warning("cross_category_scoring_failed round=%d error=%s trace_id=%s",
+                                    _cc_retry_round, e, trace_id)
+
+            if cc_vresult is not None and (cc_vresult.passed and cc_vresult.score >= min_candidate_score):
                 quality_report = InferenceQualityReport(
-                    passed=cc_vresult.identity_drift < 50.0,
+                    passed=True,
                     identity_drift_score=cc_vresult.identity_drift,
                     failure_reasons=tuple(cc_vresult.failure_reasons),
                 )
-                logger.info(
-                    "cross_category_scored score=%.4f face=%.4f garment=%.4f "
-                    "drift=%.1f replacement=%.4f trace_id=%s",
-                    cc_vresult.score, cc_vresult.face_quality, cc_vresult.garment_quality,
-                    cc_vresult.identity_drift, cc_vresult.garment_replacement, trace_id,
-                )
-                debug.candidate_scores.append({
-                    "candidate": 0,
-                    "score": round(cc_vresult.score, 4),
-                    "face_quality": round(cc_vresult.face_quality, 4),
-                    "garment_quality": round(cc_vresult.garment_quality, 4),
-                    "identity_drift": round(cc_vresult.identity_drift, 2),
-                    "garment_replacement": round(cc_vresult.garment_replacement, 4),
-                    "sharpness": round(cc_vresult.sharpness, 2),
-                    "ssim": round(cc_vresult.ssim, 4),
-                    "region_edit": round(cc_vresult.region_edit, 4),
-                    "boundary_quality": round(cc_vresult.boundary_quality, 4),
-                    "pose_consistency": round(cc_vresult.pose_consistency, 4),
-                    "geometry_correctness": round(cc_vresult.geometry_correctness, 4),
-                    "leakage_penalty": round(cc_vresult.leakage_penalty, 4),
-                    "color_coherence": round(cc_vresult.color_coherence, 4),
-                    "passed": cc_vresult.passed,
-                    "failure_reasons": cc_vresult.failure_reasons[:5],
-                })
-            except Exception as e:
-                logger.warning("cross_category_scoring_failed error=%s trace_id=%s", e, trace_id)
+                break
+
+            if _cc_retry_round >= max_retry_rounds:
+                if _cc_best_vresult is not None:
+                    quality_report = InferenceQualityReport(
+                        passed=_cc_best_vresult.passed,
+                        identity_drift_score=_cc_best_vresult.identity_drift,
+                        failure_reasons=tuple(_cc_best_vresult.failure_reasons),
+                    )
+                    result = _cc_best_result
+                    raw_output = _cc_best_raw
+                    mask_meta = _cc_best_meta
+                    best_candidate_score = best_candidate_score
+                break
+
+            logger.warning(
+                "cross_category_retry round=%d score=%.4f passed=%s reasons=%s "
+                "next_guidance=%.2f next_steps=%d trace_id=%s",
+                _cc_retry_round,
+                cc_vresult.score if cc_vresult else 0.0,
+                cc_vresult.passed if cc_vresult else False,
+                cc_vresult.failure_reasons[:3] if cc_vresult else [],
+                effective_guidance * (1.0 + RETRY_GUIDANCE_BOOST * (_cc_retry_round + 1)),
+                effective_steps + RETRY_STEPS_BOOST * (_cc_retry_round + 1),
+                trace_id,
+            )
+            _cc_retry_round += 1
 
         logger.info(
             "cross_category_inference_complete inference_ms=%.0f trace_id=%s",

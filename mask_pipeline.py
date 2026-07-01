@@ -103,6 +103,7 @@ _DRAPE_ARM_LABELS = (_LABEL_LEFT_ARM, _LABEL_RIGHT_ARM)
 _DRAPE_KEYWORDS = (
     "saree", "sari", "dupatta", "lehenga", "drape", "draped",
     "pallu", "shawl", "wrap", "anarkali", "ethnic",
+    "dhoti", "lungi", "sarong", "pareo",
 )
 
 # ── Garment-aware geometry taxonomy ───────────────────────────────────
@@ -166,10 +167,10 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
     "long_skirt": GarmentGeometry(body_region="lower", protect_upper=True),
     "leggings":   GarmentGeometry(body_region="lower", protect_upper=True),
     "joggers":    GarmentGeometry(body_region="lower", protect_upper=True),
-    "cargo_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    "cargo_pants": GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=20),
     "wide_leg":   GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=30),
     "palazzo":    GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=60),
-    "dhoti_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    "dhoti_pants": GarmentGeometry(body_region="lower", protect_upper=True, expansion_width=20),
     # ── Full body: standard ───────────────────────────────────────────
     "dress":      GarmentGeometry(body_region="full"),
     "mini_dress": GarmentGeometry(body_region="full"),
@@ -217,6 +218,57 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
     "saree_with_shawl": GarmentGeometry(body_region="draped", expansion_width=80),
     "dupatta_over_kurti": GarmentGeometry(body_region="draped", expansion_width=60),
     "any_with_scarf": GarmentGeometry(body_region="draped", expansion_width=40),
+
+    # ── Upper body: missing geometry entries ──────────────────────────
+    "puffer_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "parka": GarmentGeometry(expansion_down=100, body_region="upper", protect_lower=True),
+    "fleece": GarmentGeometry(body_region="upper", protect_lower=True),
+    "down_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "ski_jacket": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "trench_coat": GarmentGeometry(expansion_down=120, body_region="upper", protect_lower=True),
+    "raincoat": GarmentGeometry(expansion_down=120, body_region="upper", protect_lower=True),
+    "windbreaker": GarmentGeometry(body_region="upper", protect_lower=True),
+    "peacoat": GarmentGeometry(expansion_down=80, body_region="upper", protect_lower=True),
+    "overcoat": GarmentGeometry(expansion_down=100, body_region="upper", protect_lower=True),
+    "trench": GarmentGeometry(expansion_down=100, body_region="upper", protect_lower=True),
+    "henley": GarmentGeometry(body_region="upper", protect_lower=True),
+    "halter": GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "pullover": GarmentGeometry(body_region="upper", protect_lower=True),
+    "dashiki": GarmentGeometry(expansion_down=40, body_region="upper", protect_lower=True),
+    "boubou": GarmentGeometry(expansion_down=80, expansion_width=60, body_region="upper", protect_lower=True),
+    "agbada": GarmentGeometry(expansion_down=80, expansion_width=80, body_region="upper", protect_lower=True),
+    "waistcoat": GarmentGeometry(body_region="upper", protect_lower=True, expose_arms=True),
+    "sari_blouse": GarmentGeometry(body_region="upper", protect_lower=True),
+
+    # ── Full body: missing geometry entries ───────────────────────────
+    "cocktail_dress": GarmentGeometry(body_region="full"),
+    "sundress": GarmentGeometry(body_region="full"),
+    "tracksuit": GarmentGeometry(body_region="full"),
+    "suit": GarmentGeometry(body_region="full"),
+    "tuxedo": GarmentGeometry(body_region="full"),
+    "thobe": GarmentGeometry(body_region="full"),
+    "dirndl": GarmentGeometry(body_region="full"),
+    "muumuu": GarmentGeometry(expansion_width=40, body_region="full"),
+    "swimsuit": GarmentGeometry(body_region="full"),
+
+    # ── Draped: missing geometry entries ──────────────────────────────
+    "sarong": GarmentGeometry(body_region="draped"),
+    "pareo": GarmentGeometry(body_region="draped"),
+
+    # ── Lower body: missing geometry entries ──────────────────────────
+    "maxi_skirt": GarmentGeometry(body_region="lower", protect_upper=True, expansion_down=120),
+    "chinos": GarmentGeometry(body_region="lower", protect_upper=True),
+    "bermuda": GarmentGeometry(body_region="lower", protect_upper=True),
+    "cycling_shorts": GarmentGeometry(body_region="lower", protect_upper=True),
+    "yoga_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    "hiking_pants": GarmentGeometry(body_region="lower", protect_upper=True),
+    "gym_shorts": GarmentGeometry(body_region="lower", protect_upper=True),
+    "lederhosen": GarmentGeometry(body_region="lower", protect_upper=True),
+
+    # ── Upper body: layered sets ──────────────────────────────────────
+    "shrug_over_dress": GarmentGeometry(body_region="upper", protect_lower=True),
+    "vest_over_shirt": GarmentGeometry(body_region="upper", protect_lower=True),
+    "athletic_shirt": GarmentGeometry(body_region="upper", protect_lower=True),
 }
 
 
@@ -781,6 +833,442 @@ GARMENT_PROFILES: dict[str, GarmentProfile] = {
         has_sleeves=True, sleeve_length="long",
         is_fitted=False, is_structured=True, is_ethnic=True,
     ),
+
+    # ── Lower body: loose / voluminous (MISSING FROM ORIGINAL) ────────
+    "cargo_pants": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_loose=True,
+    ),
+    "long_skirt": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_loose=True,
+    ),
+    "chinos": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+    "bermuda": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+    "dhoti_pants": GarmentProfile(
+        family="draped", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_draped=True, is_loose=True, is_ethnic=True,
+    ),
+    "peacoat": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "overcoat": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True, is_voluminous=True,
+    ),
+    "trench": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+
+    # ── Full body: missing subtypes ───────────────────────────────────
+    "a_line": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, hem_type="asymmetric",
+    ),
+    "maxi": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_voluminous=True,
+    ),
+    "off_shoulder": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "one_shoulder": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "strap": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=False,
+        covers_torso_full=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=False, expose_arms=True,
+    ),
+    "jalabiya": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_ethnic=True,
+    ),
+    "yukata": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_ethnic=True,
+    ),
+    "hanbok": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_voluminous=True, is_ethnic=True,
+    ),
+    "cheongsam": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True, is_ethnic=True,
+    ),
+    "qipao": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True, is_ethnic=True,
+    ),
+    "cocktail_dress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True,
+    ),
+    "sundress": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=False,
+        covers_torso_full=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=False, is_voluminous=True, expose_arms=True,
+    ),
+
+    # ── Draped: missing subtypes ──────────────────────────────────────
+    "ghagra": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_draped=True, is_ethnic=True, is_voluminous=True,
+    ),
+    "salwar_suit": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "dhoti": GarmentProfile(
+        family="draped", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_draped=True, is_ethnic=True,
+    ),
+    "lungi": GarmentProfile(
+        family="draped", cloth_type="dresses",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_draped=True, is_loose=True, is_ethnic=True,
+    ),
+
+    # ── Upper body: missing subtypes ──────────────────────────────────
+    "shrug": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=False, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=False, is_loose=True,
+    ),
+    "henley": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=True,
+    ),
+    "halter": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        expose_arms=True, is_fitted=True,
+    ),
+    "pullover": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True,
+    ),
+    "puffer_jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True, is_voluminous=True,
+    ),
+    "parka": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True, is_voluminous=True,
+    ),
+    "fleece": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True,
+    ),
+    "down_jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True, is_voluminous=True,
+    ),
+    "ski_jacket": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "trench_coat": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "raincoat": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+    "windbreaker": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=False,
+    ),
+
+    # ── Lower body: missing subtypes ──────────────────────────────────
+    "maxi_skirt": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_voluminous=True,
+    ),
+    "cycling_shorts": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "yoga_pants": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=True,
+    ),
+    "hiking_pants": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+    "gym_shorts": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False,
+    ),
+
+    # ── Full body: traditional / ethnic missing ───────────────────────
+    "thobe": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "dirndl": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "lederhosen": GarmentProfile(
+        family="lower", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_fitted=False, is_ethnic=True,
+    ),
+
+    # ── Full body: sets / suits ───────────────────────────────────────
+    "tracksuit": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False,
+    ),
+    "suit": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True,
+    ),
+    "tuxedo": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=True, is_structured=True,
+    ),
+
+    # ── Upper body: ethnic missing ────────────────────────────────────
+    "dashiki": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_ethnic=True,
+    ),
+    "boubou": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_voluminous=True, is_ethnic=True,
+    ),
+    "agbada": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_voluminous=True, is_ethnic=True,
+    ),
+
+    # ── Draped lower body ─────────────────────────────────────────────
+    "sarong": GarmentProfile(
+        family="draped", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_draped=True, is_loose=True,
+    ),
+    "pareo": GarmentProfile(
+        family="draped", cloth_type="lower_body",
+        covers_upper=False, covers_lower=True, covers_arms=False,
+        covers_hands=False, covers_torso_full=False,
+        has_sleeves=False, is_draped=True, is_loose=True,
+    ),
+    "muumuu": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=True,
+        covers_torso_full=True,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_loose=True, is_voluminous=True,
+    ),
+
+    # ── Swimwear ──────────────────────────────────────────────────────
+    "swimsuit": GarmentProfile(
+        family="full", cloth_type="dresses",
+        covers_upper=True, covers_lower=True, covers_arms=False,
+        covers_torso_full=True,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=True, expose_arms=True,
+    ),
+    "bikini": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=True, expose_arms=True, is_cropped=True,
+    ),
+    "sports_bra": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=True, expose_arms=True, is_cropped=True,
+    ),
+    "athletic_shirt": GarmentProfile(
+        family="upper_fitted", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=False, is_loose=True,
+    ),
+    "sari_blouse": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=False, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="short",
+        is_fitted=True, is_cropped=True,
+    ),
+
+    # ── Layered sets ──────────────────────────────────────────────────
+    "shrug_over_dress": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=False, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="short",
+        is_fitted=False,
+    ),
+    "vest_over_shirt": GarmentProfile(
+        family="upper_structured", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=True, sleeve_length="long",
+        is_fitted=False, is_structured=True,
+    ),
+
+    # ── Formal upper ──────────────────────────────────────────────────
+    "waistcoat": GarmentProfile(
+        family="upper_sleeveless", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=False,
+        covers_torso_full=True, extends_below_waist=False,
+        has_sleeves=False, sleeve_length="sleeveless",
+        is_fitted=True, is_structured=True, expose_arms=True,
+    ),
 }
 
 
@@ -1237,44 +1725,12 @@ class InferenceQualityReport:
 def is_draped_garment(cloth_type: str, garment_subtype: str = "") -> bool:
     """True when the garment needs arm-span inpaint (saree pallu, dupatta, etc.)."""
     ct = (cloth_type or "").strip().lower()
-    if ct not in ("dresses", "full_body"):
+    if ct not in ("dresses", "full_body", "lower_body"):
         return False
     subtype = (garment_subtype or "").strip().lower()
     if any(kw in subtype for kw in _DRAPE_KEYWORDS):
         return True
     return False
-
-
-def needs_two_stage(
-    schp_np: np.ndarray,
-    cloth_type: str,
-    uncovered_threshold: float = 0.08,
-) -> bool:
-    """
-    Detect whether the person's current garment spans garment-label categories
-    that the target cloth_type's mask would NOT cover.
-
-    This is the root-cause check for cross-category failure.
-
-    Example: person is wearing a saree (SCHP labels 6=DRESS, 11=SCARF) but
-    target is upper_body (mask labels {5=UPPER_CLOTHES, 7=COAT}).
-    The saree body (6) and pallu (11) are outside the upper_body mask,
-    so they would survive the try-on → two-stage is needed.
-
-    Returns True when uncovered garment-label area exceeds threshold
-    fraction of the image.  False for same-category swaps that the
-    single-stage mask already covers.
-    """
-    target_labels = _CLOTHING_LABELS.get(cloth_type, _CLOTHING_LABELS["dresses"])
-    present = set(int(v) for v in np.unique(schp_np)) & _ALL_GARMENT_LABELS
-    uncovered = present - target_labels
-    if not uncovered:
-        return False
-
-    h, w = schp_np.shape
-    uncovered_px = sum(int(np.sum(schp_np == lbl)) for lbl in uncovered)
-    uncovered_frac = uncovered_px / max(h * w, 1)
-    return uncovered_frac > uncovered_threshold
 
 
 def detect_source_cloth_type(schp_np: np.ndarray) -> str:
@@ -1335,14 +1791,18 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
 
     # Saree pattern: scarf present + upper clothes (blouse) + body coverage
     # This catches sarees even when the pallu is small (5-10% of garment px)
-    if has_scarf and has_upper:
+    # Guard: require scarf > 20% to avoid false-positive on t-shirt/jacket + winter scarf.
+    # A genuine saree pallu is 20-30% of garment pixels; a winter scarf is 10-18%.
+    if has_scarf and scarf_px / garment_ratio > 0.20 and has_upper:
         return "dresses"
     # Dress+saree pattern: large dress region + scarf (pallu over shoulder)
     if has_dress and has_scarf:
         return "dresses"
     # Full-body draped: arms + legs covered + upper clothes = saree/dress
     # This catches sarees where the scarf is not visible (pallu behind back)
-    if has_upper and has_arms and has_legs and (dress_px + scarf_px) / garment_ratio > 0.10:
+    # Guard: skip when lower body has structured clothing (pants/skirt) —
+    # a scarf + pants combo is a winter outfit, not a draped garment.
+    if has_upper and has_arms and has_legs and lower_px / garment_ratio < 0.10 and (dress_px + scarf_px) / garment_ratio > 0.10:
         return "dresses"
 
     # ── 2. Dress detection (label 7 dominates) ──────────────────────
@@ -1350,7 +1810,11 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
         return "dresses"
 
     # ── 3. Scarf detection (draped garment indicator) ───────────────
-    if scarf_px / garment_ratio > 0.10:
+    # When upper body labels dominate (>20%), the scarf is an accessory
+    # (winter scarf, decorative scarf), not a pallu/drape. Skip to avoid
+    # false-positive "dresses" for t-shirt + scarf combinations.
+    _upper_ratio_check = upper_px / garment_ratio
+    if scarf_px / garment_ratio > 0.10 and _upper_ratio_check < 0.20:
         return "dresses"
 
     # ── 4. Pants / lower body detection ─────────────────────────────
@@ -1361,16 +1825,19 @@ def detect_source_cloth_type(schp_np: np.ndarray) -> str:
     # Upper garments present but below 40% threshold (partially occluded,
     # tucked-in, small crop top). Only when dress is not significant to
     # avoid stealing dress labels from misclassified SCHP boundaries.
+    # Lowered threshold from 0.15 to 0.12 to catch more borderline upper
+    # body garments (t-shirts, blouses) that would otherwise fall through
+    # to the "dresses" default.
     _upper_ratio = upper_px / garment_ratio
     _dress_ratio = dress_px / garment_ratio
-    if _upper_ratio > 0.15 and _dress_ratio < 0.15 and _upper_ratio >= lower_px / garment_ratio:
+    if _upper_ratio > 0.12 and _dress_ratio < 0.15 and _upper_ratio >= lower_px / garment_ratio:
         return "upper_body"
 
     # ── 5. Upper body detection (genuine upper garments) ────────────
-    # Raised threshold from 0.15 to 0.40 to avoid false positives from
-    # saree blouses.  A genuine upper_body garment has upper_clothes
-    # as the DOMINANT label (>40%) with no scarf or dress labels.
-    if _upper_ratio > 0.40:
+    # Lowered threshold from 0.40 to 0.30 to catch more upper body
+    # garments. A genuine upper_body garment has upper_clothes as the
+    # DOMINANT label (>30%) with no scarf or dress labels.
+    if _upper_ratio > 0.30:
         return "upper_body"
 
     # ── 6. Default fallback ─────────────────────────────────────────
@@ -1399,9 +1866,15 @@ def _hand_zones_from_arms(
     arm_labels: tuple[int, ...] = _DRAPE_ARM_LABELS,
     hand_fraction: float = 0.38,
 ) -> np.ndarray:
-    """
-    Protect only the distal portion of each arm (hands/wrists), not the full arm.
-    Enables sheer dupatta/saree drape over forearms while keeping hands intact.
+    """Protect the distal portion of each arm (hands/wrists) using 2D spatial logic.
+
+    Uses both Y-axis (vertical span) and X-axis (horizontal spread) to identify
+    the hand region. The hand is the portion of the arm that is:
+      1. In the distal hand_fraction of the arm's Y-span (wrist/hand end)
+      2. Within the arm's X-range (prevents protecting regions far from the arm)
+
+    This fixes the 1D Y-only bug where a hand on the stomach would protect
+    a wide horizontal band across the entire torso.
     """
     h, w = schp_labels.shape
     protect = np.zeros((h, w), dtype=np.uint8)
@@ -1411,11 +1884,28 @@ def _hand_zones_from_arms(
         arm_mask = schp_labels == label
         if not np.any(arm_mask):
             continue
-        ys = np.where(arm_mask)[0]
+        ys, xs = np.where(arm_mask)
         y_min, y_max = int(ys.min()), int(ys.max())
-        span = max(1, y_max - y_min)
-        hand_y_start = y_max - int(span * hand_fraction)
-        hand_zone = arm_mask & (y_idx >= hand_y_start)
+        x_min, x_max = int(xs.min()), int(xs.max())
+        span_y = max(1, y_max - y_min)
+        span_x = max(1, x_max - x_min)
+
+        # Hand region: distal hand_fraction of Y-span
+        hand_y_start = y_max - int(span_y * hand_fraction)
+
+        # 2D spatial constraint: also require X to be within the arm's X-range
+        # with a small margin (20% of arm width) to avoid protecting far-away
+        # pixels (e.g., hand on stomach protecting across the entire torso)
+        x_margin = max(5, int(span_x * 0.20))
+        x_lo = max(0, x_min - x_margin)
+        x_hi = min(w, x_max + x_margin + 1)
+
+        hand_zone = (
+            arm_mask
+            & (y_idx >= hand_y_start)
+            & (np.arange(w)[None, :] >= x_lo)
+            & (np.arange(w)[None, :] < x_hi)
+        )
         protect[hand_zone] = 255
 
     return protect
@@ -1546,6 +2036,7 @@ _FAMILY_UPPER_FITTED = frozenset({
 })
 _FAMILY_UPPER_SLEEVELESS = frozenset({
     "tank_top", "crop_top", "camisole", "vest", "corset", "halter",
+    "bikini", "sports_bra", "sari_blouse", "waistcoat",
 })
 _FAMILY_UPPER_LOOSE = frozenset({
     "hoodie", "sweater", "poncho", "cape", "shrug", "pullover",
@@ -1716,8 +2207,8 @@ def build_schp_inpaint_mask(
             mask = np.maximum(mask, source_tight)
 
         # Include arm labels if source OR target is draped
-        _drape_ct = cloth_type if cloth_type in ("dresses", "full_body") else (
-            source_cloth_type if source_cloth_type in ("dresses", "full_body") else ""
+        _drape_ct = cloth_type if cloth_type in ("dresses", "full_body", "lower_body") else (
+            source_cloth_type if source_cloth_type in ("dresses", "full_body", "lower_body") else ""
         )
         if _drape_ct:
             arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
@@ -1999,10 +2490,13 @@ def build_final_inpaint_mask(
     # already provides precise boundary coverage — aggressive dilation here
     # creates the visible gray/white border by expanding the mask beyond the
     # actual garment edge (the "fill zone" artifact).
+    #
+    # Use 1px dilation only — just enough to connect adjacent mask pixels
+    # without creating a visible fill zone. The ellipse kernel with radius
+    # 0.5px connects diagonally-adjacent pixels while adding <1px of
+    # expansion in each direction.
     h, w = schp_labels.shape
-    ks = max(3, int(min(h, w) * 0.003))  # ~3px at 1024h, minimal smoothing
-    if ks % 2 == 0:
-        ks += 1
+    ks = 3  # minimum odd kernel size for cv2 ellipse
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
     inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
 
