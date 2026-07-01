@@ -428,7 +428,7 @@ def run_cross_category_inference(
     # ── Stage 1: erase old garment ────────────────────────────────────
     # Use source_cloth_type for the erase mask so the mask covers the
     # source garment's body region (not the target's).
-    erase_cloth_type = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else "upper_body"
+    erase_cloth_type = source_cloth_type if source_cloth_type and source_cloth_type != "unknown" else "dresses"
     neutral = _generate_neutral_garment()
 
     # Source-garment-specific erase prompt
@@ -1510,44 +1510,35 @@ def run_idm_vton_inference(
         # enough to cover SCHP boundary misclassifications but not so much
         # that it allows the silhouette to extend into background regions.
         #
-        # ADAPTIVE: For loose/voluminous garments (cargo pants, palazzo,
-        # wide-leg, ball gown), skip the body clip entirely or use a very
-        # generous dilation. These garments naturally extend beyond the body
-        # silhouette — clipping them destroys the garment's true shape.
+        # AND with SCHP target-only labels for non-draped garments: only include
+        # pixels that are EDITABLE for this garment profile.
+        # For upper_body: only upper_clothes+arms (no pants/skirt/legs).
+        # For lower_body: only pants+skirt+legs (no upper_clothes/arms).
+        # This prevents source garment content from leaking into the mask.
+        # EXCEPTION for draped garments: drape extends beyond body labels.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
-        _is_loose_garment = (
-            garment_profile is not None
-            and (garment_profile.is_loose or garment_profile.is_voluminous)
-        )
-        _body_labels = {4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18}
-        _schp_body = np.isin(schp_np, list(_body_labels)).astype(np.uint8) * 255
-        if _is_loose_garment:
-            # Loose/voluminous: use very generous body dilation (3%) to
-            # preserve garment volume. The garment extends beyond the body
-            # silhouette by design — clipping it destroys cargo pockets,
-            # wide legs, palazzo flare, etc.
-            _ks_dil = max(5, int(min(_schp_body.shape) * 0.03))
-        elif _is_draped_garment:
-            # Draped: generous dilation to cover drape zones
-            _ks_dil = max(5, int(min(_schp_body.shape) * 0.02))
-        else:
-            # Fitted: tight body clip to prevent background bleeding
-            _ks_dil = max(3, int(min(_schp_body.shape) * 0.005))
-        if _ks_dil % 2 == 0:
-            _ks_dil += 1
-        _schp_body = cv2.dilate(
-            _schp_body,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_dil, _ks_dil)),
-            iterations=1,
-        )
-        if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
-            _schp_body = np.array(
-                Image.fromarray(_schp_body).resize(
-                    (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
-                )
+        if not _is_draped_garment:
+            _target_labels = (
+                get_profile_editable_labels(garment_profile)
+                if garment_profile is not None
+                else {4, 5, 6, 7, 8, 12, 13, 14, 15, 17}
             )
-            _schp_body = (_schp_body > 127).astype(np.uint8) * 255
-        garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
+            _schp_body = np.isin(schp_np, list(_target_labels)).astype(np.uint8) * 255
+            if _schp_body.shape[:2] != garm_silhouette_mask.shape[:2]:
+                _schp_body = np.array(
+                    Image.fromarray(_schp_body).resize(
+                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                    )
+                )
+                _schp_body = (_schp_body > 127).astype(np.uint8) * 255
+            garm_silhouette_mask = np.minimum(garm_silhouette_mask, _schp_body)
+        else:
+            # Draped: use silhouette directly — drape extends BEYOND body labels
+            # into background regions (pallu over shoulder, fabric flowing past body).
+            logger.info(
+                "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
+                int(np.sum(garm_silhouette_mask > 127)), trace_id,
+            )
 
         # Add garment silhouette to inpaint mask
         enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
@@ -1760,7 +1751,7 @@ def run_idm_vton_inference(
                 image=human_img,
                 height=TARGET_H,
                 width=TARGET_W,
-                ip_adapter_image=garm_img,
+                ip_adapter_image=garm_img.resize(TARGET_SIZE),
                 guidance_scale=effective_guidance,
             )
             images = pipe_output[0]
@@ -1776,17 +1767,17 @@ def run_idm_vton_inference(
     raw_output = images[0].copy()
 
     # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
-    # Preserve ORIGINAL pixels ONLY for identity-critical regions and
-    # non-target body regions (from GarmentProfile). Everything else
-    # uses the diffusion output directly.
+    # Only preserve identity (face, hair, shoes, hat, sunglasses, bag)
+    # and background. Everything else uses the diffusion output directly.
     #
-    # CRITICAL: Do NOT preserve background (label 0) — that was causing
-    # visible clipping seams at garment boundaries. The SDXL inpainting
-    # pipeline naturally preserves unmasked (mask=0) pixels, so background
-    # is handled correctly without explicit body_preserve.
+    # CRITICAL: The old feathered-complement approach (body_preserve =
+    # feathered_inverse of inpaint mask) caused source garment leakage
+    # because the feather zone (4-6px transition) blended original person
+    # pixels (with source garment) back into the diffusion output at
+    # garment boundaries. This is the primary root cause of color bleeding.
     #
-    # Also do NOT hardcode neck (label 18) — let the GarmentProfile
-    # decide whether neck is covered (e.g., turtleneck covers neck).
+    # Fix: start with body_preserve=0 everywhere (use diffusion output),
+    # then only add hard_protect for identity + background safeguard.
     try:
         result_arr = np.array(images[0], dtype=np.float32)
         person_arr = np.array(human_img, dtype=np.float32)
@@ -1796,55 +1787,28 @@ def run_idm_vton_inference(
             (final_mask_np.shape[0], final_mask_np.shape[1]), dtype=np.float32
         )
 
-        # Profile-driven protection from mask pipeline — covers identity +
-        # non-target body regions (e.g., arms for upper-body, torso for
-        # lower-body). This is garment-type-aware and replaces hardcoded rules.
-        if protect_mask_np is not None and protect_mask_np.shape == body_preserve.shape:
-            _profile_protect = protect_mask_np.astype(np.float32) / 255.0
-            # Dilate profile protection by 3px for boundary safety
-            _ks_pp = 3
-            if _ks_pp % 2 == 0:
-                _ks_pp += 1
-            _k_pp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_pp, _ks_pp))
-            _profile_protect = cv2.dilate(_profile_protect, _k_pp, iterations=1)
-            body_preserve = np.maximum(body_preserve, _profile_protect)
+        # Identity protection: face, hair, shoes, hat, sunglasses, bag, neck.
+        # These labels must never be altered by the diffusion model.
+        # NOTE: Label 18 (NECK) IS protected — it is part of identity.
+        # The old code protected neck implicitly via ~np.isin(clothing).
+        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
+        _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
 
-        # Hardcoded safety net: protect FACE, HAIR, and HANDS.
-        # Face and hair are dilated by 5px for boundary safety.
-        # Hands use the 2D spatial hand zone from mask_pipeline (imported above)
-        # — this preserves original hand pixels while allowing the model to
-        # generate sleeves on the proximal arm. The 2D logic prevents the
-        # old 1D Y-only bug where hand-on-stomach would protect a wide band
-        # across the entire torso.
-        # Everything else (neck, background) is handled by the profile-driven
-        # protect mask or the model's inpainting.
-        _safety_protect = {11, 2}  # face, hair
-        _safety_mask = np.isin(schp_np, list(_safety_protect)).astype(np.float32)
-        _ks_safe = 5
-        if _ks_safe % 2 == 0:
-            _ks_safe += 1
-        _k_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_safe, _ks_safe))
-        _safety_mask = cv2.dilate(_safety_mask, _k_safe, iterations=1)
-        # Hand zones: reuse mask_pipeline's 2D spatial hand detection
-        _hand_protect_u8 = _hand_zones_from_arms(schp_np)
-        _safety_mask = np.maximum(_safety_mask, _hand_protect_u8.astype(np.float32) / 255.0)
-        body_preserve = np.maximum(body_preserve, _safety_mask)
+        # Dilate hard protect by 2px to cover boundary zones
+        ks_hp = 2
+        kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
+        _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
 
-        # Soft boundary blend: Gaussian-blur the body_preserve mask so the
-        # transition between preserved (original) and non-preserved (generated)
-        # regions is smooth. This eliminates visible hard seams at protection
-        # boundaries (face/hair edges, neck, arm boundaries) without affecting
-        # the model's internal inpainting (it's a post-processing blend only).
-        # Use a moderate blur (0.4% of image size) to smooth the transition
-        # between preserved (original) and generated regions without bleeding
-        # original pixels into garment details.  Matches the 3-5px dilation
-        # used for profile and safety protection.
-        if 0.0 < float(np.mean(body_preserve)) < 1.0:
-            _blur_ks = max(1, int(min(body_preserve.shape) * 0.004))
-            if _blur_ks % 2 == 0:
-                _blur_ks += 1
-            if _blur_ks >= 3:
-                body_preserve = cv2.GaussianBlur(body_preserve, (_blur_ks, _blur_ks), 0)
+        # Where hard_protect=1, always preserve original
+        body_preserve = np.maximum(body_preserve, _hard_mask)
+
+        # NOTE: No background safeguard here. The old code had no body_preserve
+        # at all — the model output was the final image. Adding a background
+        # safeguard that preserves original pixels where the mask is 0 caused
+        # source garment color to bleed through at mask edges. The model
+        # already handles background correctly via the binary inpaint mask.
+
+        # Blend: where body_preserve=1 keep original, where=0 keep inpainted
         body_preserve_3ch = body_preserve[:, :, np.newaxis]
         result_arr = person_arr * body_preserve_3ch + result_arr * (1.0 - body_preserve_3ch)
         images[0] = Image.fromarray(np.clip(result_arr, 0, 255).astype(np.uint8))
@@ -1874,7 +1838,7 @@ def run_idm_vton_inference(
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
         final_img = human_img_orig.copy()
-        final_img.paste(out_img, (int(left), int(top)))
+        final_img.paste(out_img, (round(left), round(top)))
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta

@@ -2207,8 +2207,8 @@ def build_schp_inpaint_mask(
             mask = np.maximum(mask, source_tight)
 
         # Include arm labels if source OR target is draped
-        _drape_ct = cloth_type if cloth_type in ("dresses", "full_body", "lower_body") else (
-            source_cloth_type if source_cloth_type in ("dresses", "full_body", "lower_body") else ""
+        _drape_ct = cloth_type if cloth_type in ("dresses", "full_body") else (
+            source_cloth_type if source_cloth_type in ("dresses", "full_body") else ""
         )
         if _drape_ct:
             arm_mask = np.isin(schp_labels, list(_DRAPE_ARM_LABELS)).astype(np.uint8) * 255
@@ -2382,11 +2382,9 @@ def build_schp_protect_mask(
     if np.any(_hand_protect):
         mask = np.maximum(mask, _hand_protect)
 
-    # Use minimal dilation (3px) — just enough for boundary safety.
-    # The old 7px dilation was eating 7px of the inpaint mask at every
-    # identity boundary (face, hands, neck), creating hard seams.
-    # With the reduced contour dilation, 3px protection is sufficient.
-    mask = _dilate_mask(mask, 3, iterations=1)
+    # Use computed dilate_px for boundary safety — covers identity boundary zones
+    # to prevent hard seams at face/hand/neck boundaries.
+    mask = _dilate_mask(mask, dilate_px, iterations=1)
     return mask
 
 
@@ -2483,22 +2481,31 @@ def build_final_inpaint_mask(
         source_mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
         protect = np.minimum(protect, 255 - source_mask)
 
-    # 4. Minimal boundary smoothing
+    # 4. Garment-type-aware boundary smoothing
     # The inpaint mask from SCHP labels has pixelated edges at body-label
-    # boundaries. A very small kernel smooths these without expanding into
-    # background. The garment silhouette enhancement (handler.py Stage 3)
-    # already provides precise boundary coverage — aggressive dilation here
-    # creates the visible gray/white border by expanding the mask beyond the
-    # actual garment edge (the "fill zone" artifact).
-    #
-    # Use 1px dilation only — just enough to connect adjacent mask pixels
-    # without creating a visible fill zone. The ellipse kernel with radius
-    # 0.5px connects diagonally-adjacent pixels while adding <1px of
-    # expansion in each direction.
+    # boundaries. Use garment-type-aware kernels to smooth appropriately:
+    # - lower_body/dresses/full_body: larger vertical kernel to cover legs/skirt
+    # - upper_body: wider horizontal kernel to cover torso
     h, w = schp_labels.shape
-    ks = 3  # minimum odd kernel size for cv2 ellipse
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-    inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
+    scale = max(1.0, h / 512.0)
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        leg_kw = max(3, int(19 * scale))
+        leg_kh = max(3, int(29 * scale))
+        if leg_kw % 2 == 0:
+            leg_kw += 1
+        if leg_kh % 2 == 0:
+            leg_kh += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
+        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=2)
+    else:
+        up_kw = max(3, int(25 * scale))
+        up_kh = max(3, int(15 * scale))
+        if up_kw % 2 == 0:
+            up_kw += 1
+        if up_kh % 2 == 0:
+            up_kh += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (up_kw, up_kh))
+        inpaint_dilated = cv2.dilate(inpaint_raw, kernel, iterations=1)
 
     # 5. Apply protection (subtract identity from editable)
     final = apply_protection_binary(inpaint_dilated, protect)
