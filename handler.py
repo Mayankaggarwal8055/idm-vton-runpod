@@ -1587,10 +1587,34 @@ def run_idm_vton_inference(
         else:
             # Draped: use silhouette directly — drape extends BEYOND body labels
             # into background regions (pallu over shoulder, fabric flowing past body).
-            logger.info(
-                "garment_silhouette_drape_expansion silhouette_px=%d trace_id=%s",
-                int(np.sum(garm_silhouette_mask > 127)), trace_id,
-            )
+            #
+            # PHASE 2: Quantify and clamp arm overlap. The unrestricted silhouette
+            # expansion bleeds into arm regions (labels 14, 15), causing the model
+            # to generate hallucinated extra limbs. Clamp only the overlapping arm
+            # pixels — do NOT globally reduce garment coverage.
+            _arm_labels_mask = np.isin(schp_np, [14, 15]).astype(np.uint8) * 255
+            if _arm_labels_mask.shape[:2] != garm_silhouette_mask.shape[:2]:
+                _arm_labels_mask = np.array(
+                    Image.fromarray(_arm_labels_mask).resize(
+                        (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), Image.LANCZOS
+                    )
+                )
+                _arm_labels_mask = (_arm_labels_mask > 127).astype(np.uint8) * 255
+            _arm_overlap = np.sum((garm_silhouette_mask > 127) & (_arm_labels_mask > 127))
+            _sil_total = int(np.sum(garm_silhouette_mask > 127))
+            if _arm_overlap > 0:
+                # Remove arm-overlapping pixels from silhouette — arms must be preserved
+                garm_silhouette_mask = np.where(_arm_labels_mask > 127, 0, garm_silhouette_mask).astype(np.uint8)
+                logger.info(
+                    "drape_arm_overlap_clamped overlap_px=%d sil_total=%d overlap_pct=%.1f%% trace_id=%s",
+                    int(_arm_overlap), _sil_total,
+                    _arm_overlap / max(1, _sil_total) * 100, trace_id,
+                )
+            else:
+                logger.info(
+                    "garment_silhouette_drape_expansion silhouette_px=%d arm_overlap_px=0 trace_id=%s",
+                    _sil_total, trace_id,
+                )
 
         # Add garment silhouette to inpaint mask
         enhanced_inpaint = np.maximum(inpaint_mask_np, garm_silhouette_mask)
@@ -1852,11 +1876,11 @@ def run_idm_vton_inference(
             (final_mask_np.shape[0], final_mask_np.shape[1]), dtype=np.float32
         )
 
-        # Identity protection: face, hair, shoes, hat, sunglasses, bag, neck.
-        # These labels must never be altered by the diffusion model.
-        # NOTE: Label 18 (NECK) IS protected — it is part of identity.
-        # The old code protected neck implicitly via ~np.isin(clothing).
-        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 16, 18}
+        # Identity protection: face, hair, shoes, hat, sunglasses, bag, neck,
+        # and arms. Arms (14, 15) are protected to prevent the model from
+        # generating hallucinated extra limbs within the inpaint region.
+        # Label 18 (NECK) IS protected — it is part of identity.
+        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 14, 15, 16, 18}
         _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
 
         # Dilate hard protect by 5px to cover the boundary zone where the
@@ -1866,6 +1890,21 @@ def run_idm_vton_inference(
         ks_hp = 5
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
         _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
+
+        # Hand/wrist protection: detect distal arm regions (hands holding
+        # phones, bags, accessories) and protect them from diffusion modification.
+        # This prevents the model from corrupting hand-object interactions.
+        try:
+            _hand_zone = _hand_zones_from_arms(schp_np)
+            _hand_zone = cv2.dilate(
+                _hand_zone,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            )
+            _hand_zone_f = _hand_zone.astype(np.float32) / 255.0
+            _hard_mask = np.maximum(_hard_mask, _hand_zone_f)
+        except Exception:
+            pass
 
         # Where hard_protect=1, always preserve original
         body_preserve = np.maximum(body_preserve, _hard_mask)
@@ -1906,7 +1945,40 @@ def run_idm_vton_inference(
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size, Image.LANCZOS)
         final_img = human_img_orig.copy()
-        final_img.paste(out_img, (round(left), round(top)))
+
+        # Feathered alpha blending at crop boundary to eliminate hard seams.
+        # The hard paste() created visible transitions where the model output
+        # (inpaint region) met the original image (outside crop). A feathered
+        # mask smoothly blends between original (at crop edges) and model
+        # output (inside crop), eliminating the boundary artifact.
+        crop_w, crop_h = crop_size
+        feather_px = max(4, min(20, crop_w // 6, crop_h // 6))
+
+        # Build 2D feathered alpha: 0 at edges → 1 inside
+        _alpha = np.ones((crop_h, crop_w), dtype=np.float32)
+        if feather_px > 2:
+            # Gaussian-like smooth transition using cosine blend
+            t = np.linspace(0, np.pi / 2, feather_px, dtype=np.float32)
+            fade = np.sin(t)  # 0→1 smooth ramp
+            # Left edge
+            _alpha[:, :feather_px] *= fade[np.newaxis, :]
+            # Right edge
+            _alpha[:, -feather_px:] *= fade[np.newaxis, ::-1]
+            # Top edge
+            _alpha[:feather_px, :] *= fade[:, np.newaxis]
+            # Bottom edge
+            _alpha[-feather_px:, :] *= fade[::-1, np.newaxis]
+
+        # Extract the crop region from the original, blend with model output
+        paste_x, paste_y = round(left), round(top)
+        crop_box = (paste_x, paste_y, paste_x + crop_w, paste_y + crop_h)
+        crop_region = final_img.crop(crop_box)
+        out_np = np.array(out_img).astype(np.float32)
+        crop_np = np.array(crop_region).astype(np.float32)
+        alpha_3d = _alpha[:, :, np.newaxis]
+        blended = out_np * alpha_3d + crop_np * (1.0 - alpha_3d)
+        blended_img = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+        final_img.paste(blended_img, (paste_x, paste_y))
         return final_img, raw_output, mask_meta
 
     return images[0], raw_output, mask_meta
