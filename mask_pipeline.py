@@ -2466,11 +2466,17 @@ def build_final_inpaint_mask(
     # original garment pixels visible at waist/neckline. Use tighter
     # dilation for upper_body where protect labels are adjacent to editable
     # regions; keep larger for lower_body where protect labels are farther.
+    #
+    # DRESSES: use 2px — dresses cover the full body, and protect labels
+    # (face, hair, neck, belt) are embedded within the garment zone. 4px
+    # dilation bleeds neck/belt protection INTO the dress area, reducing
+    # final mask coverage at neckline/waist and leaving source clothing
+    # visible. 2px is enough for boundary safety without garment bleed.
     _protect_dilate = {
         "upper_body": 3,
         "lower_body": 5,
-        "dresses": 4,
-        "full_body": 4,
+        "dresses": 2,
+        "full_body": 2,
     }.get(cloth_type, 5)
     protect = build_schp_protect_mask(
         schp_labels, cloth_type, garment_subtype,

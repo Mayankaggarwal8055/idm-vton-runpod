@@ -1517,6 +1517,34 @@ def run_idm_vton_inference(
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ks, dilate_ks))
         garm_silhouette_mask = cv2.dilate(garm_silhouette_mask, dilate_kernel, iterations=1)
 
+        # ── SKIN-ZONE REMOVAL from garment silhouette ──────────────────
+        # When the garment reference is a worn-model photo, rembg keeps the
+        # model's skin/arms connected to the garment. These non-clothing
+        # pixels contaminate the IP-Adapter conditioning, causing the model
+        # to generate skin texture instead of fabric. Detect skin-colored
+        # pixels (HSV hue 0-50, saturation >40, value >60) in the garment
+        # image and remove them from the silhouette mask.
+        if cloth_type in ("dresses", "full_body", "upper_body"):
+            try:
+                garm_hsv = cv2.cvtColor(garm_arr, cv2.COLOR_RGB2HSV)
+                _skin_mask = (
+                    (garm_hsv[:, :, 0] < 50)   # hue: red-yellow range
+                    & (garm_hsv[:, :, 1] > 40)  # saturation: not gray
+                    & (garm_hsv[:, :, 2] > 60)  # value: not dark
+                ).astype(np.uint8) * 255
+                # Only remove skin pixels that are in the silhouette
+                # (don't create new holes in non-skin regions)
+                _skin_in_sil = np.minimum(garm_silhouette_mask, _skin_mask)
+                _skin_px = int(np.sum(_skin_in_sil > 127))
+                if _skin_px > 0:
+                    garm_silhouette_mask = np.where(_skin_in_sil > 127, 0, garm_silhouette_mask).astype(np.uint8)
+                    logger.info(
+                        "garment_skin_removal skin_px=%d cloth_type=%s trace_id=%s",
+                        _skin_px, cloth_type, trace_id,
+                    )
+            except Exception:
+                pass  # Fall back to unmodified silhouette
+
         # Limit silhouette to the person's body silhouette so the mask doesn't
         # bleed into pure background. Use a conservatively dilated body mask:
         # enough to cover SCHP boundary misclassifications but not so much
@@ -1535,7 +1563,26 @@ def run_idm_vton_inference(
         # by checking if the AND removed >25% of silhouette pixels, and if so,
         # use the silhouette directly with morphological closing to fill gaps.
         _is_draped_garment = is_draped_garment(cloth_type, garment_subtype)
-        if not _is_draped_garment:
+        _is_full_body = cloth_type in ("dresses", "full_body")
+
+        if _is_full_body and not _is_draped_garment:
+            # DRESSES/FULL_BODY: use silhouette directly with morphological
+            # closing. The AND with target labels clips the dress silhouette
+            # at body-label boundaries where SCHP misclassifies dress pixels
+            # (e.g., dress pixels labeled as background or skin). The skin
+            # removal step already cleaned non-clothing pixels, so the
+            # silhouette is trustworthy. Morphological closing fills small
+            # holes without over-constraining to body labels.
+            _ks_close = max(7, int(min(garm_silhouette_mask.shape) * 0.02))
+            if _ks_close % 2 == 0:
+                _ks_close += 1
+            _kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_close, _ks_close))
+            garm_silhouette_mask = cv2.morphologyEx(garm_silhouette_mask, cv2.MORPH_CLOSE, _kernel_close)
+            logger.info(
+                "dress_silhouette_direct silhouette_px=%d trace_id=%s",
+                int(np.sum(garm_silhouette_mask > 127)), trace_id,
+            )
+        elif not _is_draped_garment:
             _target_labels = (
                 get_profile_editable_labels(garment_profile)
                 if garment_profile is not None
@@ -1860,6 +1907,33 @@ def run_idm_vton_inference(
 
     raw_output = images[0].copy()
 
+    # ── FABRIC TEXTURE QUALITY PASS (dresses/full_body only) ──────────
+    # Diffusion models tend to flatten fabric detail — prints become blurry,
+    # embroidery loses sharpness, folds disappear. Apply mild local contrast
+    # enhancement (CLAHE) + unsharp mask ONLY to the garment region to bring
+    # out fabric texture without altering garment shape, mask, or compositing.
+    # Controlled by IDM_FABRIC_ENHANCE env var (default: enabled for dresses).
+    _fabric_enhance = os.environ.get("IDM_FABRIC_ENHANCE", "").lower() not in ("0", "false", "no")
+    if _fabric_enhance and cloth_type in ("dresses", "full_body"):
+        try:
+            _fab_arr = np.array(images[0], dtype=np.uint8)
+            _fab_mask = (final_mask_np > 127).astype(np.uint8)
+            # CLAHE on L channel for local contrast (brings out folds/wrinkles)
+            _lab = cv2.cvtColor(_fab_arr, cv2.COLOR_RGB2LAB)
+            _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            _lab[:, :, 0] = _clahe.apply(_lab[:, :, 0])
+            _enhanced = cv2.cvtColor(_lab, cv2.COLOR_LAB2RGB)
+            # Mild unsharp mask for fabric detail (gentle — no halos)
+            _blur = cv2.GaussianBlur(_enhanced, (0, 0), 1.5)
+            _sharp = cv2.addWeighted(_enhanced, 1.15, _blur, -0.15, 0)
+            # Blend: only modify garment region (inpaint mask), keep everything else
+            _fab_mask_3ch = _fab_mask[:, :, np.newaxis].astype(np.float32)
+            _result = _fab_arr.astype(np.float32) * (1.0 - _fab_mask_3ch * 0.4) + _sharp.astype(np.float32) * (_fab_mask_3ch * 0.4)
+            images[0] = Image.fromarray(np.clip(_result, 0, 255).astype(np.uint8))
+            logger.info("fabric_texture_enhancement_applied cloth_type=%s trace_id=%s", cloth_type, trace_id)
+        except Exception as exc:
+            logger.warning("fabric_texture_enhancement_failed error=%s", exc)
+
     # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
     # Preserve identity (face, hair, shoes, hat, sunglasses, bag, neck)
     # and background. All garment-editable regions use the diffusion output
@@ -1885,7 +1959,17 @@ def run_idm_vton_inference(
         # sunglasses, bag, neck, belt — even if the mask accidentally
         # includes them. These labels should never be in the inpaint mask,
         # but this is a safety net against mask bugs.
-        _identity_labels = {1, 2, 3, 8, 9, 10, 11, 16, 18}
+        # DRESSES/FULL_BODY: exclude neck (18) from safety net. The dress
+        # neckline starts below the neck — preserving neck pixels prevents
+        # the model from generating a clean neckline transition. The inpaint
+        # mask already excludes neck (it's not in editable labels), so the
+        # clamp step will preserve it naturally. The safety net is only
+        # needed for labels that might accidentally leak into the mask.
+        _identity_labels = (
+            {1, 2, 3, 8, 9, 10, 11, 16}  # no neck for dresses/full_body
+            if cloth_type in ("dresses", "full_body")
+            else {1, 2, 3, 8, 9, 10, 11, 16, 18}  # full set including neck
+        )
         _identity_mask = np.isin(schp_np, list(_identity_labels)).astype(np.float32)
         body_preserve = np.maximum(body_preserve, _identity_mask)
 
