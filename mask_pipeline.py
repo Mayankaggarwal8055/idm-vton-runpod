@@ -1864,7 +1864,7 @@ def assert_binary_mask(mask: np.ndarray, name: str = "mask") -> None:
 def _hand_zones_from_arms(
     schp_labels: np.ndarray,
     arm_labels: tuple[int, ...] = _DRAPE_ARM_LABELS,
-    hand_fraction: float = 0.38,
+    hand_fraction: float = 0.25,
 ) -> np.ndarray:
     """Protect the distal portion of each arm (hands/wrists) using 2D spatial logic.
 
@@ -2460,8 +2460,21 @@ def build_final_inpaint_mask(
     )
 
     # 3. Build protect mask — GarmentProfile-driven
+    # Garment-type-aware dilation: upper_body protects neck (18) + belt (8)
+    # which sit close to the editable garment zone. 7px bleed from these
+    # labels creates a protected border the model can't inpaint, leaving
+    # original garment pixels visible at waist/neckline. Use tighter
+    # dilation for upper_body where protect labels are adjacent to editable
+    # regions; keep larger for lower_body where protect labels are farther.
+    _protect_dilate = {
+        "upper_body": 3,
+        "lower_body": 5,
+        "dresses": 4,
+        "full_body": 4,
+    }.get(cloth_type, 5)
     protect = build_schp_protect_mask(
-        schp_labels, cloth_type, garment_subtype, profile=profile,
+        schp_labels, cloth_type, garment_subtype,
+        dilate_px=_protect_dilate, profile=profile,
     )
 
     # 3b. Cross-category fix: remove SOURCE garment labels from protection.

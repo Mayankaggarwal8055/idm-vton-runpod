@@ -1553,7 +1553,7 @@ def run_idm_vton_inference(
             _sil_px_before = int(np.sum(garm_silhouette_mask > 127))
             _clipped = np.minimum(garm_silhouette_mask, _schp_body)
             _sil_px_after = int(np.sum(_clipped > 127))
-            if _sil_px_before > 0 and (_sil_px_before - _sil_px_after) / _sil_px_before > 0.25:
+            if _sil_px_before > 0 and (_sil_px_before - _sil_px_after) / _sil_px_before > 0.15:
                 # SCHP misclassification detected — use silhouette with morphological closing
                 # to fill holes while staying within the body region
                 logger.info(
@@ -1561,8 +1561,13 @@ def run_idm_vton_inference(
                     _sil_px_before, _sil_px_after,
                     (_sil_px_before - _sil_px_after) / _sil_px_before * 100, trace_id,
                 )
-                # Use a generous body mask: dilate all body labels to cover misclassified regions
-                _all_body = np.isin(schp_np, [4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18]).astype(np.uint8) * 255
+                # Jeans-hole fix: for lower_body garments, SCHP misclassifies leg
+                # pixels (labels 12, 13) as upper_clothes (label 4). The AND with
+                # target labels removes these pixels, creating holes in the leg region.
+                # Use the silhouette directly with morphological closing to fill gaps,
+                # constrained to body-region pixels only.
+                _body_labels_fill = [4, 5, 6, 7, 12, 13, 14, 15] if cloth_type in ("lower_body",) else [4, 5, 6, 7, 8, 12, 13, 14, 15, 17, 18]
+                _all_body = np.isin(schp_np, _body_labels_fill).astype(np.uint8) * 255
                 if _all_body.shape[:2] != garm_silhouette_mask.shape[:2]:
                     _all_body = np.array(
                         Image.fromarray(_all_body).resize(
@@ -1975,12 +1980,29 @@ def run_idm_vton_inference(
             # Bottom edge
             _alpha[-feather_px:, :] *= fade[::-1, np.newaxis]
 
-        # Extract the crop region from the original, blend with model output
+        # Extract the crop region from the original, blend with model output.
+        # MASK-AWARE BLENDING: where the inpaint mask is active (editable
+        # garment region), use full model output (alpha=1.0) regardless of
+        # the feathered edge blend. This prevents original garment pixels
+        # from being restored at crop boundaries that intersect the garment.
         paste_x, paste_y = round(left), round(top)
         crop_box = (paste_x, paste_y, paste_x + crop_w, paste_y + crop_h)
         crop_region = final_img.crop(crop_box)
         out_np = np.array(out_img).astype(np.float32)
         crop_np = np.array(crop_region).astype(np.float32)
+
+        # Override alpha where inpaint mask is active in the crop region
+        try:
+            _mask_crop = final_mask_np[
+                paste_y:paste_y + crop_h, paste_x:paste_x + crop_w
+            ]
+            if _mask_crop.shape[:2] == _alpha.shape:
+                _mask_active = (_mask_crop > 127).astype(np.float32)
+                # Where mask is active: alpha=1.0 (full model output)
+                _alpha = _alpha * (1.0 - _mask_active) + _mask_active
+        except Exception:
+            pass  # Fall back to standard feathered blend
+
         alpha_3d = _alpha[:, :, np.newaxis]
         blended = out_np * alpha_3d + crop_np * (1.0 - alpha_3d)
         blended_img = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
