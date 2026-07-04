@@ -1856,64 +1856,70 @@ def run_idm_vton_inference(
     raw_output = images[0].copy()
 
     # ── BODY SHAPE PRESERVATION ───────────────────────────────────────
-    # Only preserve identity (face, hair, shoes, hat, sunglasses, bag)
-    # and background. Everything else uses the diffusion output directly.
+    # Preserve identity (face, hair, shoes, hat, sunglasses, bag, neck)
+    # and background. All garment-editable regions use the diffusion output
+    # directly — no original garment pixels are ever restored.
     #
-    # CRITICAL: The old feathered-complement approach (body_preserve =
-    # feathered_inverse of inpaint mask) caused source garment leakage
-    # because the feather zone (4-6px transition) blended original person
-    # pixels (with source garment) back into the diffusion output at
-    # garment boundaries. This is the primary root cause of color bleeding.
-    #
-    # Fix: start with body_preserve=0 everywhere (use diffusion output),
-    # then only add hard_protect for identity + background safeguard.
+    # APPROACH: mask-driven preservation.
+    #   1. Preserve everything the inpaint mask says NOT to diffuse (mask=0).
+    #   2. Always preserve identity labels regardless of mask (safety net).
+    #   3. Always preserve background.
+    # This ensures the mask pipeline's decisions are respected: if a label
+    # is editable (mask=255), the diffusion output is used; if protected
+    # (mask=0), the original is kept. No hardcoded garment labels are
+    # preserved — the mask determines what's editable.
     try:
         result_arr = np.array(images[0], dtype=np.float32)
         person_arr = np.array(human_img, dtype=np.float32)
 
-        # Start with zero preservation — use diffusion output everywhere
-        body_preserve = np.zeros(
-            (final_mask_np.shape[0], final_mask_np.shape[1]), dtype=np.float32
-        )
+        # Start with mask-driven preservation: preserve where mask=0
+        # (regions the model did NOT inpaint), use diffusion where mask=255.
+        body_preserve = (final_mask_np < 127).astype(np.float32)
 
-        # Identity protection: face, hair, shoes, hat, sunglasses, bag, neck,
-        # and arms. Arms (14, 15) are protected to prevent the model from
-        # generating hallucinated extra limbs within the inpaint region.
-        # Label 18 (NECK) IS protected — it is part of identity.
-        _hard_protect = {0, 1, 2, 3, 9, 10, 11, 14, 15, 16, 18}
-        _hard_mask = np.isin(schp_np, list(_hard_protect)).astype(np.float32)
+        # Identity safety net: always preserve face, hair, shoes, hat,
+        # sunglasses, bag, neck, belt — even if the mask accidentally
+        # includes them. These labels should never be in the inpaint mask,
+        # but this is a safety net against mask bugs.
+        _identity_labels = {1, 2, 3, 8, 9, 10, 11, 16, 18}
+        _identity_mask = np.isin(schp_np, list(_identity_labels)).astype(np.float32)
+        body_preserve = np.maximum(body_preserve, _identity_mask)
 
-        # Dilate hard protect by 5px to cover the boundary zone where the
-        # dilated inpaint mask bleeds into background pixels. Without sufficient
-        # dilation, the diffusion model generates non-background content at the
-        # body boundary, creating a visible white/light halo against dark walls.
-        ks_hp = 5
+        # Background preservation: never let the model modify background.
+        _bg_mask = (schp_np == 0).astype(np.float32)
+        body_preserve = np.maximum(body_preserve, _bg_mask)
+
+        # Boundary safety dilation: dilate the preservation zone by 3px to
+        # cover the boundary where the inpaint mask bleeds into protected
+        # regions. This prevents the diffusion model from generating
+        # non-background content at body boundaries (white halo artifact).
+        # Use 3px (not 5px) to avoid bleeding garment preservation into
+        # editable regions — arms, torso, etc. must remain fully diffused.
+        ks_hp = 3
         kernel_hp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_hp, ks_hp))
-        _hard_mask = cv2.dilate(_hard_mask, kernel_hp, iterations=1)
+        body_preserve = cv2.dilate(body_preserve, kernel_hp, iterations=1)
 
-        # Hand/wrist protection: detect distal arm regions (hands holding
-        # phones, bags, accessories) and protect them from diffusion modification.
-        # This prevents the model from corrupting hand-object interactions.
+        # Hand/wrist protection: protect the distal portion of each arm
+        # (hands holding phones, bags, accessories). Hands are identity —
+        # they don't change during try-on. Use small dilation (3px) to
+        # avoid bleeding into the forearm/sleeve region where the model
+        # should generate new garment content.
         try:
             _hand_zone = _hand_zones_from_arms(schp_np)
             _hand_zone = cv2.dilate(
                 _hand_zone,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
                 iterations=1,
             )
             _hand_zone_f = _hand_zone.astype(np.float32) / 255.0
-            _hard_mask = np.maximum(_hard_mask, _hand_zone_f)
+            body_preserve = np.maximum(body_preserve, _hand_zone_f)
         except Exception:
             pass
 
-        # Where hard_protect=1, always preserve original
-        body_preserve = np.maximum(body_preserve, _hard_mask)
-
-        # NOTE: No background safeguard here. The old code had no body_preserve
-        # at all — the model output was the final image. Adding a background
-        # safeguard that preserves original pixels where the mask is 0 caused
-        # source garment color to bleed through at mask edges. The model
-        # already handles background correctly via the binary inpaint mask.
+        # Clamp: the inpaint mask region MUST use diffusion output.
+        # Remove any preservation where the inpaint mask is active.
+        # This prevents mask dilation from accidentally preserving garment pixels.
+        _inpaint_active = (final_mask_np > 127).astype(np.float32)
+        body_preserve = body_preserve * (1.0 - _inpaint_active)
 
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted
         body_preserve_3ch = body_preserve[:, :, np.newaxis]

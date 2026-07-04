@@ -2,6 +2,19 @@
 
 # =============================================================================
 # IDM-VTON RunPod Inference Image
+#
+# Fast layered build:
+#   Layer 1: OS deps (stable)
+#   Layer 2: Python deps (stable, pip cache)
+#   Layer 3: Detectron2 (stable, pip cache)
+#   Layer 4: Model checkpoints (stable, HF cache) — downloaded to /tmp/checkpoints/
+#   Layer 5: Clone IDM-VTON repo (GIT_REVISION cache buster)
+#   Layer 6: Symlink checkpoints into repo paths
+#   Layer 7: Validate IDM-VTON pipeline imports
+#   Layer 8: Copy worker files + validate mask_pipeline + quality_validation
+#
+# Only handler.py, mask_pipeline.py, quality_validation.py, face_restoration.py
+# are copied into the image. Everything else is downloaded during build.
 # =============================================================================
 
 FROM runpod/pytorch:2.0.1-py3.10-cuda11.8.0-devel AS build
@@ -287,7 +300,9 @@ print("All validation passed")
 PY
 
 # =============================================================================
-# Copy RunPod handler + mask pipeline
+# Copy RunPod handler + mask pipeline + face restoration
+# These are the ONLY source files copied into the image.
+# All other code (IDM-VTON repo, models, checkpoints) is downloaded during build.
 # =============================================================================
 
 COPY handler.py /workspace/handler.py

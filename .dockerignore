@@ -1,32 +1,50 @@
-# Keep the build context tiny
-.next/
-node_modules/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+*.egg-info/
+
+# Git
 .git/
-.github/
 .gitattributes
-.gitignore
+
+# Environment
 .env
 .env.*
 *.env
-*.md
-*.txt
+
+# Logs
 *.log
-scripts/
-models/
+
+# Documentation
+*.md
+
+# IDE
+.vscode/
+.idea/
+
+# Local cache
+.cache/
+
+# Tests
+tests/
 regression_tests/
-pipeline_trace_*/
-pipeline_trace_complete/
-pipeline_trace_live/
+pipeline_trace*/
+debug_*.py
+
+# Local scripts
+scripts/
+
+# Downloaded models (downloaded during Docker build)
+models/
 *.pth
 *.ckpt
 *.safetensors
-garment_warp.py
-local_trace.py
-run_full_trace.py
-run_pipeline_trace.py
-trace_complete.py
+*.bin
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
