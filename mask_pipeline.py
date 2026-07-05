@@ -1688,6 +1688,13 @@ def get_profile_protect_labels(profile: GarmentProfile) -> set[int]:
     """
     labels: set[int] = set(_IDENTITY_PROTECT_LABELS)
 
+    # DRESSES/FULL_BODY: exclude neck (18) from protection. The dress
+    # neckline starts below the neck — protecting neck prevents the model
+    # from generating a clean neckline transition. The inpaint mask already
+    # excludes neck (not in editable labels), so it's safe to leave unprotected.
+    if profile.cloth_type in ("dresses", "full_body"):
+        labels.discard(_LABEL_NECK)
+
     # All garment labels — using corrected LIP labels.
     all_garment = (
         {_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_PANTS,

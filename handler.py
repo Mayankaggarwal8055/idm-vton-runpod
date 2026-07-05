@@ -433,28 +433,38 @@ def run_cross_category_inference(
     neutral = _generate_neutral_garment()
 
     # Source-garment-specific erase prompt
+    # Neutral erase: describe bare body without any garment. This avoids
+    # leaving visible artifacts (beige tank top, shorts) that the apply
+    # stage might not fully overwrite. The model erases to bare skin,
+    # then the apply stage generates the target garment cleanly.
+    #
+    # Body structure cues ("defined shoulders, natural neckline") prevent
+    # the model from over-erasing — it preserves the body's natural contour
+    # so the apply stage has a clean structural foundation for the garment.
     src_stripped = (source_cloth_type or "").lower()
     _ERASE_PROMPTS: dict[str, tuple[str, str]] = {
         "dresses": (
-            "model wearing plain simple beige tank top and shorts, "
-            "solid neutral undergarments, bare torso, visible skin",
-            "saree, drape, pallu, dupatta, scarf, shawl, lehenga, "
-            "dress, gown, skirt, wrap, embroidery, border, "
+            "bare human body, no clothing, no garments, visible skin, "
+            "defined shoulders, natural neckline, natural body shape, "
+            "clean skin texture, realistic body proportions",
+            "clothing, garment, fabric, dress, shirt, pants, "
+            "accessories, jewelry, bag, belt, "
             "original clothing, old garment, residual fabric, "
             "worst quality, low quality, deformed, extra limbs",
         ),
         "upper_body": (
-            "model wearing plain simple beige tank top and shorts, "
-            "solid neutral undergarments, bare torso, visible skin",
-            "jacket, blazer, coat, hoodie, sweater, shirt, "
-            "collar, lapels, zipper, buttons, hood, "
+            "bare human torso, no clothing, no garments, visible skin, "
+            "natural body shape, clean skin texture",
+            "clothing, garment, fabric, shirt, jacket, dress, "
+            "accessories, jewelry, bag, belt, "
             "original clothing, old garment, residual fabric, "
             "worst quality, low quality, deformed, extra limbs",
         ),
         "lower_body": (
-            "model wearing plain simple beige tank top, "
-            "bare legs, visible skin, simple neutral",
-            "jeans, trousers, pants, skirt, shorts, leggings, "
+            "bare human legs, no clothing, no garments, visible skin, "
+            "natural body shape, clean skin texture",
+            "clothing, garment, fabric, pants, jeans, skirt, "
+            "accessories, jewelry, bag, belt, "
             "original clothing, old garment, residual fabric, "
             "worst quality, low quality, deformed, extra limbs",
         ),
@@ -1524,6 +1534,14 @@ def run_idm_vton_inference(
         # to generate skin texture instead of fabric. Detect skin-colored
         # pixels (HSV hue 0-50, saturation >40, value >60) in the garment
         # image and remove them from the silhouette mask.
+        #
+        # CONSERVATIVE for dresses/full_body: skin-colored garments (beige,
+        # peach, tan dresses) would lose 30-50% of their silhouette with
+        # aggressive removal. Only remove skin patches that are:
+        #   1. Small (connected component < 15% of total silhouette)
+        #   2. Far from the garment centroid (likely model's exposed skin)
+        # This preserves skin-colored garment pixels while still cleaning
+        # model skin artifacts at garment edges.
         if cloth_type in ("dresses", "full_body", "upper_body"):
             try:
                 garm_hsv = cv2.cvtColor(garm_arr, cv2.COLOR_RGB2HSV)
@@ -1533,15 +1551,45 @@ def run_idm_vton_inference(
                     & (garm_hsv[:, :, 2] > 60)  # value: not dark
                 ).astype(np.uint8) * 255
                 # Only remove skin pixels that are in the silhouette
-                # (don't create new holes in non-skin regions)
                 _skin_in_sil = np.minimum(garm_silhouette_mask, _skin_mask)
                 _skin_px = int(np.sum(_skin_in_sil > 127))
-                if _skin_px > 0:
-                    garm_silhouette_mask = np.where(_skin_in_sil > 127, 0, garm_silhouette_mask).astype(np.uint8)
-                    logger.info(
-                        "garment_skin_removal skin_px=%d cloth_type=%s trace_id=%s",
-                        _skin_px, cloth_type, trace_id,
-                    )
+                _sil_total = int(np.sum(garm_silhouette_mask > 127))
+                if _skin_px > 0 and _sil_total > 0:
+                    _skin_ratio = _skin_px / _sil_total
+                    if cloth_type in ("dresses", "full_body") and _skin_ratio > 0.15:
+                        # Skin-colored garment detected (>15% of silhouette).
+                        # Only remove small, isolated skin patches far from
+                        # garment centroid — these are model's exposed skin,
+                        # not garment pixels.
+                        _ys, _xs = np.where(garm_silhouette_mask > 127)
+                        _cx, _cy = float(np.mean(_xs)), float(np.mean(_ys))
+                        _num_labels, _labels, _stats, _centroids = cv2.connectedComponentsWithStats(
+                            _skin_in_sil, connectivity=8,
+                        )
+                        _sil_area = max(1, _sil_total)
+                        _remove_mask = np.zeros_like(garm_silhouette_mask)
+                        for _comp_i in range(1, _num_labels):
+                            _comp_area = _stats[_comp_i, cv2.CC_STAT_AREA]
+                            _comp_cx, _comp_cy = _centroids[_comp_i]
+                            _dist = ((_comp_cx - _cx)**2 + (_comp_cy - _cy)**2)**0.5
+                            # Remove if: small (<15% of silhouette) AND far from centroid
+                            if _comp_area < _sil_area * 0.15 and _dist > min(garm_silhouette_mask.shape) * 0.15:
+                                _remove_mask[_labels == _comp_i] = 255
+                        _remove_px = int(np.sum(_remove_mask > 127))
+                        if _remove_px > 0:
+                            garm_silhouette_mask = np.where(_remove_mask > 127, 0, garm_silhouette_mask).astype(np.uint8)
+                            logger.info(
+                                "garment_skin_removal_conservative skin_total=%d "
+                                "removed=%d cloth_type=%s trace_id=%s",
+                                _skin_px, _remove_px, cloth_type, trace_id,
+                            )
+                    else:
+                        # Upper body or small skin fraction: aggressive removal OK
+                        garm_silhouette_mask = np.where(_skin_in_sil > 127, 0, garm_silhouette_mask).astype(np.uint8)
+                        logger.info(
+                            "garment_skin_removal skin_px=%d cloth_type=%s trace_id=%s",
+                            _skin_px, cloth_type, trace_id,
+                        )
             except Exception:
                 pass  # Fall back to unmodified silhouette
 
@@ -1567,17 +1615,47 @@ def run_idm_vton_inference(
 
         if _is_full_body and not _is_draped_garment:
             # DRESSES/FULL_BODY: use silhouette directly with morphological
-            # closing. The AND with target labels clips the dress silhouette
-            # at body-label boundaries where SCHP misclassifies dress pixels
-            # (e.g., dress pixels labeled as background or skin). The skin
-            # removal step already cleaned non-clothing pixels, so the
-            # silhouette is trustworthy. Morphological closing fills small
-            # holes without over-constraining to body labels.
+            # closing + hole-filling. The AND with target labels clips the
+            # dress silhouette at body-label boundaries where SCHP misclassifies
+            # dress pixels. The skin removal step already cleaned non-clothing
+            # pixels, so the silhouette is trustworthy.
+            #
+            # Morphological closing fills small gaps at garment boundaries.
+            # FloodFill from centroid fills INTERNAL holes (pattern regions,
+            # shadow gaps, transparent areas) that closing misses. Without
+            # hole-filling, these gaps become inpaint-mask holes where source
+            # clothing shows through.
             _ks_close = max(7, int(min(garm_silhouette_mask.shape) * 0.02))
             if _ks_close % 2 == 0:
                 _ks_close += 1
             _kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_ks_close, _ks_close))
             garm_silhouette_mask = cv2.morphologyEx(garm_silhouette_mask, cv2.MORPH_CLOSE, _kernel_close)
+            # Hole-filling: floodFill from centroid to close internal gaps.
+            # Only fills pixels connected to the background (exterior) that
+            # are inside the convex hull of the garment — preserves true
+            # hemline/neckline gaps while filling pattern/shadow holes.
+            _sil_px = int(np.sum(garm_silhouette_mask > 127))
+            if _sil_px > 100:
+                _ys, _xs = np.where(garm_silhouette_mask > 127)
+                _cx, _cy = int(np.mean(_xs)), int(np.mean(_ys))
+                _h_fill, _w_fill = garm_silhouette_mask.shape
+                _flood_mask = np.zeros((_h_fill + 2, _w_fill + 2), dtype=np.uint8)
+                # Invert: floodFill fills background (0) starting from centroid
+                _inv = 255 - garm_silhouette_mask
+                # Only fill if centroid is inside garment (not in a hole)
+                if garm_silhouette_mask[_cy, _cx] > 127:
+                    cv2.floodFill(_inv, _flood_mask, (_cx, _cy), 255)
+                    # Holes = pixels that were NOT reached by floodFill (interior)
+                    _holes = (_inv < 127).astype(np.uint8) * 255
+                    _holes_px = int(np.sum(_holes > 127))
+                    # Only fill if holes are small (<20% of garment) — large
+                    # gaps might be true hemline/neckline openings
+                    if _holes_px > 0 and _holes_px < _sil_px * 0.20:
+                        garm_silhouette_mask = np.maximum(garm_silhouette_mask, _holes)
+                        logger.info(
+                            "dress_silhouette_hole_fill filled_px=%d total=%d trace_id=%s",
+                            _holes_px, _sil_px, trace_id,
+                        )
             logger.info(
                 "dress_silhouette_direct silhouette_px=%d trace_id=%s",
                 int(np.sum(garm_silhouette_mask > 127)), trace_id,
@@ -1815,7 +1893,20 @@ def run_idm_vton_inference(
                     negative_prompt=negative_prompt,
                 )
 
-                prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
+                # IP-Adapter garment conditioning prompt. This determines what
+                # the model "sees" as the garment via visual+textual conditioning.
+                # For dresses/full_body: include structural cues (silhouette,
+                # length, fit) so the model preserves garment identity instead
+                # of generating a generic shape. For upper/lower: keep concise.
+                if cloth_type in ("dresses", "full_body"):
+                    prompt_c = (
+                        "a photo of " + garment_desc
+                        + ", full garment silhouette, correct garment length and shape, "
+                        + "detailed fabric texture, natural garment folds, "
+                        + "accurate garment structure and proportions"
+                    )
+                else:
+                    prompt_c = "a photo of " + garment_desc + ", detailed fabric texture, natural folds"
                 prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                     prompt_c,
                     num_images_per_prompt=1,
@@ -1926,9 +2017,13 @@ def run_idm_vton_inference(
             # Mild unsharp mask for fabric detail (gentle — no halos)
             _blur = cv2.GaussianBlur(_enhanced, (0, 0), 1.5)
             _sharp = cv2.addWeighted(_enhanced, 1.15, _blur, -0.15, 0)
-            # Blend: only modify garment region (inpaint mask), keep everything else
+            # Blend: only modify garment region (inpaint mask), keep everything else.
+            # 50% blend: strong enough to bring out fabric texture (folds, wrinkles,
+            # embroidery detail) but not so strong that it creates halos or alters
+            # garment color. Previous 40% was too conservative for dresses where
+            # the diffusion model flattens fabric detail significantly.
             _fab_mask_3ch = _fab_mask[:, :, np.newaxis].astype(np.float32)
-            _result = _fab_arr.astype(np.float32) * (1.0 - _fab_mask_3ch * 0.4) + _sharp.astype(np.float32) * (_fab_mask_3ch * 0.4)
+            _result = _fab_arr.astype(np.float32) * (1.0 - _fab_mask_3ch * 0.5) + _sharp.astype(np.float32) * (_fab_mask_3ch * 0.5)
             images[0] = Image.fromarray(np.clip(_result, 0, 255).astype(np.uint8))
             logger.info("fabric_texture_enhancement_applied cloth_type=%s trace_id=%s", cloth_type, trace_id)
         except Exception as exc:
@@ -2007,7 +2102,16 @@ def run_idm_vton_inference(
         # Clamp: the inpaint mask region MUST use diffusion output.
         # Remove any preservation where the inpaint mask is active.
         # This prevents mask dilation from accidentally preserving garment pixels.
-        _inpaint_active = (final_mask_np > 127).astype(np.float32)
+        #
+        # USE INPAINT_MASK (not final_mask): final_mask = inpaint - protect.
+        # Protect removes identity labels (neck, belt) from the inpaint mask,
+        # creating gaps where final_mask=0. In those gaps, body_preserve stays
+        # as original → source clothing survives. Using inpaint_mask ensures
+        # ALL garment regions use diffusion output, regardless of protect gaps.
+        # The clamp is safe because the inpaint mask already excludes identity
+        # labels (they're not in editable labels), so it only affects garment
+        # regions where diffusion output should always be used.
+        _inpaint_active = (inpaint_mask_np > 127).astype(np.float32)
         body_preserve = body_preserve * (1.0 - _inpaint_active)
 
         # Blend: where body_preserve=1 keep original, where=0 keep inpainted
