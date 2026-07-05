@@ -84,11 +84,13 @@ SCHEDULER_NAMES = {"ddpm", "dpmpp"}
 if IDM_VTON_SCHEDULER not in SCHEDULER_NAMES:
     logger.info("scheduler_unknown_fallback value=%s", IDM_VTON_SCHEDULER)
     IDM_VTON_SCHEDULER = "ddpm"
-# Guidance scale: 3.5 balances garment faithfulness vs artifact risk.
-# 2.5 was too conservative — model generated soft/over-smoothed texture
-# because it didn't follow garment conditioning strongly enough.
-# 5.0+ causes over-saturation and color artifacts.
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "3.5"))
+# Guidance scale: 4.0 for stronger garment fidelity.
+# 3.5 was too conservative — model followed person pose/body more than garment
+# conditioning, causing color drift (bottle green → white) and generic texture.
+# 4.0 makes the model follow IP-Adapter + cloth tensor more strongly while
+# staying below the 5.0+ over-saturation threshold.
+# Override via IDM_VTON_GUIDANCE env var.
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "4.0"))
 
 # Cross-category two-stage pipeline constants
 NEUTRAL_GARMENT_PATH = os.path.join(
@@ -1998,14 +2000,16 @@ def run_idm_vton_inference(
 
     raw_output = images[0].copy()
 
-    # ── FABRIC TEXTURE QUALITY PASS (dresses/full_body only) ──────────
+    # ── FABRIC TEXTURE QUALITY PASS (all garment types) ─────────────
     # Diffusion models tend to flatten fabric detail — prints become blurry,
-    # embroidery loses sharpness, folds disappear. Apply mild local contrast
-    # enhancement (CLAHE) + unsharp mask ONLY to the garment region to bring
-    # out fabric texture without altering garment shape, mask, or compositing.
-    # Controlled by IDM_FABRIC_ENHANCE env var (default: enabled for dresses).
+    # embroidery loses sharpness, folds disappear, colors wash out. Apply
+    # mild local contrast enhancement (CLAHE) + unsharp mask ONLY to the
+    # garment region to bring out fabric texture without altering garment
+    # shape, mask, or compositing. Previously only applied to dresses —
+    # upper-body and lower-body garments also suffer from flat fabric.
+    # Controlled by IDM_FABRIC_ENHANCE env var (default: enabled).
     _fabric_enhance = os.environ.get("IDM_FABRIC_ENHANCE", "").lower() not in ("0", "false", "no")
-    if _fabric_enhance and cloth_type in ("dresses", "full_body"):
+    if _fabric_enhance:
         try:
             _fab_arr = np.array(images[0], dtype=np.uint8)
             _fab_mask = (final_mask_np > 127).astype(np.uint8)
