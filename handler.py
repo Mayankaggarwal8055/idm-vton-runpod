@@ -1214,25 +1214,37 @@ def _restore_person_identity(
 
     # ── SCHP parsing-based restoration (preferred) ─────────────────
     if parsing_map is not None:
-        # Resize parsing map to match the original image dimensions
-        parse_resized = cv2.resize(
-            np.array(parsing_map, dtype=np.uint8),
-            (w, h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        p_h, p_w = parsing_map.shape[:2]
+        if (p_w, p_h) == (w, h):
+            parse_resized = parsing_map
+        else:
+            parse_resized = cv2.resize(
+                np.array(parsing_map, dtype=np.uint8),
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
 
         # Build identity mask from parsing labels
         # Always include: face (11), hair (2)
         identity_labels = {2, 11}  # _LABEL_HAIR, _LABEL_FACE
 
-        # For lower_body: restore face + hair ONLY (not neck — the model
-        # may need to modify the neckline area for waistband context)
-        # For upper_body: include neck (18) to protect the neck/chin area
-        # For dresses: include neck (18) since the collar matters
-        if cloth_type != "lower_body":
-            identity_labels.add(18)  # _LABEL_NECK
-
+        # For non-lower-body (upper_body / dresses): include neck (18)
+        # BUT filter out the lower collarbone zone (bottom 40% of neck)
+        # to prevent neck label 18 from bleeding original skin pixels over
+        # the generated open shirt collar / lapel ("melted collar" fix).
         identity_mask = np.isin(parse_resized, list(identity_labels)).astype(np.uint8) * 255
+
+        if cloth_type != "lower_body":
+            neck_mask = (parse_resized == 18).astype(np.uint8) * 255
+            neck_rows = np.where(neck_mask.any(axis=1))[0]
+            if len(neck_rows) > 0:
+                neck_top = int(neck_rows[0])
+                neck_bottom = int(neck_rows[-1])
+                neck_height = neck_bottom - neck_top
+                # Protect top 60% of neck (near chin/jaw), exclude bottom 40% (collarbone/collar lapels)
+                cutoff_y = neck_top + int(neck_height * 0.60)
+                neck_mask[cutoff_y:, :] = 0
+            identity_mask = np.maximum(identity_mask, neck_mask)
 
         # Morphological closing to fill tiny gaps in parsed regions
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -1350,7 +1362,7 @@ def run_idm_vton_inference(
         select_worker_mask_strategy,
     )
 
-    garm_img = garment_img.convert("RGB").resize(TARGET_SIZE)
+    garm_img = garment_img.convert("RGB").resize(TARGET_SIZE, Image.LANCZOS)
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -1358,37 +1370,28 @@ def run_idm_vton_inference(
 
     if auto_crop:
         # ── Aspect-ratio preserving crop ───────────────────────────────
-        # Compute the largest crop box that fits within the original image
-        # AND matches the target aspect ratio (TARGET_W / TARGET_H = 0.75).
-        # This ensures the resize to TARGET_SIZE is a pure scale with zero
-        # distortion — no horizontal stretch or vertical squish.
         target_aspect = TARGET_W / TARGET_H  # 0.75
         img_aspect = width / height
 
         if img_aspect > target_aspect:
-            # Image is wider than target — crop width, keep full height
             target_height = height
             target_width = int(height * target_aspect)
         else:
-            # Image is taller than target — crop height, keep full width
             target_width = width
             target_height = int(width / target_aspect)
 
         is_full_body = cloth_type in ("dresses", "lower_body", "full_body")
         if is_full_body:
-            # Bottom-anchored crop: keep the bottom portion, sacrifice top
             left = (width - target_width) / 2
             bottom = height
             top = height - target_height
             right = (width + target_width) / 2
         else:
-            # Center-anchored crop (default for upper_body)
             left = (width - target_width) / 2
             top = (height - target_height) / 2
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
 
-        # Clamp to image bounds
         left = max(0.0, left)
         top = max(0.0, top)
         right = min(float(width), right)
@@ -1399,17 +1402,13 @@ def run_idm_vton_inference(
         human_img = cropped_img.resize(TARGET_SIZE, Image.LANCZOS)
     else:
         # ── No auto_crop: aspect-ratio preserving resize with padding ──
-        # Letterbox the image to TARGET_SIZE using edge reflection padding
-        # to avoid black bars while preserving body geometry.
         img_aspect = width / height
         target_aspect = TARGET_W / TARGET_H
 
         if img_aspect > target_aspect:
-            # Wider: fit width, pad height
             new_w = TARGET_W
             new_h = int(TARGET_W / img_aspect)
         else:
-            # Taller: fit height, pad width
             new_h = TARGET_H
             new_w = int(TARGET_H * img_aspect)
 
@@ -1430,9 +1429,20 @@ def run_idm_vton_inference(
         else:
             human_img = resized
 
+    # ── Single-pass pre-resizing for OpenPose, SCHP, and DensePose ─────
+    human_img_384 = human_img.resize((384, 512), Image.LANCZOS)
+
     # Always compute AutoMasker mask (SCHP + OpenPose) for routing / hybrid
-    keypoints = openpose_model(human_img.resize((384, 512)))
-    model_parse, _ = parsing_model(human_img.resize((384, 512)))
+    keypoints = openpose_model(human_img_384)
+    model_parse, _ = parsing_model(human_img_384)
+
+    # Pre-compute parse_768 once at TARGET_SIZE for mask ops and identity restore
+    parse_768 = cv2.resize(
+        np.array(model_parse, dtype=np.uint8),
+        (TARGET_W, TARGET_H),
+        interpolation=cv2.INTER_NEAREST,
+    )
+
     automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
     automasker_mask = automasker_mask.resize(TARGET_SIZE)
 
@@ -1466,26 +1476,15 @@ def run_idm_vton_inference(
     mask = apply_protected_mask(mask, protected_mask)
 
     # ── Lower-body mask enhancement using SCHP parsing labels ──────────
-    # Uses the person's SCHP parsing map (already computed at model_parse)
-    # to identify pants/skirt regions and expand the mask with morphology.
-    # This replaces the old cv2.threshold(garment_image, 240) approach
-    # which leaked garment product photo backgrounds as dark box artifacts.
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "lower_body":
-        # SCHP labels for lower-body clothing: pants(6), skirt(5)
         _lower_clothing_labels = {5, 6}  # _LABEL_SKIRT, _LABEL_PANTS
-        _parse_resized = cv2.resize(
-            np.array(model_parse, dtype=np.uint8),
-            (TARGET_W, TARGET_H),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        _lower_region = np.isin(_parse_resized, list(_lower_clothing_labels)).astype(np.uint8) * 255
+        _lower_region = np.isin(parse_768, list(_lower_clothing_labels)).astype(np.uint8) * 255
 
         # Morphological closing to fill gaps (belt loops, seams, zippers)
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17))
         _lower_region = cv2.morphologyEx(_lower_region, cv2.MORPH_CLOSE, close_kernel)
 
         # Generous dilation to expand beyond tight SCHP label boundaries
-        # and give the model room for waistband, pockets, and hem
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 21))
         _lower_region = cv2.dilate(_lower_region, dilate_kernel, iterations=1)
 
@@ -1493,54 +1492,52 @@ def run_idm_vton_inference(
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _lower_region)
 
-        # Extend mask upward to cover the waistband transition zone.
+        # ── Contoured Waistband Extension (Task 5) ─────────────────────
+        # Follow shirt hem curvature (label 4) to extend waistband mask with
+        # a smooth natural curve rather than a flat rectangular box.
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_top = int(_rows_with_mask[0])
-            _extend_up = max(0, _mask_top - 80)
+            _extend_up = max(0, _mask_top - 60)
             _top_band = mask_np[_mask_top:min(_mask_top + 15, TARGET_H), :]
             _col_sums = np.sum(_top_band > 127, axis=0)
             _nonzero_cols = np.where(_col_sums > 0)[0]
             if len(_nonzero_cols) > 0:
-                _left_bound = max(0, int(_nonzero_cols[0]) - 15)
-                _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 15)
-                mask_np[_extend_up:_mask_top, _left_bound:_right_bound] = 255
+                _left_bound = max(0, int(_nonzero_cols[0]) - 10)
+                _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
+                _band_width = _right_bound - _left_bound
+                if _band_width > 0:
+                    # Build parabolic waistband contour curve
+                    x_idx = np.arange(_band_width)
+                    norm_x = (x_idx - _band_width / 2.0) / (_band_width / 2.0)
+                    curve = (1.0 - 0.25 * (norm_x ** 2))  # dip slightly at edges
+                    for col_i, col_x in enumerate(range(_left_bound, _right_bound)):
+                        curr_top = max(0, _mask_top - int(60 * curve[col_i]))
+                        mask_np[curr_top:_mask_top, col_x] = 255
 
         # Hard upper-body exclusion: protect everything well above waistband
         rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(rows_with_mask) > 0:
             mask_top = int(rows_with_mask[0])
-            exclude_top = max(0, mask_top - 100)
+            exclude_top = max(0, mask_top - 80)
             mask_np[:exclude_top, :] = 0
 
         mask = Image.fromarray(mask_np, mode="L")
 
     # ── Dress/full-body mask enhancement using SCHP parsing labels ────
-    # Uses SCHP parsing to identify all clothing regions (upper_clothes,
-    # pants, skirt, dress, scarf) and expand the mask with morphology.
-    # Replaces the old cv2.threshold approach that leaked garment photo BG.
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type in ("dresses", "full_body"):
-        # SCHP labels for dress/full-body clothing
-        _dress_clothing_labels = {4, 5, 6, 7, 17}  # upper_clothes, skirt, pants, dress, scarf
-        _parse_resized = cv2.resize(
-            np.array(model_parse, dtype=np.uint8),
-            (TARGET_W, TARGET_H),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        _dress_region = np.isin(_parse_resized, list(_dress_clothing_labels)).astype(np.uint8) * 255
+        _dress_clothing_labels = {4, 5, 6, 7, 17}
+        _dress_region = np.isin(parse_768, list(_dress_clothing_labels)).astype(np.uint8) * 255
 
-        # Morphological closing to unify separate clothing segments
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 21))
         _dress_region = cv2.morphologyEx(_dress_region, cv2.MORPH_CLOSE, close_kernel)
 
-        # Generous dilation for hem, drape, and garment edges
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 23))
         _dress_region = cv2.dilate(_dress_region, dilate_kernel, iterations=1)
 
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _dress_region)
 
-        # Extend the mask downward to cover the full dress hem
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_bottom = int(_rows_with_mask[-1])
@@ -1556,9 +1553,7 @@ def run_idm_vton_inference(
 
         mask = Image.fromarray(mask_np, mode="L")
 
-    # Feather the lower-body waistband (top) edge for a natural transition into
-    # the torso. Geometry/pose are untouched — only the boundary blend softens,
-    # eliminating the "pasted waistband" look. Skipped for other cloth types.
+    # Feather top edge for natural waistband transition
     if cloth_type == "lower_body":
         mask = _feather_mask_top(mask, feather=30)
 
@@ -1570,7 +1565,8 @@ def run_idm_vton_inference(
     )
 
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
-    human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
+    # Reuse human_img_384 for DensePose (Task 2 optimization)
+    human_img_arg = _apply_exif_orientation(human_img_384)
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
     with torch.no_grad():
@@ -1589,15 +1585,13 @@ def run_idm_vton_inference(
     pose_img = pose_img[:, :, ::-1]
     pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
 
-    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+    effective_guidance = guidance_scale if guidance_scale is not None else 2.5
+    effective_steps = min(steps, 24) if steps == 30 else steps
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype) + (
-            ", photorealistic fabric, visible weave and grain, "
-            "natural wrinkles and creases, realistic garment depth, "
-            "soft contact shadows at waist, hips, inner thighs, knees and hem, "
-            "natural knee and seat wrinkles, hip and thigh folds, "
-            "crotch folds, hem folds, fabric tension and gravity"
+            ", photorealistic fabric texture, visible weave and grain, "
+            "natural fabric drape and tension, soft realistic contact shadows"
         )
         if cloth_type == "lower_body":
             negative_prompt = _build_source_specific_negative() + (
@@ -1607,20 +1601,9 @@ def run_idm_vton_inference(
                 "generic pants, plain pants, lost pockets, missing seams, "
                 "lost belt loops, lost fabric detail, smooth texture, "
                 "lost garment structure, changed silhouette, "
-                "wrong drape, lost folds, missing wrinkles, "
-                "wrong waistband shape, changed hem"
-                ", oversmoothed, lack of detail, no fabric grain, "
-                "physically impossible folds, distorted creases, "
-                "unnatural flat lighting, no contact shadows, "
-                "pasted on look, plastic texture, airbrushed, "
-                "missing knee wrinkles, missing seat folds, missing crotch folds, "
-                "missing hem folds, missing thigh folds, lost stitching, "
-                "lost zipper, lost buttons, lost embroidery, lost print, "
-                "smooth denim, smooth cotton, missing fabric tension, "
-                "unnatural compression"
+                "wrong drape, pasted on look, plastic texture, airbrushed"
             )
         else:
-            # dresses / full_body: suppress common failure modes + identity bleed
             negative_prompt = _build_source_specific_negative() + (
                 ", changed garment category, wrong outfit type, "
                 "mini dress, different silhouette, wrong length, "
@@ -1633,11 +1616,6 @@ def run_idm_vton_inference(
                 "symmetric skirt, ignored leg positions"
             )
     else:
-        # upper_body: use the subtype-aware prompt + fabric cues so ethnic
-        # (kurta/kurti), open-front (kimono/cardigan/jacket/blazer/coat) and
-        # long (long kurta/tunic) garments are described accurately instead of
-        # a generic "model is wearing <desc>", which loses their defining
-        # traits (open front, drape, length, ethnicity).
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
         negative_prompt = _build_source_specific_negative()
 
@@ -1675,7 +1653,7 @@ def run_idm_vton_inference(
                 negative_prompt_embeds=negative_prompt_embeds.to(device, TORCH_DTYPE),
                 pooled_prompt_embeds=pooled_prompt_embeds.to(device, TORCH_DTYPE),
                 negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(device, TORCH_DTYPE),
-                num_inference_steps=steps,
+                num_inference_steps=effective_steps,
                 generator=generator,
                 strength=1.0,
                 pose_img=pose_tensor.to(device, TORCH_DTYPE),
@@ -1685,7 +1663,7 @@ def run_idm_vton_inference(
                 image=human_img,
                 height=TARGET_H,
                 width=TARGET_W,
-                ip_adapter_image=garm_img.resize(TARGET_SIZE),
+                ip_adapter_image=garm_img,
                 guidance_scale=effective_guidance,
             )[0]
 
@@ -1752,7 +1730,7 @@ def run_idm_vton_inference(
             final_img = _restore_person_identity(
                 final_img, human_img_orig, cloth_type,
                 crop_top=int(top),
-                parsing_map=model_parse,
+                parsing_map=parse_768,
             )
 
         return final_img, mask_meta
