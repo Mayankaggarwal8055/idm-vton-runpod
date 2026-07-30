@@ -1531,9 +1531,12 @@ def run_idm_vton_inference(
             right = (width + target_width) / 2
         else:
             left = (width - target_width) / 2
-            top = (height - target_height) / 2
+            # For upper_body, position crop from top of head down through upper thighs
+            # so original long kurti/tunic hems are completely inside the crop
+            # and fully replaced, avoiding crop boundary leakage during uncropping.
+            top = max(0.0, (height - target_height) * 0.15)
             right = (width + target_width) / 2
-            bottom = (height + target_height) / 2
+            bottom = min(float(height), top + target_height)
 
         left = max(0.0, left)
         top = max(0.0, top)
@@ -1703,7 +1706,10 @@ def run_idm_vton_inference(
     # Without this, the AutoMasker only covers the outermost layer tightly,
     # leaving the underlayer's hem visible in the generated output.
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "upper_body":
-        _upper_clothing_labels = {4}  # upper_clothes
+        # Include upper_clothes (4), dress/kurti (5), coat/jacket (6), scarf/dupatta (10)
+        # to ensure any original ethnic long top, kurti, coat, or dress is captured
+        # and completely replaced by the new upper garment.
+        _upper_clothing_labels = {4, 5, 6, 10}
         _upper_region = np.isin(parse_768, list(_upper_clothing_labels)).astype(np.uint8) * 255
 
         # Morphological closing to unify jacket + underlayer regions
@@ -1721,8 +1727,8 @@ def run_idm_vton_inference(
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_bottom = int(_rows_with_mask[-1])
-            # Extend down by 40px to catch underlayer hems
-            _target_bottom = min(TARGET_H, _mask_bottom + 40)
+            # Extend down by 50px to catch underlayer hems
+            _target_bottom = min(TARGET_H, _mask_bottom + 50)
             _bottom_band = mask_np[max(0, _mask_bottom - 15):_mask_bottom, :]
             _col_sums = np.sum(_bottom_band > 127, axis=0)
             _nonzero_cols = np.where(_col_sums > 0)[0]
@@ -1862,8 +1868,9 @@ def run_idm_vton_inference(
         # original pixels — insufficient feathering creates a visible horizontal seam.
         top_feather = feather_px
         if cloth_type == "lower_body":
-            # 3x larger feathering at waist boundary for smooth blending
-            top_feather = max(feather_px * 3, 60)
+            # Compact 16px feathering at waist boundary to keep waistband stitching sharp
+            # and prevent 60px translucent smudging artifacts.
+            top_feather = min(feather_px, 16)
 
         # Build 1D feathering ramps for each edge
         alpha = np.ones((crop_h, crop_w), dtype=np.float32)
@@ -2093,9 +2100,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # weakened garment conditioning and washed out black/dark garments
     # (lost texture, turned gray). Dark garments need FULL guidance so the
     # model actually applies the (low-luminance) garment color/texture.
-    # P2: Use 2.5 for upper_body (sharper textures), 4.0 for lower_body
+    # P2: Use 2.5 for upper_body, 2.8 for lower_body (natural weave without over-saturation)
     if vton_type == "lower_body":
-        effective_guidance = 4.0
+        effective_guidance = 2.8
     elif vton_type == "upper_body":
         effective_guidance = 2.5
     else:
@@ -2188,6 +2195,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     user_input = job.get("input", {})
     job_id = str(job.get("id", "unknown"))
 
+    import gc
     try:
         output = run_inference(user_input, job_id)
         output["cold_start"] = cold_start
@@ -2202,6 +2210,12 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             "total_ms": round(total_ms, 2),
             "cold_start": cold_start,
         }
+    finally:
+        # Free CUDA memory and run garbage collection after every job
+        # to prevent memory accumulation and worker container restarts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 
 # =============================================================================
