@@ -621,9 +621,11 @@ def _refine_target_inpaint_mask(mask: Image.Image, cloth_type: str) -> Image.Ima
         mask_np = cv2.dilate(mask_np, dilate_kernel, iterations=1)
 
     else:
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 11))
+        # Upper body: more aggressive dilation to cover layered outfits
+        # (e.g. kurti hem peeking below a jacket, shirt tail below sweater)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 15))
         mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, close_kernel)
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9))
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13))
         mask_np = cv2.dilate(mask_np, dilate_kernel, iterations=1)
 
     return Image.fromarray(mask_np, mode="L")
@@ -1067,6 +1069,147 @@ _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
     },
 }
 
+# ── Upper-body prompt attributes (P3) ─────────────────────────────────
+# These ensure shirts, hoodies, jackets etc. get correct hem-length
+# attributes so the diffusion model doesn't generate kurta-length garments.
+_UPPER_GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
+    "shirt": {
+        "coverage": "upper body garment",
+        "fit": "regular fit",
+        "silhouette": "straight body",
+        "sleeves": "long sleeves or short sleeves",
+        "neckline": "collar neckline",
+        "collar": "pointed collar or spread collar",
+        "waist_position": "natural waist",
+        "garment_length": "ends at belt line or just below waist",
+        "layering": "single layer",
+        "structure": "button front placket with collar and cuffs",
+        "drape": "moderate structured drape",
+        "material": "woven cotton polyester",
+        "fabric_behavior": "crisp structured woven",
+    },
+    "tshirt": {
+        "coverage": "upper body garment",
+        "fit": "regular fit",
+        "silhouette": "straight body",
+        "sleeves": "short sleeves",
+        "neckline": "crew neck or v-neck",
+        "collar": "ribbed crew collar",
+        "waist_position": "natural waist",
+        "garment_length": "ends at belt line or hip",
+        "layering": "single layer",
+        "structure": "pullover with crew or v-neck",
+        "drape": "soft casual drape",
+        "material": "cotton jersey",
+        "fabric_behavior": "soft stretchy knit",
+    },
+    "hoodie": {
+        "coverage": "upper body garment",
+        "fit": "relaxed fit",
+        "silhouette": "straight oversized body",
+        "sleeves": "long sleeves with ribbed cuffs",
+        "neckline": "hood",
+        "collar": "hood with drawstring",
+        "waist_position": "hip length",
+        "garment_length": "ends at hip or just below",
+        "layering": "single layer or over tshirt",
+        "structure": "pullover or zip front with kangaroo pocket and hood",
+        "drape": "casual relaxed drape",
+        "material": "fleece cotton blend",
+        "fabric_behavior": "soft thick casual",
+    },
+    "jacket": {
+        "coverage": "upper body outerwear",
+        "fit": "regular fit",
+        "silhouette": "structured body",
+        "sleeves": "long sleeves",
+        "neckline": "collared or zip neck",
+        "collar": "lapel collar or stand collar",
+        "waist_position": "natural waist to hip",
+        "garment_length": "ends at waist or hip",
+        "layering": "outer layer over shirt or tshirt",
+        "structure": "front opening with zip or buttons",
+        "drape": "structured minimal drape",
+        "material": "polyester nylon cotton",
+        "fabric_behavior": "structured outerwear",
+    },
+    "blazer": {
+        "coverage": "upper body outerwear",
+        "fit": "tailored fit",
+        "silhouette": "structured tailored body",
+        "sleeves": "long sleeves",
+        "neckline": "notch lapel",
+        "collar": "notch lapel or peak lapel",
+        "waist_position": "natural waist",
+        "garment_length": "ends at hip",
+        "layering": "outer layer over shirt",
+        "structure": "single or double breasted with lapels",
+        "drape": "structured formal drape",
+        "material": "wool polyester blend",
+        "fabric_behavior": "crisp structured formal",
+    },
+    "cardigan": {
+        "coverage": "upper body layer",
+        "fit": "regular relaxed fit",
+        "silhouette": "straight open front body",
+        "sleeves": "long sleeves",
+        "neckline": "v-neck or round neck",
+        "collar": "n/a",
+        "waist_position": "hip length",
+        "garment_length": "ends at hip or below",
+        "layering": "open front layer over inner top",
+        "structure": "open front with buttons or draped",
+        "drape": "soft relaxed drape",
+        "material": "knit wool cotton",
+        "fabric_behavior": "soft knit structured",
+    },
+    "sweater": {
+        "coverage": "upper body garment",
+        "fit": "regular fit",
+        "silhouette": "straight body",
+        "sleeves": "long sleeves with ribbed cuffs",
+        "neckline": "crew neck or turtleneck",
+        "collar": "ribbed crew or turtleneck",
+        "waist_position": "natural waist to hip",
+        "garment_length": "ends at waist or hip",
+        "layering": "single layer or over shirt",
+        "structure": "pullover knit with ribbed hem",
+        "drape": "moderate structured drape",
+        "material": "knit wool cotton blend",
+        "fabric_behavior": "knit structured warm",
+    },
+    "polo": {
+        "coverage": "upper body garment",
+        "fit": "regular fit",
+        "silhouette": "straight body",
+        "sleeves": "short sleeves",
+        "neckline": "polo collar",
+        "collar": "polo collar with button placket",
+        "waist_position": "natural waist",
+        "garment_length": "ends at belt line",
+        "layering": "single layer",
+        "structure": "pique knit with collar and two button placket",
+        "drape": "moderate casual drape",
+        "material": "pique cotton",
+        "fabric_behavior": "structured casual knit",
+    },
+    "coat": {
+        "coverage": "upper body outerwear",
+        "fit": "regular fit",
+        "silhouette": "straight structured body",
+        "sleeves": "long sleeves",
+        "neckline": "lapel collar",
+        "collar": "notch or peak lapel",
+        "waist_position": "below hip",
+        "garment_length": "ends at mid-thigh or knee",
+        "layering": "outer layer",
+        "structure": "front opening with buttons or zip",
+        "drape": "heavy structured drape",
+        "material": "wool polyester blend",
+        "fabric_behavior": "heavy structured formal",
+    },
+}
+
 
 _FABRIC_CUES: dict[str, str] = {
     "jeans": "denim texture with visible stitching, realistic wash pattern, natural creasing at knees and hips",
@@ -1121,7 +1264,7 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
     avoid wasting prompt capacity on irrelevant attributes.
     """
     key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
-    attrs = _GARMENT_PROMPT_ATTRS.get(key)
+    attrs = _GARMENT_PROMPT_ATTRS.get(key) or _UPPER_GARMENT_PROMPT_ATTRS.get(key)
     if not attrs:
         cue = _FABRIC_CUES.get(key, "")
         if cue:
@@ -1553,6 +1696,43 @@ def run_idm_vton_inference(
 
         mask = Image.fromarray(mask_np, mode="L")
 
+    # ── Upper-body mask enhancement using SCHP parsing labels (P0) ─────
+    # Expands the upper_body mask using SCHP label 4 (upper_clothes) to cover
+    # layered garments where an underlayer (kurti, long shirt, blouse) extends
+    # below the outermost visible garment (jacket, cardigan, hoodie).
+    # Without this, the AutoMasker only covers the outermost layer tightly,
+    # leaving the underlayer's hem visible in the generated output.
+    if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "upper_body":
+        _upper_clothing_labels = {4}  # upper_clothes
+        _upper_region = np.isin(parse_768, list(_upper_clothing_labels)).astype(np.uint8) * 255
+
+        # Morphological closing to unify jacket + underlayer regions
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17))
+        _upper_region = cv2.morphologyEx(_upper_region, cv2.MORPH_CLOSE, close_kernel)
+
+        # Generous dilation — especially downward — to cover layered garment hems
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 19))
+        _upper_region = cv2.dilate(_upper_region, dilate_kernel, iterations=1)
+
+        mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+        mask_np = np.maximum(mask_np, _upper_region)
+
+        # Extend mask downward to cover shirt tails, kurti hems peeking below
+        _rows_with_mask = np.where(mask_np.any(axis=1))[0]
+        if len(_rows_with_mask) > 0:
+            _mask_bottom = int(_rows_with_mask[-1])
+            # Extend down by 40px to catch underlayer hems
+            _target_bottom = min(TARGET_H, _mask_bottom + 40)
+            _bottom_band = mask_np[max(0, _mask_bottom - 15):_mask_bottom, :]
+            _col_sums = np.sum(_bottom_band > 127, axis=0)
+            _nonzero_cols = np.where(_col_sums > 0)[0]
+            if len(_nonzero_cols) > 0:
+                _left_bound = max(0, int(_nonzero_cols[0]) - 10)
+                _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
+                mask_np[_mask_bottom:_target_bottom, _left_bound:_right_bound] = 255
+
+        mask = Image.fromarray(mask_np, mode="L")
+
     # Feather top edge for natural waistband transition
     if cloth_type == "lower_body":
         mask = _feather_mask_top(mask, feather=30)
@@ -1810,9 +1990,32 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "overall": ["overall", "overalls", "dungaree"],
         "coord": ["co-ord", "coord", "co ord", "matching set", "two piece"],
     }
+    # ── Upper-body subtype keywords (P4) ────────────────────────────────
+    _UPPER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+        "shirt": ["shirt", "button up", "button-up", "dress shirt", "casual shirt", "oxford"],
+        "tshirt": ["t-shirt", "tshirt", "t shirt", "tee", "crew neck tee"],
+        "hoodie": ["hoodie", "hooded", "sweatshirt", "pullover hoodie", "zip hoodie"],
+        "jacket": ["jacket", "bomber", "windbreaker", "puffer", "denim jacket"],
+        "blazer": ["blazer", "sport coat", "sports coat"],
+        "cardigan": ["cardigan", "open front"],
+        "sweater": ["sweater", "jumper", "pullover", "knit top"],
+        "polo": ["polo", "polo shirt", "polo t-shirt"],
+        "coat": ["coat", "overcoat", "trench", "parka"],
+        "kurta": ["kurta", "kurti"],
+        "long_kurta": ["long kurta"],
+    }
+
+    # P1: Restrict subtype keyword matching to cloth_type-appropriate dicts
+    # to prevent regular shirts from being classified as kurta/long_kurta.
     if not garment_subtype:
         _desc_lower = (garment_desc or "").lower().replace("-", " ")
-        for _sub, _kws in {**_FULL_SUBTYPE_KEYWORDS, **_LOWER_SUBTYPE_KEYWORDS}.items():
+        if vton_type == "upper_body":
+            _keyword_dict = _UPPER_SUBTYPE_KEYWORDS
+        elif vton_type == "lower_body":
+            _keyword_dict = _LOWER_SUBTYPE_KEYWORDS
+        else:
+            _keyword_dict = {**_FULL_SUBTYPE_KEYWORDS, **_LOWER_SUBTYPE_KEYWORDS}
+        for _sub, _kws in _keyword_dict.items():
             if any(_kw in _desc_lower for _kw in _kws):
                 garment_subtype = _sub
                 break
@@ -1890,9 +2093,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # weakened garment conditioning and washed out black/dark garments
     # (lost texture, turned gray). Dark garments need FULL guidance so the
     # model actually applies the (low-luminance) garment color/texture.
-    effective_guidance = GUIDANCE_SCALE
+    # P2: Use 2.5 for upper_body (sharper textures), 4.0 for lower_body
     if vton_type == "lower_body":
         effective_guidance = 4.0
+    elif vton_type == "upper_body":
+        effective_guidance = 2.5
+    else:
+        effective_guidance = GUIDANCE_SCALE
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
