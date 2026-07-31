@@ -1389,6 +1389,18 @@ def _restore_person_identity(
                 neck_mask[cutoff_y:, :] = 0
             identity_mask = np.maximum(identity_mask, neck_mask)
 
+        # For dresses / full_body: restore original lower leg skin (12, 13) and shoes (16, 17)
+        # located below the dress hem to guarantee 100% original leg skin & sandal preservation.
+        if cloth_type in ("dresses", "full_body"):
+            dress_mask_parsed = np.isin(parse_resized, [4, 5, 6]).astype(np.uint8) * 255
+            dress_rows = np.where(dress_mask_parsed.any(axis=1))[0]
+            if len(dress_rows) > 0:
+                dress_bottom_y = int(dress_rows[-1])
+                leg_shoe_mask = np.isin(parse_resized, [12, 13, 16, 17]).astype(np.uint8) * 255
+                # Only restore legs/shoes below the dress hem line
+                leg_shoe_mask[:dress_bottom_y, :] = 0
+                identity_mask = np.maximum(identity_mask, leg_shoe_mask)
+
         # Morphological closing to fill tiny gaps in parsed regions
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         identity_mask = cv2.morphologyEx(identity_mask, cv2.MORPH_CLOSE, close_k)
@@ -2012,21 +2024,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "long_kurta": ["long kurta"],
     }
 
-    # P1: Restrict subtype keyword matching to cloth_type-appropriate dicts
-    # to prevent regular shirts from being classified as kurta/long_kurta.
-    if not garment_subtype:
-        _desc_lower = (garment_desc or "").lower().replace("-", " ")
-        if vton_type == "upper_body":
-            _keyword_dict = _UPPER_SUBTYPE_KEYWORDS
-        elif vton_type == "lower_body":
-            _keyword_dict = _LOWER_SUBTYPE_KEYWORDS
-        else:
-            _keyword_dict = {**_FULL_SUBTYPE_KEYWORDS, **_LOWER_SUBTYPE_KEYWORDS}
-        for _sub, _kws in _keyword_dict.items():
-            if any(_kw in _desc_lower for _kw in _kws):
-                garment_subtype = _sub
-                break
-
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
     trace_id = job_input.get("trace_id", "")
@@ -2062,6 +2059,21 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "dupatta": "dresses",
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
+
+    # P1: Restrict subtype keyword matching to cloth_type-appropriate dicts
+    # to prevent regular shirts from being classified as kurta/long_kurta.
+    if not garment_subtype:
+        _desc_lower = (garment_desc or "").lower().replace("-", " ")
+        if vton_type == "upper_body":
+            _keyword_dict = _UPPER_SUBTYPE_KEYWORDS
+        elif vton_type == "lower_body":
+            _keyword_dict = _LOWER_SUBTYPE_KEYWORDS
+        else:
+            _keyword_dict = {**_FULL_SUBTYPE_KEYWORDS, **_LOWER_SUBTYPE_KEYWORDS}
+        for _sub, _kws in _keyword_dict.items():
+            if any(_kw in _desc_lower for _kw in _kws):
+                garment_subtype = _sub
+                break
 
     garment_desc = garment_desc.strip()
     if garment_desc.lower().startswith(("a ", "an ", "the ")):
