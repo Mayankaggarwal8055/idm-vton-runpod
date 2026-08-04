@@ -1308,6 +1308,10 @@ def _build_source_specific_negative(source_cloth_type: str = "", target_subtype:
         "ugly, blurry, watermark, signature, text, logo, "
         "smooth plastic, airbrushed, cg render, 3d render, "
         "flat lighting, "
+        "changed body shape, different body proportions, "
+        "female body on male, male body on female, "
+        "changed shoulder width, different chest size, altered waist, "
+        "different torso, changed hips, modified body structure, "
         "bag, purse, handbag, clutch, tote, backpack, "
         "headphones, earphones, headset, "
         "necklace, chain, pendant, choker, "
@@ -1326,20 +1330,23 @@ def _restore_person_identity(
     cloth_type: str,
     crop_top: int = 0,
     parsing_map: np.ndarray | None = None,
+    inpaint_mask: Image.Image | None = None,
 ) -> Image.Image:
     """
-    Restore the person's face/hair identity from the original onto the
-    diffusion result using SCHP parsing labels.
+    Restore the person's identity AND body structure from the original onto
+    the diffusion result using SCHP parsing labels.
 
-    The IDM-VTON model with strength=1.0 denoises the entire image,
-    regenerating the face even though it's not in the inpaint mask.
-    This function restores identity by blending original pixels back
-    using the SCHP parsing map (face=11, hair=2, neck=18) instead of
-    a rectangular Haar-cascade box.
+    The IDM-VTON model with strength=1.0 denoises the ENTIRE image,
+    regenerating the face and body even though only clothing should change.
+    This function restores identity by blending original pixels back for:
+      - Face (11), Hair (2), upper Neck (18): Always restored.
+      - Bare skin — Arms (14, 15), Legs (12, 13): Restored ONLY for pixels
+        that fall OUTSIDE the inpaint mask, to prevent TryonNet from
+        replacing the user's body shape with the garment model's body.
 
     Using parsing labels instead of a rectangular box means the restore
-    mask follows actual face/hair/neck contours, so garment collars
-    and necklines are never overwritten by original pixels.
+    mask follows actual face/hair/skin contours, so garment collars,
+    necklines, and sleeve edges are never overwritten by original pixels.
 
     Falls back to Haar cascade only if no parsing_map is provided.
     """
@@ -1384,22 +1391,29 @@ def _restore_person_identity(
                 neck_top = int(neck_rows[0])
                 neck_bottom = int(neck_rows[-1])
                 neck_height = neck_bottom - neck_top
-                # Protect top 60% of neck (near chin/jaw), exclude bottom 40% (collarbone/collar lapels)
                 cutoff_y = neck_top + int(neck_height * 0.60)
                 neck_mask[cutoff_y:, :] = 0
             identity_mask = np.maximum(identity_mask, neck_mask)
 
-        # For dresses / full_body: restore original lower leg skin (12, 13) and shoes (16, 17)
-        # located below the dress hem to guarantee 100% original leg skin & sandal preservation.
-        if cloth_type in ("dresses", "full_body"):
-            dress_mask_parsed = np.isin(parse_resized, [4, 5, 6]).astype(np.uint8) * 255
-            dress_rows = np.where(dress_mask_parsed.any(axis=1))[0]
-            if len(dress_rows) > 0:
-                dress_bottom_y = int(dress_rows[-1])
-                leg_shoe_mask = np.isin(parse_resized, [12, 13, 16, 17]).astype(np.uint8) * 255
-                # Only restore legs/shoes below the dress hem line
-                leg_shoe_mask[:dress_bottom_y, :] = 0
-                identity_mask = np.maximum(identity_mask, leg_shoe_mask)
+        # ── Body structure preservation: restore bare skin pixels ──────
+        # Composite original skin (arms=14,15 legs=12,13) back, but ONLY
+        # for pixels that fall OUTSIDE the inpaint mask. This prevents
+        # TryonNet cross-attention from replacing the user's body shape
+        # with the garment reference model's anatomy, while still allowing
+        # clothing-region pixels inside the mask to come from diffusion.
+        skin_labels = {12, 13, 14, 15}  # LeftLeg, RightLeg, LeftArm, RightArm
+        skin_mask = np.isin(parse_resized, list(skin_labels)).astype(np.uint8) * 255
+
+        if inpaint_mask is not None:
+            inpaint_np = np.array(
+                inpaint_mask.convert("L").resize((w, h), Image.NEAREST),
+                dtype=np.uint8,
+            )
+            # Only preserve skin pixels that are OUTSIDE the inpaint mask.
+            # Skin inside the mask is where sleeves/garment should be generated.
+            skin_mask[inpaint_np > 127] = 0
+
+        identity_mask = np.maximum(identity_mask, skin_mask)
 
         # Morphological closing to fill tiny gaps in parsed regions
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -1410,7 +1424,6 @@ def _restore_person_identity(
         identity_mask = cv2.dilate(identity_mask, dilate_k, iterations=1)
 
         # Soft feathering with Gaussian blur for seamless blending
-        # The feather radius adapts to image size for consistent softness
         feather_radius = max(15, min(h, w) // 40)
         if feather_radius % 2 == 0:
             feather_radius += 1
@@ -1421,13 +1434,16 @@ def _restore_person_identity(
         )
         mask_3d = mask_soft[:, :, np.newaxis] / 255.0
 
-        # Composite: restore original pixels in identity region
+        # Composite: restore original pixels in identity + skin regions
         restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
 
         identity_pixel_count = int(np.sum(identity_mask > 127))
+        skin_pixel_count = int(np.sum(skin_mask > 127))
         logger.info(
-            "schp_identity_restored cloth_type=%s labels=%s identity_pixels=%d feather=%d",
-            cloth_type, sorted(identity_labels), identity_pixel_count, feather_radius,
+            "schp_identity_restored cloth_type=%s identity_labels=%s skin_labels=%s "
+            "identity_pixels=%d skin_pixels=%d feather=%d",
+            cloth_type, sorted(identity_labels), sorted(skin_labels),
+            identity_pixel_count, skin_pixel_count, feather_radius,
         )
 
         return Image.fromarray(restored, mode="RGB")
@@ -1631,7 +1647,6 @@ def run_idm_vton_inference(
         mask_meta["mask_type_used"] = "automasker"
 
     mask = _refine_target_inpaint_mask(mask, cloth_type)
-    mask = apply_protected_mask(mask, protected_mask)
 
     # ── Lower-body mask enhancement using SCHP parsing labels ──────────
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "lower_body":
@@ -1696,6 +1711,18 @@ def run_idm_vton_inference(
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _dress_region)
 
+        # ── Bare arm exclusion for sleeveless/off-shoulder dresses ─────
+        # After clothing label expansion, subtract bare arm skin pixels
+        # (SCHP labels 14=LeftArm, 15=RightArm) so the inpaint mask does
+        # not cover bare arms. Without this, convex hull + dilation causes
+        # SDXL to generate fabric over bare arms for sleeveless garments.
+        _bare_arm_labels = {14, 15}  # LeftArm, RightArm
+        _bare_arm_region = np.isin(parse_768, list(_bare_arm_labels)).astype(np.uint8)
+        # Erode slightly to avoid cutting into sleeve edges
+        _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
+        mask_np[_bare_arm_region > 0] = 0
+
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_bottom = int(_rows_with_mask[-1])
@@ -1750,6 +1777,11 @@ def run_idm_vton_inference(
                 mask_np[_mask_bottom:_target_bottom, _left_bound:_right_bound] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
+
+    # ── Re-apply protected regions AFTER all SCHP expansion steps ──────
+    # Protected mask must be applied last so face, hair, hands, and lower
+    # body locks are never negated by SCHP label dilation above.
+    mask = apply_protected_mask(mask, protected_mask)
 
     # Feather top edge for natural waistband transition
     if cloth_type == "lower_body":
@@ -1930,6 +1962,7 @@ def run_idm_vton_inference(
                 final_img, human_img_orig, cloth_type,
                 crop_top=int(top),
                 parsing_map=parse_768,
+                inpaint_mask=mask,
             )
 
         return final_img, mask_meta
