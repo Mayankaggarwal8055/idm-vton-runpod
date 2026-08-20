@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         pycocotools \
         tqdm \
         requests==2.32.3 \
-        runpod==1.9.1 \
+        runpod==1.10.1 \
         cloudinary==1.41.0
 
 # =============================================================================
