@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         omegaconf \
         pycocotools \
         tqdm \
-        requests==2.32.3 \
+        requests>=2.32.3 \
         runpod==1.10.1 \
         cloudinary==1.41.0
 
