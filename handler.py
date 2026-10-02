@@ -57,8 +57,8 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "20"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.0"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "16"))
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "1.9"))
 # Garment IP-Adapter scale. IDM-VTON drives garment APPEARANCE (texture, grain,
 # seams, pockets, weaves) primarily through the IP-Adapter image. The library
 # default (~0.5) under-conditions this, so fabric is smoothed into an
@@ -469,6 +469,8 @@ def load_models():
         pipe.unet.to(memory_format=torch.channels_last)
         if hasattr(pipe, "unet_encoder"):
             pipe.unet_encoder.to(memory_format=torch.channels_last)
+        if hasattr(pipe, "vae"):
+            pipe.vae.to(memory_format=torch.channels_last)
         logger.info("channels_last_enabled=True")
     except Exception as exc:
         logger.warning("channels_last_failed error=%s", exc)
@@ -1427,12 +1429,23 @@ def isolate_cloth_item(
 
                         cw, ch = 768, 1024
                         canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
+                        cropped_aspect = float(cropped_item.height) / max(1.0, float(cropped_item.width))
+                        is_tall_item = cropped_aspect > 1.20 or any(
+                            kw in (cloth_type or "").lower() for kw in ["dress", "kurta", "kurti", "tunic", "long"]
+                        )
                         if c_norm in ("upper_body", "upper", "top"):
-                            target_w, target_h = int(cw * 0.75), int(ch * 0.55)
-                            scaled_item = cropped_item.copy()
-                            scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
-                            paste_x = (cw - scaled_item.width) // 2
-                            paste_y = int(ch * 0.12)
+                            if is_tall_item:
+                                target_w, target_h = int(cw * 0.78), int(ch * 0.80)
+                                scaled_item = cropped_item.copy()
+                                scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
+                                paste_x = (cw - scaled_item.width) // 2
+                                paste_y = int(ch * 0.08)
+                            else:
+                                target_w, target_h = int(cw * 0.75), int(ch * 0.58)
+                                scaled_item = cropped_item.copy()
+                                scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
+                                paste_x = (cw - scaled_item.width) // 2
+                                paste_y = int(ch * 0.12)
                         else:
                             target_w, target_h = int(cw * 0.80), int(ch * 0.80)
                             scaled_item = cropped_item.copy()
@@ -1441,7 +1454,7 @@ def isolate_cloth_item(
                             paste_y = (ch - scaled_item.height) // 2
 
                         canvas.paste(scaled_item, (paste_x, paste_y))
-                        logger.info("garment_isolated_from_model cloth_type=%s bbox=(%d,%d,%d,%d)", cloth_type, xmin, ymin, xmax, ymax)
+                        logger.info("garment_isolated_from_model cloth_type=%s bbox=(%d,%d,%d,%d) is_tall=%s", cloth_type, xmin, ymin, xmax, ymax, is_tall_item)
                         return canvas
         except Exception as exc:
             logger.warning("isolate_cloth_item_failed error=%s", exc)
@@ -1456,6 +1469,7 @@ def _restore_person_identity(
     crop_top: int = 0,
     parsing_map: np.ndarray | None = None,
     inpaint_mask: Image.Image | None = None,
+    has_collar: bool = False,
 ) -> Image.Image:
     """
     Restore the person's identity AND body structure from the original onto
@@ -1504,9 +1518,11 @@ def _restore_person_identity(
         identity_labels = {2, 11}  # _LABEL_HAIR, _LABEL_FACE
 
         # For non-lower-body (upper_body / dresses): include neck (18)
-        # BUT filter out the lower collarbone zone (bottom 40% of neck)
-        # to prevent neck label 18 from bleeding original skin pixels over
-        # the generated open shirt collar / lapel ("melted collar" fix).
+        # Protect ONLY the uppermost 15% of neck under the chin when collar is present
+        # (mandarin collar, polo, shirt collar, turtleneck, high neckline), and top 30%
+        # for open/scoop necks (replacing the static 60% neck cutoff). This allows the new
+        # garment's collar area to breathe and prevents mandarin collars and necklines from
+        # melting with original exposed throat skin during Laplacian blending.
         identity_mask = np.isin(parse_resized, list(identity_labels)).astype(np.uint8) * 255
 
         if cloth_type != "lower_body":
@@ -1516,7 +1532,8 @@ def _restore_person_identity(
                 neck_top = int(neck_rows[0])
                 neck_bottom = int(neck_rows[-1])
                 neck_height = neck_bottom - neck_top
-                cutoff_y = neck_top + int(neck_height * 0.60)
+                neck_ratio = 0.15 if has_collar else 0.30
+                cutoff_y = neck_top + int(neck_height * neck_ratio)
                 neck_mask[cutoff_y:, :] = 0
             identity_mask = np.maximum(identity_mask, neck_mask)
 
@@ -1529,6 +1546,7 @@ def _restore_person_identity(
         skin_labels = {12, 13, 14, 15}  # LeftLeg, RightLeg, LeftArm, RightArm
         skin_mask = np.isin(parse_resized, list(skin_labels)).astype(np.uint8) * 255
 
+        inpaint_np = None
         if inpaint_mask is not None:
             inpaint_np = np.array(
                 inpaint_mask.convert("L").resize((w, h), Image.BILINEAR),
@@ -1536,20 +1554,25 @@ def _restore_person_identity(
             )
             # Only preserve skin pixels that are OUTSIDE the inpaint mask.
             # Skin inside the mask is where sleeves/garment should be generated.
-            skin_mask[inpaint_np > 127] = 0
+            skin_mask[inpaint_np > 50] = 0
             # Identity regions (neck/chest/skin) inside inpaint mask must NOT be restored,
             # allowing new collars, high necklines, and shirts to generate naturally.
-            identity_mask[inpaint_np > 127] = 0
+            identity_mask[inpaint_np > 50] = 0
 
         identity_mask = np.maximum(identity_mask, skin_mask)
 
         # Morphological closing to fill tiny gaps in parsed regions
-        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         identity_mask = cv2.morphologyEx(identity_mask, cv2.MORPH_CLOSE, close_k)
 
         # Gentle dilation to provide a small safety margin around identity
-        dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         identity_mask = cv2.dilate(identity_mask, dilate_k, iterations=1)
+
+        # Re-enforce zeroing inside inpaint mask AFTER dilation so dilated face/neck
+        # boundaries NEVER bleed downward into newly generated collars, shoulders, or lapels.
+        if inpaint_np is not None:
+            identity_mask[inpaint_np > 50] = 0
 
         # Multi-scale Laplacian pyramid blending (<50ms) preserving pores, hair, and edges
         from postprocess import laplacian_pyramid_blend
@@ -1617,13 +1640,242 @@ def _restore_person_identity(
     return Image.fromarray(restored, mode="RGB")
 
 
+def analyze_garment_attributes(
+    garment_img: Image.Image,
+    garment_desc: str = "",
+    garment_subtype: str = "",
+    cloth_type: str = "upper_body",
+) -> dict[str, Any]:
+    """
+    Analyze geometry, aspect ratio, vertical coverage, sleeve width, and collar
+    structure of the target garment. Combines vision contour analysis with textual cues.
+    Eliminates the "Crop Top Trap" and provides garment length/sleeve awareness.
+    """
+    import cv2
+    desc_lower = f"{garment_desc} {garment_subtype}".lower().replace("-", " ")
+
+    # 1. Textual analysis
+    explicit_long = any(kw in desc_lower for kw in [
+        "long kurta", "long kurti", "kurta set", "kurti set", "kurta", "kurti",
+        "tunic", "long shirt", "dress", "anarkali", "sherwani", "kaftan", "robe",
+        "longline", "trench", "maxi", "midi", "gown", "overcoat", "pathani"
+    ])
+    explicit_crop = any(kw in desc_lower for kw in [
+        "crop top", "cropped top", "crop", "cropped", "choli", "tube top",
+        "bralette", "bandeau", "corset", "bustier", "short top", "baby tee"
+    ])
+    explicit_regular = any(kw in desc_lower for kw in [
+        "shirt", "t-shirt", "tshirt", "tee", "polo", "blouse", "sweater",
+        "hoodie", "jacket", "blazer", "cardigan", "sweatshirt", "regular top", "top"
+    ]) and not explicit_crop and not explicit_long
+
+    explicit_sleeveless = any(kw in desc_lower for kw in [
+        "sleeveless", "strapless", "tank top", "tank", "cami", "spaghetti strap",
+        "spaghetti", "halter", "tube top", "off-shoulder", "off shoulder",
+        "slip dress", "sleeveless dress"
+    ])
+    explicit_has_sleeves = any(kw in desc_lower for kw in [
+        "short sleeve", "half sleeve", "long sleeve", "full sleeve", "sleeve",
+        "sleeved", "t-shirt", "shirt", "polo", "hoodie", "sweater", "jacket",
+        "blazer", "cardigan", "kurta", "kurti", "sweatshirt"
+    ])
+    explicit_long_sleeve = any(kw in desc_lower for kw in [
+        "long sleeve", "full sleeve", "long-sleeve", "full-sleeve", "long-sleeved",
+        "sweater", "sweatshirt", "hoodie", "cardigan", "blazer", "jacket", "coat"
+    ])
+    explicit_collar = any(kw in desc_lower for kw in [
+        "collar", "collared", "mandarin", "nehru", "spread collar", "button down",
+        "button-down", "polo", "turtleneck", "high neck", "hoodie", "lapel", "shirt", "kurta"
+    ])
+
+    # 2. Vision contour analysis on garment_img
+    aspect_ratio = 1.0
+    vertical_coverage = 0.55
+    has_sleeves_cv = True
+    has_long_sleeves_cv = False
+
+    try:
+        g_np = np.array(garment_img.convert("RGB"))
+        gh, gw = g_np.shape[:2]
+
+        # Background: luminance > 235 and low saturation
+        max_c = np.max(g_np, axis=2).astype(np.int16)
+        min_c = np.min(g_np, axis=2).astype(np.int16)
+        sat = max_c - min_c
+        mean_c = np.mean(g_np, axis=2)
+        is_bg = (mean_c > 235) & (sat < 25)
+
+        fg_mask = (~is_bg).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+
+        ys, xs = np.where(fg_mask > 127)
+        if len(ys) > 500 and len(xs) > 500:
+            ymin, ymax = int(np.min(ys)), int(np.max(ys))
+            xmin, xmax = int(np.min(xs)), int(np.max(xs))
+            box_h = max(1, ymax - ymin)
+            box_w = max(1, xmax - xmin)
+            aspect_ratio = float(box_h) / float(box_w)
+            vertical_coverage = float(box_h) / float(gh)
+
+            # Analyze sleeve width at shoulder/armpit (top 20% - 45% of garment height)
+            y_upper_start = ymin + int(box_h * 0.20)
+            y_upper_end = ymin + int(box_h * 0.45)
+            upper_band = fg_mask[y_upper_start:y_upper_end, xmin:xmax]
+            upper_widths = np.sum(upper_band > 127, axis=1)
+            max_upper_w = np.max(upper_widths) if len(upper_widths) > 0 else box_w
+
+            # Sleeveless garments (tank tops, tube tops, camis) have narrow width at sleeve height
+            if (max_upper_w / float(box_w) < 0.48) and not explicit_has_sleeves and not explicit_long_sleeve and not explicit_regular:
+                has_sleeves_cv = False
+
+            # Outer columns in the midsection (sleeves running down sides)
+            y_mid_start = ymin + int(box_h * 0.35)
+            y_mid_end = ymin + int(box_h * 0.75)
+            left_outer = fg_mask[y_mid_start:y_mid_end, xmin:xmin + int(box_w * 0.22)]
+            right_outer = fg_mask[y_mid_start:y_mid_end, xmax - int(box_w * 0.22):xmax]
+            outer_density = (np.mean(left_outer > 127) + np.mean(right_outer > 127)) / 2.0
+            if outer_density > 0.20:
+                has_long_sleeves_cv = True
+    except Exception as exc:
+        logger.warning("analyze_garment_geometry_failed error=%s", exc)
+
+    # 3. Combine vision + text: Fix the "Crop Top Trap"
+    if explicit_crop:
+        is_crop = True
+        is_long = False
+        is_regular = False
+    elif explicit_long or cloth_type in ("dresses", "full_body"):
+        is_crop = False
+        is_long = True
+        is_regular = False
+    elif explicit_regular:
+        # Regular top / shirt / t-shirt:
+        # Never clamp into crop top! Only long if vertical coverage or aspect ratio is exceptionally high.
+        is_crop = False
+        is_long = (aspect_ratio >= 1.25) or (vertical_coverage >= 0.72)
+        is_regular = not is_long
+    else:
+        # Vision-based classification avoiding the Crop Top Trap:
+        # A garment is crop ONLY if aspect_ratio < 0.78 AND vertical_coverage < 0.42.
+        # Boxy shirts/t-shirts (aspect_ratio ~0.85, vertical_coverage ~0.55) are regular tops!
+        is_crop = (aspect_ratio < 0.78) and (vertical_coverage < 0.42)
+        is_long = (aspect_ratio >= 1.18) or (vertical_coverage >= 0.65)
+        is_regular = not is_crop and not is_long
+
+    # 4. Sleeve classification: Only mark sleeveless if explicitly detected/stated
+    if explicit_sleeveless:
+        has_sleeves = False
+        has_long_sleeves = False
+    elif explicit_long_sleeve:
+        has_sleeves = True
+        has_long_sleeves = True
+    elif explicit_has_sleeves or explicit_regular:
+        has_sleeves = True
+        has_long_sleeves = has_long_sleeves_cv
+    else:
+        has_sleeves = has_sleeves_cv
+        has_long_sleeves = has_long_sleeves_cv
+
+    has_collar = explicit_collar or (aspect_ratio > 1.1)
+
+    return {
+        "aspect_ratio": aspect_ratio,
+        "vertical_coverage": vertical_coverage,
+        "is_long_garment": is_long,
+        "is_crop_top": is_crop,
+        "is_regular_top": is_regular,
+        "has_sleeves": has_sleeves,
+        "has_long_sleeves": has_long_sleeves,
+        "has_collar_or_high_neck": has_collar,
+    }
+
+
+def _extract_hip_waist_y(
+    keypoints: Any,
+    parse_768: np.ndarray,
+    target_h: int = TARGET_H,
+    target_w: int = TARGET_W,
+) -> tuple[int | None, int | None]:
+    """
+    Extract hip_y and waist_y in target image coordinates using OpenPose keypoints
+    and/or SCHP human parsing maps.
+    Returns (hip_y, waist_y).
+    """
+    hip_y = None
+    waist_y = None
+
+    # 1. From SCHP parsing: top of pants/skirt (labels 5, 6)
+    lower_clothing_labels = {5, 6}
+    lower_rows = np.where(np.isin(parse_768, list(lower_clothing_labels)).any(axis=1))[0]
+    if len(lower_rows) > 0:
+        waist_y = int(lower_rows[0])
+
+    # 2. From OpenPose keypoints
+    if keypoints is not None:
+        try:
+            if isinstance(keypoints, dict):
+                hips_found = []
+                # Case A: Named keys
+                for k in ("left_hip", "right_hip", "l_hip", "r_hip"):
+                    pt = keypoints.get(k)
+                    if pt is not None:
+                        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                            py = float(pt[1])
+                            if py <= 1.0:
+                                py *= target_h
+                            elif py <= 512:
+                                py = py * (target_h / 512.0)
+                            hips_found.append(py)
+                        elif hasattr(pt, "y"):
+                            py = float(pt.y)
+                            if py <= 1.0:
+                                py *= target_h
+                            hips_found.append(py)
+
+                # Case B: OpenPose candidate / subset
+                if not hips_found and "candidate" in keypoints and "subset" in keypoints:
+                    candidate = keypoints["candidate"]
+                    subset = keypoints["subset"]
+                    if len(subset) > 0 and len(candidate) > 0:
+                        for part_idx in (8, 11):  # 8=RHip, 11=LHip
+                            cand_idx = int(subset[0][part_idx])
+                            if 0 <= cand_idx < len(candidate):
+                                py = float(candidate[cand_idx][1])
+                                if py <= 1.0:
+                                    py *= target_h
+                                elif py <= 512:
+                                    py = py * (target_h / 512.0)
+                                hips_found.append(py)
+
+                # Case C: pose_keypoints_2d list
+                if not hips_found and "pose_keypoints_2d" in keypoints:
+                    pk = keypoints["pose_keypoints_2d"]
+                    for part_idx in (8, 11):
+                        offset = part_idx * 3
+                        if len(pk) > offset + 2 and pk[offset + 2] > 0.05:
+                            py = float(pk[offset + 1])
+                            if py <= 1.0:
+                                py *= target_h
+                            elif py <= 512:
+                                py = py * (target_h / 512.0)
+                            hips_found.append(py)
+
+                if hips_found:
+                    hip_y = int(np.mean(hips_found))
+        except Exception as exc:
+            logger.warning("extract_hip_waist_y_failed error=%s", exc)
+
+    return hip_y, waist_y
+
+
 def run_idm_vton_inference(
     person_img: Image.Image,
     garment_img: Image.Image,
     garment_desc: str,
     cloth_type: str,
     garment_subtype: str = "",
-    steps: int = 30,
+    steps: int = 16,
     seed: int = 42,
     auto_crop: bool = True,
     external_mask: Image.Image | None = None,
@@ -1653,6 +1905,13 @@ def run_idm_vton_inference(
 
     isolated_garment = isolate_cloth_item(garment_img, cloth_type=cloth_type, parsing_model=parsing_model)
     garm_img = isolated_garment.convert("RGB").resize(TARGET_SIZE, Image.LANCZOS)
+    garm_attrs = analyze_garment_attributes(
+        garment_img=garm_img,
+        garment_desc=garment_desc,
+        garment_subtype=garment_subtype,
+        cloth_type=cloth_type,
+    )
+    logger.info("garment_attributes_analyzed %s", garm_attrs)
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -1830,30 +2089,42 @@ def run_idm_vton_inference(
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _dress_region)
 
-        # ── Bare arm exclusion for sleeveless/off-shoulder dresses ─────
-        # After clothing label expansion, subtract bare arm skin pixels
-        # (SCHP labels 14=LeftArm, 15=RightArm) so the inpaint mask does
-        # not cover bare arms. Without this, convex hull + dilation causes
-        # SDXL to generate fabric over bare arms for sleeveless garments.
+        # ── Target-Aware Arm & Sleeve Masking for Dresses ──────────────
         _bare_arm_labels = {14, 15}  # LeftArm, RightArm
         _bare_arm_region = np.isin(parse_768, list(_bare_arm_labels)).astype(np.uint8)
-        # Erode slightly to avoid cutting into sleeve edges
-        _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
-        mask_np[_bare_arm_region > 0] = 0
+
+        # Static Sleeve Lockout Fix: Only zero out arms if explicitly sleeveless/strapless.
+        # If target has sleeves (half or full), allow the garment to inpaint over the arms.
+        if not garm_attrs.get("has_sleeves", True):
+            _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
+            mask_np[_bare_arm_region > 0] = 0
+            logger.info("dress_arms_protected target_sleeveless=True")
+        else:
+            _arm_dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            _arm_mask_expanded = cv2.dilate(_bare_arm_region, _arm_dilate_k, iterations=1) * 255
+            mask_np = np.maximum(mask_np, _arm_mask_expanded)
+            logger.info("dress_arms_masked_for_sleeves has_long_sleeves=%s", garm_attrs.get("has_long_sleeves", False))
 
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_bottom = int(_rows_with_mask[-1])
             _target_bottom = min(TARGET_H, int(TARGET_H * 0.92))
             if _mask_bottom < _target_bottom:
-                _bottom_band = mask_np[max(0, _mask_bottom - 20):_mask_bottom, :]
-                _col_sums = np.sum(_bottom_band > 127, axis=0)
-                _nonzero_cols = np.where(_col_sums > 0)[0]
-                if len(_nonzero_cols) > 0:
-                    _left_bound = max(0, int(_nonzero_cols[0]) - 10)
-                    _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
-                    mask_np[_mask_bottom:_target_bottom, _left_bound:_right_bound] = 255
+                for y in range(_mask_bottom, _target_bottom):
+                    row_body = np.where(np.isin(parse_768[y, :], [4, 5, 6, 7, 8, 12, 13, 18]))[0]
+                    if len(row_body) > 0:
+                        x_left = max(0, int(row_body[0]) - 12)
+                        x_right = min(TARGET_W, int(row_body[-1]) + 12)
+                        mask_np[y, x_left:x_right] = 255
+                    else:
+                        _bottom_band = mask_np[max(0, _mask_bottom - 20):_mask_bottom, :]
+                        _col_sums = np.sum(_bottom_band > 127, axis=0)
+                        _nonzero_cols = np.where(_col_sums > 0)[0]
+                        if len(_nonzero_cols) > 0:
+                            x_left = max(0, int(_nonzero_cols[0]) - 10)
+                            x_right = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
+                            mask_np[y, x_left:x_right] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
 
@@ -1861,8 +2132,6 @@ def run_idm_vton_inference(
     # Expands the upper_body mask using SCHP label 4 (upper_clothes) to cover
     # layered garments where an underlayer (kurti, long shirt, blouse) extends
     # below the outermost visible garment (jacket, cardigan, hoodie).
-    # Without this, the AutoMasker only covers the outermost layer tightly,
-    # leaving the underlayer's hem visible in the generated output.
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "upper_body":
         # In ATR parsing: UpperClothes=4, Dress/Kurti=7, Scarf/Dupatta=17.
         # DO NOT include Skirt=5, Pants=6, or RightShoe=10.
@@ -1880,28 +2149,97 @@ def run_idm_vton_inference(
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _upper_region)
 
-        # ── Bare Arm & Hand Protection for Upper-Body ───────────────────
-        # Prevents cv2.MORPH_CLOSE and dilation from swallowing crossed arms,
-        # hands resting on hips, or limbs in front of the torso.
+        # ── Target-Aware Arm & Sleeve Masking (Fix Static Sleeve Lockout) ──
+        # If target garment has sleeves (full or half sleeved), DO NOT zero out
+        # _bare_arm_region (labels 14, 15). Allow the garment to inpaint over the arms.
+        # Only zero out bare arms if the target garment is explicitly detected as sleeveless/strapless.
         _bare_arm_labels = {14, 15}  # LeftArm, RightArm
         _bare_arm_region = np.isin(parse_768, list(_bare_arm_labels)).astype(np.uint8)
-        _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
-        mask_np[_bare_arm_region > 0] = 0
 
-        # Extend mask downward to cover shirt tails, kurti hems peeking below
+        if not garm_attrs.get("has_sleeves", True):
+            _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
+            mask_np[_bare_arm_region > 0] = 0
+            logger.info("bare_arms_protected target_sleeveless=True")
+        else:
+            _arm_dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            _arm_mask_expanded = cv2.dilate(_bare_arm_region, _arm_dilate_k, iterations=1) * 255
+            mask_np = np.maximum(mask_np, _arm_mask_expanded)
+            logger.info("bare_arms_masked_for_sleeves has_long_sleeves=%s", garm_attrs.get("has_long_sleeves", False))
+
+        # ── Upward Collar / Neckline Expansion (Fix Collar Ghosting) ────
+        # Allow the new garment's collar area to breathe so mandarin collars,
+        # Nehru collars, and high necklines do not get melted with original exposed throat skin.
+        if garm_attrs.get("has_collar_or_high_neck", False):
+            neck_zone = (parse_768 == 18).astype(np.uint8) * 255
+            neck_rows = np.where(neck_zone.any(axis=1))[0]
+            if len(neck_rows) > 0:
+                neck_top = int(neck_rows[0])
+                neck_bottom = int(neck_rows[-1])
+                neck_height = neck_bottom - neck_top
+                collar_cut = neck_top + int(neck_height * 0.20)  # breathe up to top 20% of neck
+                collar_inpaint_patch = np.zeros_like(neck_zone)
+                collar_inpaint_patch[collar_cut:, :] = neck_zone[collar_cut:, :]
+                mask_np = np.maximum(mask_np, collar_inpaint_patch)
+
+        # ── Dynamic Downward Garment Extension (Fix Crop Top Trap) ─────
+        # Compute anatomical hip/waist coordinates from OpenPose and SCHP.
+        # Never limit the mask bottom to _mask_bottom + 50!
+        # Use OpenPose hip keypoints (LeftHip, RightHip) or SCHP lower torso labels
+        # to extend the mask over the bare stomach/navel down to the hip/thigh line.
+        # Ensure the bare midriff and waistband do not clamp long garments into crop tops.
+        hip_y, waist_y = _extract_hip_waist_y(keypoints, parse_768, TARGET_H, TARGET_W)
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
             _mask_bottom = int(_rows_with_mask[-1])
-            # Extend down by 50px to catch underlayer hems
-            _target_bottom = min(TARGET_H, _mask_bottom + 50)
-            _bottom_band = mask_np[max(0, _mask_bottom - 15):_mask_bottom, :]
-            _col_sums = np.sum(_bottom_band > 127, axis=0)
-            _nonzero_cols = np.where(_col_sums > 0)[0]
-            if len(_nonzero_cols) > 0:
-                _left_bound = max(0, int(_nonzero_cols[0]) - 10)
-                _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
-                mask_np[_mask_bottom:_target_bottom, _left_bound:_right_bound] = 255
+
+            if garm_attrs.get("is_long_garment", False):
+                # Long Kurta / Kurti / Tunic / Long Shirt / Dress:
+                # Extend down over bare midriff, navel, and hips down to mid-thigh line
+                if hip_y is not None:
+                    _target_bottom = min(TARGET_H, hip_y + int(TARGET_H * 0.18))
+                elif waist_y is not None:
+                    _target_bottom = min(TARGET_H, waist_y + int(TARGET_H * 0.25))
+                else:
+                    _target_bottom = min(TARGET_H, max(_mask_bottom + 300, int(TARGET_H * 0.72)))
+                _target_bottom = max(_target_bottom, int(TARGET_H * 0.68))
+                logger.info("mask_extended_for_long_garment target_bottom=%d hip_y=%s waist_y=%s", _target_bottom, hip_y, waist_y)
+
+            elif not garm_attrs.get("is_crop_top", False):
+                # Regular Top / Shirt / T-Shirt:
+                # Do NOT limit mask to _mask_bottom + 50!
+                # Extend over bare stomach/navel down to waistband / hip line (+40px into waistband)
+                if waist_y is not None:
+                    _target_bottom = min(TARGET_H, max(_mask_bottom + 100, waist_y + 40))
+                elif hip_y is not None:
+                    _target_bottom = min(TARGET_H, max(_mask_bottom + 100, hip_y + 30))
+                else:
+                    _target_bottom = min(TARGET_H, _mask_bottom + 160)
+                logger.info("mask_extended_for_regular_top target_bottom=%d hip_y=%s waist_y=%s", _target_bottom, hip_y, waist_y)
+
+            else:
+                # Explicit crop top: preserve natural cropped hemline
+                _target_bottom = min(TARGET_H, _mask_bottom + 30)
+                logger.info("mask_kept_for_crop_top target_bottom=%d", _target_bottom)
+
+            if _target_bottom > _mask_bottom:
+                # Row-by-row anatomical extension using SCHP torso/lower body silhouette:
+                # Ensures bare stomach/navel and waistband are completely covered down to _target_bottom
+                for y in range(_mask_bottom, _target_bottom):
+                    # Check torso / lower clothing / body pixels at row y in parse_768
+                    row_body = np.where(np.isin(parse_768[y, :], [4, 5, 6, 7, 8, 12, 13, 18]))[0]
+                    if len(row_body) > 0:
+                        x_left = max(0, int(row_body[0]) - 10)
+                        x_right = min(TARGET_W, int(row_body[-1]) + 10)
+                        mask_np[y, x_left:x_right] = 255
+                    else:
+                        _bottom_band = mask_np[max(0, _mask_bottom - 20):_mask_bottom, :]
+                        _col_sums = np.sum(_bottom_band > 127, axis=0)
+                        _nonzero_cols = np.where(_col_sums > 0)[0]
+                        if len(_nonzero_cols) > 0:
+                            x_left = max(0, int(_nonzero_cols[0]) - 15)
+                            x_right = min(TARGET_W, int(_nonzero_cols[-1]) + 15)
+                            mask_np[y, x_left:x_right] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
 
@@ -1953,8 +2291,9 @@ def run_idm_vton_inference(
     pose_img = pose_img[:, :, ::-1]
     pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
 
-    effective_guidance = guidance_scale if guidance_scale is not None else 2.5
-    effective_steps = min(steps, 24) if steps == 30 else steps
+    effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
+    effective_guidance = max(1.8, min(2.0, float(effective_guidance)))
+    effective_steps = min(steps, 16) if steps >= 16 else steps
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype) + (
@@ -2101,6 +2440,7 @@ def run_idm_vton_inference(
                 crop_top=int(top),
                 parsing_map=parse_768,
                 inpaint_mask=mask,
+                has_collar=garm_attrs.get("has_collar_or_high_neck", False),
             )
 
         return final_img, mask_meta
@@ -2182,6 +2522,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     }
     # ── Upper-body subtype keywords (P4) ────────────────────────────────
     _UPPER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+        "crop_top": ["crop top", "crop", "cropped", "tube top", "tank top", "choli", "bralette", "bandeau", "corset", "short top"],
+        "regular_top": ["regular top", "top", "blouse", "tunic"],
         "shirt": ["shirt", "button up", "button-up", "dress shirt", "casual shirt", "oxford"],
         "tshirt": ["t-shirt", "tshirt", "t shirt", "tee", "crew neck tee"],
         "hoodie": ["hoodie", "hooded", "sweatshirt", "pullover hoodie", "zip hoodie"],
@@ -2283,13 +2625,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # weakened garment conditioning and washed out black/dark garments
     # (lost texture, turned gray). Dark garments need FULL guidance so the
     # model actually applies the (low-luminance) garment color/texture.
-    # P2: Use 2.5 for upper_body, 2.8 for lower_body (natural weave without over-saturation)
+    # Guidance scale in 1.8 - 2.0 range to eliminate oversaturation and reduce artifacting
     if vton_type == "lower_body":
-        effective_guidance = 2.8
+        effective_guidance = 2.0
     elif vton_type == "upper_body":
-        effective_guidance = 2.5
+        effective_guidance = 1.9
     else:
-        effective_guidance = GUIDANCE_SCALE
+        effective_guidance = 1.9
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
