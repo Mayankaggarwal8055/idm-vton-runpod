@@ -43,7 +43,7 @@ _LABEL_NECK = 18
 # ── Clothing label sets per cloth_type ────────────────────────────────────────
 
 _CLOTHING_LABELS: dict[str, frozenset[int]] = {
-    "upper_body": frozenset({_LABEL_UPPER_CLOTHES}),
+    "upper_body": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_SCARF}),
     "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT}),
     "dresses": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
                           _LABEL_DRESS, _LABEL_SCARF}),
@@ -182,11 +182,11 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
 # ── EDITABLE_BODY_REGIONS: which SCHP labels are inpaintable ─────────────────
 
 EDITABLE_BODY_REGIONS: dict[str, frozenset[int]] = {
-    "upper_body": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}),
+    "upper_body": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_SCARF, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}),
     "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT}),
     "dresses": frozenset({
-        _LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
-        _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
+        _LABEL_UPPER_CLOTHES, _LABEL_DRESS, _LABEL_PANTS, _LABEL_SKIRT,
+        _LABEL_SCARF, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
         _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
     }),
 }
@@ -358,11 +358,13 @@ def build_schp_protect_mask(
     identity_labels = {_LABEL_BG, _LABEL_HAT, _LABEL_HAIR, _LABEL_SUNGLASSES,
                        _LABEL_FACE, _LABEL_NECK}
 
-    # For full-body garments, socks/shoes/belt/scarf are part of the outfit
-    # and should NOT be identity-protected. For upper/lower-only, protect them.
+    # Belt, shoes, and bag are protected for non-full-body garments.
+    # Scarf/Dupatta is only protected if it's lower_body or specifically marked to preserve.
+    # For upper-body Western try-on, any existing scarf/dupatta MUST be removable.
     if not (profile.covers_upper and profile.covers_lower):
-        identity_labels |= {_LABEL_BELT, _LABEL_LEFT_SHOE, _LABEL_RIGHT_SHOE,
-                            _LABEL_BAG, _LABEL_SCARF}
+        identity_labels |= {_LABEL_BELT, _LABEL_LEFT_SHOE, _LABEL_RIGHT_SHOE, _LABEL_BAG}
+        if cloth_type == "lower_body":
+            identity_labels.add(_LABEL_SCARF)
 
     protect_labels = identity_labels | editable
     # Protect everything NOT in the editable set

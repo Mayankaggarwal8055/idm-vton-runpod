@@ -1,0 +1,21 @@
+{
+  "delayTime": 24245,
+  "executionTime": 11013,
+  "id": "c38f2caa-712c-4907-823f-c832493543f1-e1",
+  "output": {
+    "cloth_type_used": "upper_body",
+    "cold_start": false,
+    "download_ms": 429.89,
+    "inference_ms": 7851.25,
+    "mask_type_used": "automasker",
+    "result_url": "https://res.cloudinary.com/dpfot18bn/image/upload/v1790894263/trylix/tryon/results/result_c38f2caa-712c-4907-823f-c832493543f1-e1.png",
+    "seed": 42,
+    "status": "success",
+    "steps_used": 30,
+    "total_ms": 10638.96,
+    "trace_id": "",
+    "upload_ms": 2326.43
+  },
+  "status": "COMPLETED",
+  "workerId": "2bfhjyg5ddbjwq"
+}

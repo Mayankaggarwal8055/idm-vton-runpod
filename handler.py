@@ -57,7 +57,7 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "30"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "20"))
 GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.0"))
 # Garment IP-Adapter scale. IDM-VTON drives garment APPEARANCE (texture, grain,
 # seams, pockets, weaves) primarily through the IP-Adapter image. The library
@@ -331,6 +331,7 @@ def load_models():
 
     from diffusers import (
         DDPMScheduler,
+        DPMSolverMultistepScheduler,
         AutoencoderKL,
     )
 
@@ -357,11 +358,21 @@ def load_models():
         use_fast=False,
     )
 
-    logger.info("Loading scheduler...")
-    noise_scheduler = DDPMScheduler.from_pretrained(
+    logger.info("Loading scheduler (DPM++ 2M Karras)...")
+    base_scheduler = DDPMScheduler.from_pretrained(
         IDM_VTON_MODEL,
         subfolder="scheduler",
     )
+    try:
+        noise_scheduler = DPMSolverMultistepScheduler.from_config(
+            base_scheduler.config,
+            algorithm_type="dpmsolver++",
+            use_karras_sigmas=True,
+        )
+        logger.info("noise_scheduler_configured type=DPMSolverMultistepScheduler karras=True")
+    except Exception as sched_err:
+        logger.warning("dpm_scheduler_fallback_to_ddpm error=%s", sched_err)
+        noise_scheduler = base_scheduler
 
     logger.info("Loading text_encoder_one...")
     text_encoder_one = CLIPTextModel.from_pretrained(
@@ -431,18 +442,43 @@ def load_models():
         logger.warning("set_ip_adapter_scale_failed error=%s", exc)
 
     if ENABLE_XFORMERS:
-
         logger.info("Attempting xformers enable...")
-
         try:
             pipe.enable_xformers_memory_efficient_attention()
             logger.info("xformers_enabled=True")
-
         except Exception as exc:
-            logger.warning(
-                "xformers_enable_failed error=%s",
-                exc,
-            )
+            logger.warning("xformers_unavailable fallback_to_pytorch2_sdpa error=%s", exc)
+            try:
+                pipe.unet.set_default_attn_processor()
+                if hasattr(pipe, "unet_encoder"):
+                    pipe.unet_encoder.set_default_attn_processor()
+                logger.info("pytorch2_sdpa_enabled=True")
+            except Exception as sdpa_err:
+                logger.warning("sdpa_fallback_error=%s", sdpa_err)
+    else:
+        try:
+            pipe.unet.set_default_attn_processor()
+            if hasattr(pipe, "unet_encoder"):
+                pipe.unet_encoder.set_default_attn_processor()
+            logger.info("pytorch2_sdpa_enabled=True")
+        except Exception as sdpa_err:
+            logger.warning("sdpa_fallback_error=%s", sdpa_err)
+
+    # ── Memory & Throughput Optimization ──────────────────────────────
+    try:
+        pipe.unet.to(memory_format=torch.channels_last)
+        if hasattr(pipe, "unet_encoder"):
+            pipe.unet_encoder.to(memory_format=torch.channels_last)
+        logger.info("channels_last_enabled=True")
+    except Exception as exc:
+        logger.warning("channels_last_failed error=%s", exc)
+
+    if hasattr(pipe, "enable_vae_slicing"):
+        pipe.enable_vae_slicing()
+        logger.info("vae_slicing_enabled=True")
+    if hasattr(pipe, "enable_vae_tiling"):
+        pipe.enable_vae_tiling()
+        logger.info("vae_tiling_enabled=True")
 
     if ENABLE_MODEL_CPU_OFFLOAD:
 
@@ -1273,8 +1309,8 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
 
     parts = ["model wearing " + garment_desc]
     for attr_key in (
-        "coverage", "fit", "silhouette", "waist_position",
-        "garment_length", "layering", "structure", "drape",
+        "coverage", "fit", "silhouette", "sleeves", "neckline", "collar",
+        "waist_position", "garment_length", "layering", "structure", "drape",
         "material", "fabric_behavior",
     ):
         val = attrs.get(attr_key, "")
@@ -1322,6 +1358,95 @@ def _build_source_specific_negative(source_cloth_type: str = "", target_subtype:
         "accessory, accessories, "
         "extra object, held item, carrying"
     )
+
+
+def isolate_cloth_item(
+    garment_img: Image.Image,
+    cloth_type: str = "upper_body",
+    parsing_model: Any = None,
+) -> Image.Image:
+    """
+    Isolate the target garment item on a clean white canvas.
+    If the garment image contains a human model, skirts, bags, or other items,
+    strip non-target elements using semantic parsing so GarmentNet receives strictly
+    the target garment on a clean white canvas.
+    """
+    if garment_img is None:
+        return garment_img
+
+    # If the image has an alpha channel with actual transparency, composite on white
+    if garment_img.mode in ("RGBA", "LA") or (garment_img.mode == "P" and "transparency" in garment_img.info):
+        rgba = garment_img.convert("RGBA")
+        alpha = np.array(rgba.split()[-1])
+        if np.any(alpha < 250):
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            bg.alpha_composite(rgba)
+            return bg.convert("RGB")
+
+    # If a parsing model is available, check for and strip non-garment elements
+    if parsing_model is not None:
+        try:
+            import cv2
+            orig_size = garment_img.size
+            g_parse_img = garment_img.convert("RGB").resize((384, 512), Image.BILINEAR)
+            g_parse, _ = parsing_model(g_parse_img)
+            g_parse_np = np.array(g_parse, dtype=np.uint8)
+            g_parse_full = cv2.resize(g_parse_np, orig_size, interpolation=cv2.INTER_NEAREST)
+
+            # Check if person elements (face, hair, legs, arms) exist
+            has_person = np.any(np.isin(g_parse_full, [11, 2, 12, 13, 14, 15]))
+            if has_person:
+                c_norm = cloth_type.lower().replace("-", "_")
+                if c_norm in ("upper_body", "upper", "top"):
+                    target_labels = [4, 7]  # UpperClothes, Dress
+                elif c_norm in ("lower_body", "lower", "bottom", "pants", "skirt"):
+                    target_labels = [5, 6]  # Skirt, Pants
+                elif c_norm in ("dresses", "dress", "full_body"):
+                    target_labels = [4, 5, 6, 7]
+                else:
+                    target_labels = [4, 7]
+
+                cloth_mask = np.isin(g_parse_full, target_labels).astype(np.uint8) * 255
+                if np.sum(cloth_mask > 127) > 500:
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    cloth_mask = cv2.morphologyEx(cloth_mask, cv2.MORPH_CLOSE, k)
+                    cloth_mask = cv2.dilate(cloth_mask, k, iterations=1)
+
+                    g_np = np.array(garment_img.convert("RGB"))
+                    isolated = np.full_like(g_np, 255)
+                    isolated[cloth_mask > 127] = g_np[cloth_mask > 127]
+
+                    ys, xs = np.where(cloth_mask > 127)
+                    if len(ys) > 0 and len(xs) > 0:
+                        ymin, ymax = int(np.min(ys)), int(np.max(ys))
+                        xmin, xmax = int(np.min(xs)), int(np.max(xs))
+                        pad = 10
+                        ymin, ymax = max(0, ymin - pad), min(g_np.shape[0], ymax + pad)
+                        xmin, xmax = max(0, xmin - pad), min(g_np.shape[1], xmax + pad)
+                        cropped_item = Image.fromarray(isolated[ymin:ymax, xmin:xmax])
+
+                        cw, ch = 768, 1024
+                        canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
+                        if c_norm in ("upper_body", "upper", "top"):
+                            target_w, target_h = int(cw * 0.75), int(ch * 0.55)
+                            scaled_item = cropped_item.copy()
+                            scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
+                            paste_x = (cw - scaled_item.width) // 2
+                            paste_y = int(ch * 0.12)
+                        else:
+                            target_w, target_h = int(cw * 0.80), int(ch * 0.80)
+                            scaled_item = cropped_item.copy()
+                            scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
+                            paste_x = (cw - scaled_item.width) // 2
+                            paste_y = (ch - scaled_item.height) // 2
+
+                        canvas.paste(scaled_item, (paste_x, paste_y))
+                        logger.info("garment_isolated_from_model cloth_type=%s bbox=(%d,%d,%d,%d)", cloth_type, xmin, ymin, xmax, ymax)
+                        return canvas
+        except Exception as exc:
+            logger.warning("isolate_cloth_item_failed error=%s", exc)
+
+    return garment_img
 
 
 def _restore_person_identity(
@@ -1406,12 +1531,15 @@ def _restore_person_identity(
 
         if inpaint_mask is not None:
             inpaint_np = np.array(
-                inpaint_mask.convert("L").resize((w, h), Image.NEAREST),
+                inpaint_mask.convert("L").resize((w, h), Image.BILINEAR),
                 dtype=np.uint8,
             )
             # Only preserve skin pixels that are OUTSIDE the inpaint mask.
             # Skin inside the mask is where sleeves/garment should be generated.
             skin_mask[inpaint_np > 127] = 0
+            # Identity regions (neck/chest/skin) inside inpaint mask must NOT be restored,
+            # allowing new collars, high necklines, and shirts to generate naturally.
+            identity_mask[inpaint_np > 127] = 0
 
         identity_mask = np.maximum(identity_mask, skin_mask)
 
@@ -1423,27 +1551,17 @@ def _restore_person_identity(
         dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         identity_mask = cv2.dilate(identity_mask, dilate_k, iterations=1)
 
-        # Soft feathering with Gaussian blur for seamless blending
-        feather_radius = max(15, min(h, w) // 40)
-        if feather_radius % 2 == 0:
-            feather_radius += 1
-        mask_soft = cv2.GaussianBlur(
-            identity_mask.astype(np.float32),
-            (feather_radius, feather_radius),
-            0,
-        )
-        mask_3d = mask_soft[:, :, np.newaxis] / 255.0
-
-        # Composite: restore original pixels in identity + skin regions
-        restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
+        # Multi-scale Laplacian pyramid blending (<50ms) preserving pores, hair, and edges
+        from postprocess import laplacian_pyramid_blend
+        restored = laplacian_pyramid_blend(orig_np, result_np, identity_mask, num_levels=3)
 
         identity_pixel_count = int(np.sum(identity_mask > 127))
         skin_pixel_count = int(np.sum(skin_mask > 127))
         logger.info(
-            "schp_identity_restored cloth_type=%s identity_labels=%s skin_labels=%s "
-            "identity_pixels=%d skin_pixels=%d feather=%d",
+            "laplacian_identity_restored cloth_type=%s identity_labels=%s skin_labels=%s "
+            "identity_pixels=%d skin_pixels=%d",
             cloth_type, sorted(identity_labels), sorted(skin_labels),
-            identity_pixel_count, skin_pixel_count, feather_radius,
+            identity_pixel_count, skin_pixel_count,
         )
 
         return Image.fromarray(restored, mode="RGB")
@@ -1533,7 +1651,8 @@ def run_idm_vton_inference(
         select_worker_mask_strategy,
     )
 
-    garm_img = garment_img.convert("RGB").resize(TARGET_SIZE, Image.LANCZOS)
+    isolated_garment = isolate_cloth_item(garment_img, cloth_type=cloth_type, parsing_model=parsing_model)
+    garm_img = isolated_garment.convert("RGB").resize(TARGET_SIZE, Image.LANCZOS)
     human_img_orig = person_img.convert("RGB")
 
     width, height = human_img_orig.size
@@ -1745,10 +1864,9 @@ def run_idm_vton_inference(
     # Without this, the AutoMasker only covers the outermost layer tightly,
     # leaving the underlayer's hem visible in the generated output.
     if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "upper_body":
-        # Include upper_clothes (4), dress/kurti (5), coat/jacket (6), scarf/dupatta (10)
-        # to ensure any original ethnic long top, kurti, coat, or dress is captured
-        # and completely replaced by the new upper garment.
-        _upper_clothing_labels = {4, 5, 6, 10}
+        # In ATR parsing: UpperClothes=4, Dress/Kurti=7, Scarf/Dupatta=17.
+        # DO NOT include Skirt=5, Pants=6, or RightShoe=10.
+        _upper_clothing_labels = {4, 7, 17}
         _upper_region = np.isin(parse_768, list(_upper_clothing_labels)).astype(np.uint8) * 255
 
         # Morphological closing to unify jacket + underlayer regions
@@ -1761,6 +1879,15 @@ def run_idm_vton_inference(
 
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _upper_region)
+
+        # ── Bare Arm & Hand Protection for Upper-Body ───────────────────
+        # Prevents cv2.MORPH_CLOSE and dilation from swallowing crossed arms,
+        # hands resting on hips, or limbs in front of the torso.
+        _bare_arm_labels = {14, 15}  # LeftArm, RightArm
+        _bare_arm_region = np.isin(parse_768, list(_bare_arm_labels)).astype(np.uint8)
+        _arm_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        _bare_arm_region = cv2.erode(_bare_arm_region, _arm_erode_k, iterations=1)
+        mask_np[_bare_arm_region > 0] = 0
 
         # Extend mask downward to cover shirt tails, kurti hems peeking below
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
@@ -1777,6 +1904,17 @@ def run_idm_vton_inference(
                 mask_np[_mask_bottom:_target_bottom, _left_bound:_right_bound] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
+
+    # ── Universal Body Silhouette Constraint for ALL cloth types ──────
+    # Prevents any mask dilation from expanding outside the human body
+    # into bedroom background clutter, sofas, chairs, or textured wallpaper.
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    _body_labels = set(range(1, 20))  # All valid SCHP person labels
+    _body_silhouette = np.isin(parse_768, list(_body_labels)).astype(np.uint8) * 255
+    _body_dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    _body_silhouette = cv2.dilate(_body_silhouette, _body_dilate_k, iterations=1)
+    mask_np = cv2.bitwise_and(mask_np, _body_silhouette)
+    mask = Image.fromarray(mask_np, mode="L")
 
     # ── Re-apply protected regions AFTER all SCHP expansion steps ──────
     # Protected mask must be applied last so face, hair, hands, and lower

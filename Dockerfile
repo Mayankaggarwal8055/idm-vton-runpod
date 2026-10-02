@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     IDM_VTON_MODEL=/workspace/models/yisol/IDM-VTON \
     DENSEPOSE_WEIGHTS=/workspace/IDM-VTON/ckpt/densepose/model_final_162be9.pkl \
     CLOUDINARY_FOLDER=trylix/tryon/results \
-    ENABLE_XFORMERS=0 \
+    ENABLE_XFORMERS=1 \
     ALLOW_TF32=1
 
 WORKDIR /workspace
@@ -240,6 +240,7 @@ PY
 COPY handler.py /workspace/handler.py
 COPY mask_pipeline.py /workspace/mask_pipeline.py
 COPY quality_validation.py /workspace/quality_validation.py
+COPY postprocess.py /workspace/postprocess.py
 
 # =============================================================================
 # Layer 7 — Validate worker module (mask_pipeline.py)
