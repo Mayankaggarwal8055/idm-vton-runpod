@@ -18,6 +18,52 @@ from PIL import Image
 
 logger = logging.getLogger("idm-vton.mask_generator")
 
+def safe_float(val: Any, default: Any = 0.0) -> Any:
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        try:
+            return float(val.item())
+        except Exception:
+            pass
+    while isinstance(val, (list, tuple)):
+        if len(val) == 0:
+            return default
+        val = val[0]
+    if hasattr(val, "item"):
+        try:
+            return float(val.item())
+        except Exception:
+            pass
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(val: Any, default: Any = 0) -> Any:
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        try:
+            return int(val.item())
+        except Exception:
+            pass
+    while isinstance(val, (list, tuple)):
+        if len(val) == 0:
+            return default
+        val = val[0]
+    if hasattr(val, "item"):
+        try:
+            return int(val.item())
+        except Exception:
+            pass
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 # =============================================================================
 # SCHP (ATR Dataset) Canonical Label Map
 # =============================================================================
@@ -131,13 +177,18 @@ def generate_anatomical_neckline(
             for n in names:
                 if n in keypoints:
                     val = keypoints[n]
+                    while isinstance(val, (list, tuple)) and len(val) == 1:
+                        val = val[0]
                     if isinstance(val, (list, tuple)) and len(val) >= 2:
-                        x, y = float(val[0]), float(val[1])
+                        x = safe_float(val[0], default=0.0)
+                        y = safe_float(val[1], default=0.0)
                         if x <= 1.0 and y <= 1.0:
-                            return int(x * width), int(y * height)
-                        return int(x), int(y)
+                            return safe_int(x * width), safe_int(y * height)
+                        return safe_int(x), safe_int(y)
                     elif hasattr(val, "x") and hasattr(val, "y"):
-                        return int(val.x * width), int(val.y * height)
+                        x = safe_float(val.x, default=0.0)
+                        y = safe_float(val.y, default=0.0)
+                        return safe_int(x * width), safe_int(y * height)
             return None
 
         neck_pt = _get_pt(["neck", "upper_neck", "nose"])
@@ -221,13 +272,18 @@ def protect_hands(
             for n in names:
                 if n in keypoints:
                     val = keypoints[n]
+                    while isinstance(val, (list, tuple)) and len(val) == 1:
+                        val = val[0]
                     if isinstance(val, (list, tuple)) and len(val) >= 2:
-                        x, y = float(val[0]), float(val[1])
+                        x = safe_float(val[0], default=0.0)
+                        y = safe_float(val[1], default=0.0)
                         if x <= 1.0 and y <= 1.0:
-                            return int(x * width), int(y * height)
-                        return int(x), int(y)
+                            return safe_int(x * width), safe_int(y * height)
+                        return safe_int(x), safe_int(y)
                     elif hasattr(val, "x") and hasattr(val, "y"):
-                        return int(val.x * width), int(val.y * height)
+                        x = safe_float(val.x, default=0.0)
+                        y = safe_float(val.y, default=0.0)
+                        return safe_int(x * width), safe_int(y * height)
             return None
 
         found_wrist = False

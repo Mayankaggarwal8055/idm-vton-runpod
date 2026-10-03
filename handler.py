@@ -43,6 +43,58 @@ def _ensure_logging():
 
 
 # =============================================================================
+# Defensive Type Coercion Helpers
+# =============================================================================
+
+def safe_float(val: Any, default: Any = 0.0) -> Any:
+    """Safely coerce any scalar, string, single-element list/tuple, or numpy value to float."""
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        try:
+            return float(val.item())
+        except Exception:
+            pass
+    while isinstance(val, (list, tuple)):
+        if len(val) == 0:
+            return default
+        val = val[0]
+    if hasattr(val, "item"):
+        try:
+            return float(val.item())
+        except Exception:
+            pass
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(val: Any, default: Any = 0) -> Any:
+    """Safely coerce any scalar, string, single-element list/tuple, or numpy value to int."""
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        try:
+            return int(val.item())
+        except Exception:
+            pass
+    while isinstance(val, (list, tuple)):
+        if len(val) == 0:
+            return default
+        val = val[0]
+    if hasattr(val, "item"):
+        try:
+            return int(val.item())
+        except Exception:
+            pass
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# =============================================================================
 # Env / Constants
 # =============================================================================
 
@@ -60,17 +112,17 @@ CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
 # Inference Steps: 14 steps on DPM++ 2M Karras produces indistinguishable output from
 # 20 steps while eliminating 18 UNet forward passes, saving ~12-15s of GPU inference.
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "14"))
+DENOISE_STEPS = safe_int(os.environ.get("IDM_VTON_STEPS"), default=14)
 
 # Guidance Scale: 2.2 - 2.4 optimal balance with DPM++ 2M Karras or Euler Ancestral.
 # Eliminates global color pooling and oversaturation while rendering crisp weave and seams.
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.3"))
+GUIDANCE_SCALE = safe_float(os.environ.get("IDM_VTON_GUIDANCE"), default=2.3)
 
 # Garment IP-Adapter scale: Lowered from 0.9 to 0.55 (0.5 - 0.6 range).
 # High IP-Adapter scale (~0.9) causes global color pooling that washes out sharp
 # geometric patterns like thin pinstripes and crisp button plackets.
 # 0.55 preserves needle-sharp line details, button edges, and precise fabric weave.
-IP_ADAPTER_SCALE = float(os.environ.get("IP_ADAPTER_SCALE", "0.55"))
+IP_ADAPTER_SCALE = safe_float(os.environ.get("IP_ADAPTER_SCALE"), default=0.55)
 
 # DensePose Bypass for Upper Tops: For standard front/three-quarter upper-body shots,
 # OpenPose skeleton provides structural guidance. Skipping DensePose saves ~3s GPU overhead.
@@ -743,13 +795,13 @@ def _refine_target_inpaint_mask(mask: Image.Image, cloth_type: str) -> Image.Ima
 
         rows = np.where(mask_np.any(axis=1))[0]
         if len(rows) > 0:
-            top = int(rows[0])
+            top = safe_int(rows[0])
             waist_top = max(0, top - 56)
             band = mask_np[top:min(mask_np.shape[0], top + 24), :]
             cols = np.where(np.sum(band > 127, axis=0) > 0)[0]
             if len(cols) > 0:
-                x1 = max(0, int(cols[0]) - 20)
-                x2 = min(mask_np.shape[1], int(cols[-1]) + 20)
+                x1 = max(0, safe_int(cols[0]) - 20)
+                x2 = min(mask_np.shape[1], safe_int(cols[-1]) + 20)
                 mask_np[waist_top:top, x1:x2] = 255
             hard_protect_top = max(0, waist_top - 32)
             mask_np[:hard_protect_top, :] = 0
@@ -786,12 +838,12 @@ def _feather_mask_top(mask: Image.Image, feather: int = 30) -> Image.Image:
     rows = np.where(mask_np.any(axis=1))[0]
     if len(rows) == 0 or feather <= 0:
         return mask
-    top = int(rows[0])
+    top = safe_int(rows[0])
     for dy in range(feather):
         yy = top + dy
         if yy >= mask_np.shape[0]:
             break
-        a = dy / float(feather)  # 0 at the very top -> 1 after `feather` rows
+        a = dy / safe_float(feather, 1.0)  # 0 at the very top -> 1 after `feather` rows
         mask_np[yy] = (mask_np[yy].astype(np.float32) * a).astype(np.uint8)
     return Image.fromarray(mask_np, mode="L")
 
@@ -1525,8 +1577,8 @@ def isolate_cloth_item(
 
                     ys, xs = np.where(cloth_mask > 127)
                     if len(ys) > 0 and len(xs) > 0:
-                        ymin, ymax = int(np.min(ys)), int(np.max(ys))
-                        xmin, xmax = int(np.min(xs)), int(np.max(xs))
+                        ymin, ymax = safe_int(np.min(ys)), safe_int(np.max(ys))
+                        xmin, xmax = safe_int(np.min(xs)), safe_int(np.max(xs))
                         pad = 10
                         ymin, ymax = max(0, ymin - pad), min(g_np.shape[0], ymax + pad)
                         xmin, xmax = max(0, xmin - pad), min(g_np.shape[1], xmax + pad)
@@ -1534,25 +1586,25 @@ def isolate_cloth_item(
 
                         cw, ch = 768, 1024
                         canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
-                        cropped_aspect = float(cropped_item.height) / max(1.0, float(cropped_item.width))
+                        cropped_aspect = safe_float(cropped_item.height) / max(1.0, safe_float(cropped_item.width))
                         is_tall_item = cropped_aspect > 1.20 or any(
                             kw in (cloth_type or "").lower() for kw in ["dress", "kurta", "kurti", "tunic", "long"]
                         )
                         if c_norm in ("upper_body", "upper", "top"):
                             if is_tall_item:
-                                target_w, target_h = int(cw * 0.78), int(ch * 0.80)
+                                target_w, target_h = safe_int(cw * 0.78), safe_int(ch * 0.80)
                                 scaled_item = cropped_item.copy()
                                 scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
                                 paste_x = (cw - scaled_item.width) // 2
-                                paste_y = int(ch * 0.08)
+                                paste_y = safe_int(ch * 0.08)
                             else:
-                                target_w, target_h = int(cw * 0.75), int(ch * 0.58)
+                                target_w, target_h = safe_int(cw * 0.75), safe_int(ch * 0.58)
                                 scaled_item = cropped_item.copy()
                                 scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
                                 paste_x = (cw - scaled_item.width) // 2
-                                paste_y = int(ch * 0.12)
+                                paste_y = safe_int(ch * 0.12)
                         else:
-                            target_w, target_h = int(cw * 0.80), int(ch * 0.80)
+                            target_w, target_h = safe_int(cw * 0.80), safe_int(ch * 0.80)
                             scaled_item = cropped_item.copy()
                             scaled_item.thumbnail((target_w, target_h), Image.LANCZOS)
                             paste_x = (cw - scaled_item.width) // 2
@@ -1634,11 +1686,11 @@ def _restore_person_identity(
             neck_mask = (parse_resized == 18).astype(np.uint8) * 255
             neck_rows = np.where(neck_mask.any(axis=1))[0]
             if len(neck_rows) > 0:
-                neck_top = int(neck_rows[0])
-                neck_bottom = int(neck_rows[-1])
+                neck_top = safe_int(neck_rows[0])
+                neck_bottom = safe_int(neck_rows[-1])
                 neck_height = neck_bottom - neck_top
                 neck_ratio = 0.15 if has_collar else 0.30
-                cutoff_y = neck_top + int(neck_height * neck_ratio)
+                cutoff_y = neck_top + safe_int(neck_height * neck_ratio)
                 neck_mask[cutoff_y:, :] = 0
             identity_mask = np.maximum(identity_mask, neck_mask)
 
@@ -1683,8 +1735,8 @@ def _restore_person_identity(
         from postprocess import laplacian_pyramid_blend
         restored = laplacian_pyramid_blend(orig_np, result_np, identity_mask, num_levels=3)
 
-        identity_pixel_count = int(np.sum(identity_mask > 127))
-        skin_pixel_count = int(np.sum(skin_mask > 127))
+        identity_pixel_count = safe_int(np.sum(identity_mask > 127))
+        skin_pixel_count = safe_int(np.sum(skin_mask > 127))
         logger.info(
             "laplacian_identity_restored cloth_type=%s identity_labels=%s skin_labels=%s "
             "identity_pixels=%d skin_pixels=%d",
@@ -1704,7 +1756,7 @@ def _restore_person_identity(
     if detector.empty():
         return result
 
-    min_dim = max(30, int(min(h, w) * 0.04))
+    min_dim = max(30, safe_int(min(h, w) * 0.04))
     faces = detector.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_dim, min_dim)
     )
@@ -1715,9 +1767,9 @@ def _restore_person_identity(
 
     # Conservative face-only padding — smaller than before to avoid
     # collar clipping. Only restores face + hair, not neck/chest.
-    pad_x = int(fw * 0.20)
-    pad_y_top = int(fh * 0.50)
-    pad_y_bottom = int(fh * 0.20)  # Reduced from 0.30/0.60 to avoid collars
+    pad_x = safe_int(fw * 0.20)
+    pad_y_top = safe_int(fh * 0.50)
+    pad_y_bottom = safe_int(fh * 0.20)  # Reduced from 0.30/0.60 to avoid collars
 
     face_x1 = max(0, fx - pad_x)
     face_y1 = max(0, fy - pad_y_top)
@@ -1816,29 +1868,29 @@ def analyze_garment_attributes(
 
         ys, xs = np.where(fg_mask > 127)
         if len(ys) > 500 and len(xs) > 500:
-            ymin, ymax = int(np.min(ys)), int(np.max(ys))
-            xmin, xmax = int(np.min(xs)), int(np.max(xs))
+            ymin, ymax = safe_int(np.min(ys)), safe_int(np.max(ys))
+            xmin, xmax = safe_int(np.min(xs)), safe_int(np.max(xs))
             box_h = max(1, ymax - ymin)
             box_w = max(1, xmax - xmin)
-            aspect_ratio = float(box_h) / float(box_w)
-            vertical_coverage = float(box_h) / float(gh)
+            aspect_ratio = safe_float(box_h) / safe_float(box_w, 1.0)
+            vertical_coverage = safe_float(box_h) / safe_float(gh, 1.0)
 
             # Analyze sleeve width at shoulder/armpit (top 20% - 45% of garment height)
-            y_upper_start = ymin + int(box_h * 0.20)
-            y_upper_end = ymin + int(box_h * 0.45)
+            y_upper_start = ymin + safe_int(box_h * 0.20)
+            y_upper_end = ymin + safe_int(box_h * 0.45)
             upper_band = fg_mask[y_upper_start:y_upper_end, xmin:xmax]
             upper_widths = np.sum(upper_band > 127, axis=1)
             max_upper_w = np.max(upper_widths) if len(upper_widths) > 0 else box_w
 
             # Sleeveless garments (tank tops, tube tops, camis) have narrow width at sleeve height
-            if (max_upper_w / float(box_w) < 0.48) and not explicit_has_sleeves and not explicit_long_sleeve and not explicit_regular:
+            if (safe_float(max_upper_w) / safe_float(box_w, 1.0) < 0.48) and not explicit_has_sleeves and not explicit_long_sleeve and not explicit_regular:
                 has_sleeves_cv = False
 
             # Outer columns in the midsection (sleeves running down sides)
-            y_mid_start = ymin + int(box_h * 0.35)
-            y_mid_end = ymin + int(box_h * 0.75)
-            left_outer = fg_mask[y_mid_start:y_mid_end, xmin:xmin + int(box_w * 0.22)]
-            right_outer = fg_mask[y_mid_start:y_mid_end, xmax - int(box_w * 0.22):xmax]
+            y_mid_start = ymin + safe_int(box_h * 0.35)
+            y_mid_end = ymin + safe_int(box_h * 0.75)
+            left_outer = fg_mask[y_mid_start:y_mid_end, xmin:xmin + safe_int(box_w * 0.22)]
+            right_outer = fg_mask[y_mid_start:y_mid_end, xmax - safe_int(box_w * 0.22):xmax]
             outer_density = (np.mean(left_outer > 127) + np.mean(right_outer > 127)) / 2.0
             if outer_density > 0.20:
                 has_long_sleeves_cv = True
@@ -1914,7 +1966,7 @@ def _extract_hip_waist_y(
     lower_clothing_labels = {5, 6}
     lower_rows = np.where(np.isin(parse_768, list(lower_clothing_labels)).any(axis=1))[0]
     if len(lower_rows) > 0:
-        waist_y = int(lower_rows[0])
+        waist_y = safe_int(lower_rows[0])
 
     # 2. From OpenPose keypoints
     if keypoints is not None:
@@ -1926,14 +1978,14 @@ def _extract_hip_waist_y(
                     pt = keypoints.get(k)
                     if pt is not None:
                         if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                            py = float(pt[1])
+                            py = safe_float(pt[1])
                             if py <= 1.0:
                                 py *= target_h
                             elif py <= 512:
                                 py = py * (target_h / 512.0)
                             hips_found.append(py)
                         elif hasattr(pt, "y"):
-                            py = float(pt.y)
+                            py = safe_float(pt.y)
                             if py <= 1.0:
                                 py *= target_h
                             hips_found.append(py)
@@ -1944,9 +1996,9 @@ def _extract_hip_waist_y(
                     subset = keypoints["subset"]
                     if len(subset) > 0 and len(candidate) > 0:
                         for part_idx in (8, 11):  # 8=RHip, 11=LHip
-                            cand_idx = int(subset[0][part_idx])
+                            cand_idx = safe_int(subset[0][part_idx])
                             if 0 <= cand_idx < len(candidate):
-                                py = float(candidate[cand_idx][1])
+                                py = safe_float(candidate[cand_idx][1])
                                 if py <= 1.0:
                                     py *= target_h
                                 elif py <= 512:
@@ -1958,8 +2010,8 @@ def _extract_hip_waist_y(
                     pk = keypoints["pose_keypoints_2d"]
                     for part_idx in (8, 11):
                         offset = part_idx * 3
-                        if len(pk) > offset + 2 and pk[offset + 2] > 0.05:
-                            py = float(pk[offset + 1])
+                        if len(pk) > offset + 2 and safe_float(pk[offset + 2]) > 0.05:
+                            py = safe_float(pk[offset + 1])
                             if py <= 1.0:
                                 py *= target_h
                             elif py <= 512:
@@ -1967,7 +2019,7 @@ def _extract_hip_waist_y(
                             hips_found.append(py)
 
                 if hips_found:
-                    hip_y = int(np.mean(hips_found))
+                    hip_y = safe_int(np.mean(hips_found))
         except Exception as exc:
             logger.warning("extract_hip_waist_y_failed error=%s", exc)
 
@@ -2010,25 +2062,25 @@ def _render_openpose_pose_img(
             if len(subset) > 0:
                 sub = subset[0]
                 for i in range(min(18, len(sub))):
-                    cand_idx = int(sub[i])
+                    cand_idx = safe_int(sub[i])
                     if 0 <= cand_idx < len(candidate):
-                        px, py = float(candidate[cand_idx][0]), float(candidate[cand_idx][1])
+                        px, py = safe_float(candidate[cand_idx][0]), safe_float(candidate[cand_idx][1])
                         if px <= 1.0:
                             px *= w
                         if py <= 1.0:
                             py *= h
-                        points[i] = (int(px), int(py))
+                        points[i] = (safe_int(px), safe_int(py))
         elif "pose_keypoints_2d" in keypoints:
             pk = keypoints["pose_keypoints_2d"]
             for i in range(min(18, len(pk) // 3)):
-                conf = float(pk[i * 3 + 2])
+                conf = safe_float(pk[i * 3 + 2])
                 if conf > 0.05:
-                    px, py = float(pk[i * 3]), float(pk[i * 3 + 1])
+                    px, py = safe_float(pk[i * 3]), safe_float(pk[i * 3 + 1])
                     if px <= 1.0:
                         px *= w
                     if py <= 1.0:
                         py *= h
-                    points[i] = (int(px), int(py))
+                    points[i] = (safe_int(px), safe_int(py))
 
     # Draw limbs
     for i, (p1, p2) in enumerate(limb_seq):
@@ -2100,10 +2152,10 @@ def run_idm_vton_inference(
 
         if img_aspect > target_aspect:
             target_height = height
-            target_width = int(height * target_aspect)
+            target_width = safe_int(height * target_aspect)
         else:
             target_width = width
-            target_height = int(width / target_aspect)
+            target_height = safe_int(width / target_aspect)
 
         is_full_body = cloth_type in ("dresses", "lower_body", "full_body")
         if is_full_body:
@@ -2118,12 +2170,12 @@ def run_idm_vton_inference(
             # and fully replaced, avoiding crop boundary leakage during uncropping.
             top = max(0.0, (height - target_height) * 0.15)
             right = (width + target_width) / 2
-            bottom = min(float(height), top + target_height)
+            bottom = min(safe_float(height), top + target_height)
 
         left = max(0.0, left)
         top = max(0.0, top)
-        right = min(float(width), right)
-        bottom = min(float(height), bottom)
+        right = min(safe_float(width), safe_float(right))
+        bottom = min(safe_float(height), safe_float(bottom))
 
         cropped_img = human_img_orig.crop((left, top, right, bottom))
         crop_size = cropped_img.size
@@ -2135,10 +2187,10 @@ def run_idm_vton_inference(
 
         if img_aspect > target_aspect:
             new_w = TARGET_W
-            new_h = int(TARGET_W / img_aspect)
+            new_h = safe_int(TARGET_W / img_aspect)
         else:
             new_h = TARGET_H
-            new_w = int(TARGET_H * img_aspect)
+            new_w = safe_int(TARGET_H * img_aspect)
 
         resized = human_img_orig.resize((new_w, new_h), Image.LANCZOS)
         resized_np = np.array(resized, dtype=np.uint8)
@@ -2174,7 +2226,7 @@ def run_idm_vton_inference(
     automasker_mask, _ = get_mask_location_fn("hd", cloth_type, model_parse, keypoints)
     automasker_mask = automasker_mask.resize(TARGET_SIZE)
 
-    min_quality = float(os.environ.get("MASK_MIN_QUALITY_SCORE", "62.0"))
+    min_quality = safe_float(os.environ.get("MASK_MIN_QUALITY_SCORE"), default=62.0)
     strategy = select_worker_mask_strategy(
         external_mask,
         mask_quality_score,
@@ -2224,14 +2276,14 @@ def run_idm_vton_inference(
         # a smooth natural curve rather than a flat rectangular box.
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
-            _mask_top = int(_rows_with_mask[0])
+            _mask_top = safe_int(_rows_with_mask[0])
             _extend_up = max(0, _mask_top - 60)
             _top_band = mask_np[_mask_top:min(_mask_top + 15, TARGET_H), :]
             _col_sums = np.sum(_top_band > 127, axis=0)
             _nonzero_cols = np.where(_col_sums > 0)[0]
             if len(_nonzero_cols) > 0:
-                _left_bound = max(0, int(_nonzero_cols[0]) - 10)
-                _right_bound = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
+                _left_bound = max(0, safe_int(_nonzero_cols[0]) - 10)
+                _right_bound = min(TARGET_W, safe_int(_nonzero_cols[-1]) + 10)
                 _band_width = _right_bound - _left_bound
                 if _band_width > 0:
                     # Build parabolic waistband contour curve
@@ -2239,13 +2291,13 @@ def run_idm_vton_inference(
                     norm_x = (x_idx - _band_width / 2.0) / (_band_width / 2.0)
                     curve = (1.0 - 0.25 * (norm_x ** 2))  # dip slightly at edges
                     for col_i, col_x in enumerate(range(_left_bound, _right_bound)):
-                        curr_top = max(0, _mask_top - int(60 * curve[col_i]))
+                        curr_top = max(0, _mask_top - safe_int(60 * curve[col_i]))
                         mask_np[curr_top:_mask_top, col_x] = 255
 
         # Hard upper-body exclusion: protect everything well above waistband
         rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(rows_with_mask) > 0:
-            mask_top = int(rows_with_mask[0])
+            mask_top = safe_int(rows_with_mask[0])
             exclude_top = max(0, mask_top - 80)
             mask_np[:exclude_top, :] = 0
 
@@ -2284,22 +2336,22 @@ def run_idm_vton_inference(
 
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
-            _mask_bottom = int(_rows_with_mask[-1])
-            _target_bottom = min(TARGET_H, int(TARGET_H * 0.92))
+            _mask_bottom = safe_int(_rows_with_mask[-1])
+            _target_bottom = min(TARGET_H, safe_int(TARGET_H * 0.92))
             if _mask_bottom < _target_bottom:
                 for y in range(_mask_bottom, _target_bottom):
                     row_body = np.where(np.isin(parse_768[y, :], [4, 5, 6, 7, 8, 12, 13, 18]))[0]
                     if len(row_body) > 0:
-                        x_left = max(0, int(row_body[0]) - 12)
-                        x_right = min(TARGET_W, int(row_body[-1]) + 12)
+                        x_left = max(0, safe_int(row_body[0]) - 12)
+                        x_right = min(TARGET_W, safe_int(row_body[-1]) + 12)
                         mask_np[y, x_left:x_right] = 255
                     else:
                         _bottom_band = mask_np[max(0, _mask_bottom - 20):_mask_bottom, :]
                         _col_sums = np.sum(_bottom_band > 127, axis=0)
                         _nonzero_cols = np.where(_col_sums > 0)[0]
                         if len(_nonzero_cols) > 0:
-                            x_left = max(0, int(_nonzero_cols[0]) - 10)
-                            x_right = min(TARGET_W, int(_nonzero_cols[-1]) + 10)
+                            x_left = max(0, safe_int(_nonzero_cols[0]) - 10)
+                            x_right = min(TARGET_W, safe_int(_nonzero_cols[-1]) + 10)
                             mask_np[y, x_left:x_right] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
@@ -2350,10 +2402,10 @@ def run_idm_vton_inference(
             neck_zone = (parse_768 == 18).astype(np.uint8) * 255
             neck_rows = np.where(neck_zone.any(axis=1))[0]
             if len(neck_rows) > 0:
-                neck_top = int(neck_rows[0])
-                neck_bottom = int(neck_rows[-1])
+                neck_top = safe_int(neck_rows[0])
+                neck_bottom = safe_int(neck_rows[-1])
                 neck_height = neck_bottom - neck_top
-                collar_cut = neck_top + int(neck_height * 0.20)  # breathe up to top 20% of neck
+                collar_cut = neck_top + safe_int(neck_height * 0.20)  # breathe up to top 20% of neck
                 collar_inpaint_patch = np.zeros_like(neck_zone)
                 collar_inpaint_patch[collar_cut:, :] = neck_zone[collar_cut:, :]
                 mask_np = np.maximum(mask_np, collar_inpaint_patch)
@@ -2367,18 +2419,18 @@ def run_idm_vton_inference(
         hip_y, waist_y = _extract_hip_waist_y(keypoints, parse_768, TARGET_H, TARGET_W)
         _rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(_rows_with_mask) > 0:
-            _mask_bottom = int(_rows_with_mask[-1])
+            _mask_bottom = safe_int(_rows_with_mask[-1])
 
             if garm_attrs.get("is_long_garment", False):
                 # Long Kurta / Kurti / Tunic / Long Shirt / Dress:
                 # Extend down over bare midriff, navel, and hips down to mid-thigh line
                 if hip_y is not None:
-                    _target_bottom = min(TARGET_H, hip_y + int(TARGET_H * 0.18))
+                    _target_bottom = min(TARGET_H, hip_y + safe_int(TARGET_H * 0.18))
                 elif waist_y is not None:
-                    _target_bottom = min(TARGET_H, waist_y + int(TARGET_H * 0.25))
+                    _target_bottom = min(TARGET_H, waist_y + safe_int(TARGET_H * 0.25))
                 else:
-                    _target_bottom = min(TARGET_H, max(_mask_bottom + 300, int(TARGET_H * 0.72)))
-                _target_bottom = max(_target_bottom, int(TARGET_H * 0.68))
+                    _target_bottom = min(TARGET_H, max(_mask_bottom + 300, safe_int(TARGET_H * 0.72)))
+                _target_bottom = max(_target_bottom, safe_int(TARGET_H * 0.68))
                 logger.info("mask_extended_for_long_garment target_bottom=%d hip_y=%s waist_y=%s", _target_bottom, hip_y, waist_y)
 
             elif not garm_attrs.get("is_crop_top", False):
@@ -2405,16 +2457,16 @@ def run_idm_vton_inference(
                     # Check torso / lower clothing / body pixels at row y in parse_768
                     row_body = np.where(np.isin(parse_768[y, :], [4, 5, 6, 7, 8, 12, 13, 18]))[0]
                     if len(row_body) > 0:
-                        x_left = max(0, int(row_body[0]) - 10)
-                        x_right = min(TARGET_W, int(row_body[-1]) + 10)
+                        x_left = max(0, safe_int(row_body[0]) - 10)
+                        x_right = min(TARGET_W, safe_int(row_body[-1]) + 10)
                         mask_np[y, x_left:x_right] = 255
                     else:
                         _bottom_band = mask_np[max(0, _mask_bottom - 20):_mask_bottom, :]
                         _col_sums = np.sum(_bottom_band > 127, axis=0)
                         _nonzero_cols = np.where(_col_sums > 0)[0]
                         if len(_nonzero_cols) > 0:
-                            x_left = max(0, int(_nonzero_cols[0]) - 15)
-                            x_right = min(TARGET_W, int(_nonzero_cols[-1]) + 15)
+                            x_left = max(0, safe_int(_nonzero_cols[0]) - 15)
+                            x_right = min(TARGET_W, safe_int(_nonzero_cols[-1]) + 15)
                             mask_np[y, x_left:x_right] = 255
 
         mask = Image.fromarray(mask_np, mode="L")
@@ -2484,8 +2536,8 @@ def run_idm_vton_inference(
         logger.info("densepose_computed_at_half_res elapsed_ms=%.1f", (time.perf_counter() - t_dense_0) * 1000)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
-    effective_guidance = max(2.2, min(2.4, float(effective_guidance)))
-    effective_steps = min(steps, 15) if steps >= 15 else steps
+    effective_guidance = max(2.2, min(2.4, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
+    effective_steps = min(safe_int(steps, default=DENOISE_STEPS), 15)
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype) + (
@@ -2596,23 +2648,23 @@ def run_idm_vton_inference(
         alpha = np.ones((crop_h, crop_w), dtype=np.float32)
 
         # Top edge fade (only if crop doesn't start at image top)
-        if int(top) > 0:
+        if safe_int(top) > 0:
             ramp = np.linspace(0.0, 1.0, top_feather)
             alpha[:top_feather, :] *= ramp[:, np.newaxis]
 
         # Bottom edge fade (only if not at image bottom)
-        orig_bottom = int(top) + crop_h
+        orig_bottom = safe_int(top) + crop_h
         if orig_bottom < height:
             ramp = np.linspace(1.0, 0.0, feather_px)
             alpha[-feather_px:, :] *= ramp[:, np.newaxis]
 
         # Left edge fade (only if not at image left)
-        if int(left) > 0:
+        if safe_int(left) > 0:
             ramp = np.linspace(0.0, 1.0, feather_px)
             alpha[:, :feather_px] *= ramp[np.newaxis, :]
 
         # Right edge fade (only if not at image right)
-        orig_right = int(left) + crop_w
+        orig_right = safe_int(left) + crop_w
         if orig_right < width:
             ramp = np.linspace(1.0, 0.0, feather_px)
             alpha[:, -feather_px:] *= ramp[np.newaxis, :]
@@ -2620,12 +2672,12 @@ def run_idm_vton_inference(
         # Alpha composite: output * alpha + original * (1 - alpha)
         out_np = np.array(out_img.convert("RGB"), dtype=np.float32)
         orig_crop = np.array(
-            human_img_orig.crop((int(left), int(top), orig_right, orig_bottom))
+            human_img_orig.crop((safe_int(left), safe_int(top), orig_right, orig_bottom))
             .resize((crop_w, crop_h)),
             dtype=np.float32,
         )
         blended = (out_np * alpha[..., np.newaxis] + orig_crop * (1.0 - alpha[..., np.newaxis])).astype(np.uint8)
-        final_img.paste(Image.fromarray(blended), (int(left), int(top)))
+        final_img.paste(Image.fromarray(blended), (safe_int(left), safe_int(top)))
 
         # ── Face identity restoration ──────────────────────────────────
         # The IDM-VTON model with strength=1.0 denoises the ENTIRE image,
@@ -2636,7 +2688,7 @@ def run_idm_vton_inference(
         if cloth_type in ("upper_body", "dresses", "full_body", "lower_body"):
             final_img = _restore_person_identity(
                 final_img, human_img_orig, cloth_type,
-                crop_top=int(top),
+                crop_top=safe_int(top),
                 parsing_map=parse_768,
                 inpaint_mask=mask,
                 has_collar=garm_attrs.get("has_collar_or_high_neck", False),
@@ -2702,14 +2754,11 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     cloth_type = job_input.get("cloth_type", "upper_body")
     mask_url = job_input.get("mask_image_url") or job_input.get("mask_url") or ""
     mask_quality_raw = job_input.get("mask_quality_score")
-    try:
-        mask_quality_score = (
-            float(mask_quality_raw)
-            if mask_quality_raw is not None and mask_quality_raw != ""
-            else None
-        )
-    except (TypeError, ValueError):
-        mask_quality_score = None
+    mask_quality_score = (
+        safe_float(mask_quality_raw, default=None)
+        if mask_quality_raw is not None and mask_quality_raw != ""
+        else None
+    )
 
     _LOWER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
         "jeans": ["jeans", "denim"],
@@ -2768,28 +2817,21 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "long_kurta": ["long kurta"],
     }
 
-    steps = int(job_input.get("steps", DENOISE_STEPS))
-    steps = min(steps, 15)  # Cap steps at 14-15 for ~10-12s inference
-    seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
+    steps = min(safe_int(job_input.get("steps"), default=DENOISE_STEPS), 15)  # Cap steps at 14-15 for ~10-12s inference
+    seed = safe_int(job_input.get("seed"), default=random.randint(0, 2**31 - 1))
     trace_id = job_input.get("trace_id", "")
 
     # Guidance Scale: precisely in 2.2 - 2.4 range to preserve thin pinstripes
     # and crisp button details without color pooling.
     user_guidance = job_input.get("guidance_scale")
-    if user_guidance is not None:
-        try:
-            req_guidance = float(user_guidance)
-        except (ValueError, TypeError):
-            req_guidance = GUIDANCE_SCALE
-    else:
-        req_guidance = GUIDANCE_SCALE
+    req_guidance = safe_float(user_guidance, default=GUIDANCE_SCALE) if user_guidance is not None else GUIDANCE_SCALE
     effective_guidance = max(2.2, min(2.4, req_guidance))
 
     # Allow dynamic request-level IP-Adapter scale adjustment (default: 0.55)
     req_ip_scale = job_input.get("ip_adapter_scale")
     if req_ip_scale is not None:
         try:
-            req_ip_val = max(0.4, min(0.8, float(req_ip_scale)))
+            req_ip_val = max(0.4, min(0.8, safe_float(req_ip_scale, default=IP_ADAPTER_SCALE)))
             if pipe is not None and hasattr(pipe, "set_ip_adapter_scale"):
                 pipe.set_ip_adapter_scale(req_ip_val)
                 logger.info("request_ip_adapter_scale_set value=%.2f", req_ip_val)
@@ -2869,7 +2911,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # ── Garment RGB diagnostics ──
     garm_np = np.array(garment_img.convert("RGB"), dtype=np.float32)
-    garm_mean_all = float(np.mean(garm_np))
+    garm_mean_all = safe_float(np.mean(garm_np), default=128.0)
     logger.info(
         "garment_rgb_stats mean_all=%.1f is_dark=%s",
         garm_mean_all, garm_mean_all < 80.0,
@@ -2881,7 +2923,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # (lost texture, turned gray). Dark garments need FULL guidance so the
     # model actually applies the (low-luminance) garment color/texture.
     # Guidance scale in 2.2 - 2.4 sweet spot prevents muddy color pooling
-    effective_guidance = max(2.2, min(2.4, float(effective_guidance)))
+    effective_guidance = max(2.2, min(2.4, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
