@@ -110,13 +110,13 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-# Inference Steps: 18 steps on DPM++ 2M Karras produces pristine photorealistic fabric
-# texture, weave details, and seam sharpness while keeping GPU time ~7s (under 15s total latency).
-DENOISE_STEPS = safe_int(os.environ.get("IDM_VTON_STEPS"), default=18)
+# Inference Steps: Locked at 16 steps on DPM++ 2M Karras for consistent 12-15s latency
+# while producing pristine photorealistic fabric texture, weave details, and seam sharpness.
+DENOISE_STEPS = safe_int(os.environ.get("IDM_VTON_STEPS"), default=16)
 
-# Guidance Scale: 2.2 - 2.4 optimal balance with DPM++ 2M Karras or Euler Ancestral.
-# Eliminates global color pooling and oversaturation while rendering crisp weave and seams.
-GUIDANCE_SCALE = safe_float(os.environ.get("IDM_VTON_GUIDANCE"), default=2.3)
+# Guidance Scale: 2.5 - 2.8 with DPMSolverMultistepScheduler (use_karras_sigmas=True).
+# Forces SDXL out of the soft watercolor regime into sharp, high-contrast fabric rendering.
+GUIDANCE_SCALE = safe_float(os.environ.get("IDM_VTON_GUIDANCE"), default=2.6)
 
 # Garment IP-Adapter scale: Restored to 1.0.
 # Full IP-Adapter scale ensures accurate CLIP vision feature transfer (exact color RGB,
@@ -244,7 +244,16 @@ def _configure_cloudinary() -> bool:
 
 def _upload_to_cloudinary(image: Image.Image, job_id: str) -> str:
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
+    # High-quality progressive WebP (q=92) or progressive JPEG (q=95) directly from memory.
+    # Eliminates slow multi-second PNG CPU compression and large file transfer latency.
+    try:
+        image.save(buffer, format="WEBP", quality=92, method=2)
+        fmt = "webp"
+    except Exception as enc_err:
+        logger.warning("webp_encoding_failed error=%s falling back to progressive jpeg", enc_err)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95, progressive=True, optimize=True)
+        fmt = "jpg"
     buffer.seek(0)
 
     last_error: Exception | None = None
@@ -255,10 +264,11 @@ def _upload_to_cloudinary(image: Image.Image, job_id: str) -> str:
                 folder=CLOUDINARY_FOLDER,
                 public_id=f"result_{job_id}",
                 resource_type="image",
+                format=fmt,
                 overwrite=True,  # Must be True so retried jobs upload fresh results
             )
             url = str(result["secure_url"])
-            logger.info("cloudinary_upload_complete result_url=%s", url)
+            logger.info("cloudinary_upload_complete format=%s result_url=%s", fmt, url)
             return url
         except Exception as exc:
             last_error = exc
@@ -1488,6 +1498,7 @@ def _build_source_specific_negative(source_cloth_type: str = "", target_subtype:
     — those are handled by the positive prompt's preservation instructions.
     """
     return (
+        "watercolor, oil painting, washed out, low contrast, soft pastel, blurry fabric, airbrushed, smudged, "
         "monochrome, lowres, bad anatomy, worst quality, low quality, "
         "deformed, distorted, disfigured, bad proportions, "
         "extra limbs, missing limbs, cloned head, body out of frame, "
@@ -2599,8 +2610,8 @@ def run_idm_vton_inference(
     logger.info("densepose_computed_at_half_res elapsed_ms=%.1f", (time.perf_counter() - t_dense_0) * 1000)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
-    effective_guidance = max(2.0, min(2.5, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
-    effective_steps = max(14, min(safe_int(steps, default=DENOISE_STEPS), 25))
+    effective_guidance = max(2.5, min(2.8, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
+    effective_steps = 16  # Locked at 16 steps (DPM++ 2M Karras) for consistent 12-15s latency
 
     # Enrich description with extracted dominant color and embroidery cues to eliminate color hallucination
     color_info = garm_attrs.get("color_info", {})
@@ -2628,7 +2639,8 @@ def run_idm_vton_inference(
         )
         if cloth_type == "lower_body":
             negative_prompt = _build_source_specific_negative() + (
-                ", changed shirt, new shirt, different top, altered torso, "
+                ", watercolor, oil painting, washed out, low contrast, soft pastel, blurry fabric, airbrushed, smudged, "
+                "changed shirt, new shirt, different top, altered torso, "
                 "regenerated upper body, different arms, moved hands, "
                 "changed shoulders, modified chest, new upper garment, "
                 "generic pants, plain pants, lost pockets, missing seams, "
@@ -2638,7 +2650,8 @@ def run_idm_vton_inference(
             )
         else:
             negative_prompt = _build_source_specific_negative() + (
-                ", changed garment category, wrong outfit type, "
+                ", watercolor, oil painting, washed out, low contrast, soft pastel, blurry fabric, airbrushed, smudged, "
+                "changed garment category, wrong outfit type, "
                 "mini dress, different silhouette, wrong length, "
                 "missing sleeves, changed sleeve style, wrong neckline, "
                 "different face, new face, changed facial features, "
@@ -2655,7 +2668,8 @@ def run_idm_vton_inference(
             "realistic thread texture, soft realistic contact shadows"
         )
         negative_prompt = _build_source_specific_negative() + (
-            ", flat fabric, painted texture, lost stitching, "
+            ", watercolor, oil painting, washed out, low contrast, soft pastel, blurry fabric, airbrushed, smudged, "
+            "flat fabric, painted texture, lost stitching, "
             "smooth cloth, no folds, plastic surface, airbrushed fabric, "
             "dirty grey texture, muddy brown pattern, dark carpet pattern"
         )
@@ -2786,9 +2800,9 @@ def run_idm_vton_inference(
             final_img = enhance_fabric_texture(
                 final_img,
                 garment_mask=mask,
-                sharpen_amount=0.45,
-                sharpen_radius=1.0,
-                detail_boost=0.25,
+                amount=0.6,
+                radius=1.0,
+                threshold=2.0,
             )
             logger.info("fabric_texture_enhanced=True")
         except Exception as exc:
@@ -2803,9 +2817,9 @@ def run_idm_vton_inference(
         raw_result = enhance_fabric_texture(
             raw_result,
             garment_mask=mask,
-            sharpen_amount=0.45,
-            sharpen_radius=1.0,
-            detail_boost=0.25,
+            amount=0.6,
+            radius=1.0,
+            threshold=2.0,
         )
         logger.info("fabric_texture_enhanced_no_crop=True")
     except Exception as exc:
@@ -2900,14 +2914,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "long_kurta": ["long kurta"],
     }
 
-    steps = max(14, min(safe_int(job_input.get("steps"), default=DENOISE_STEPS), 25))
+    steps = 16  # Locked at 16 steps (DPM++ 2M Karras) for consistent 12-15s latency
     seed = safe_int(job_input.get("seed"), default=random.randint(0, 2**31 - 1))
     trace_id = job_input.get("trace_id", "")
 
-    # Guidance Scale: strictly in 2.2 - 2.5 range for fabric saturation and texture sharpness
+    # Guidance Scale: 2.5 - 2.8 with DPMSolverMultistepScheduler (use_karras_sigmas=True)
+    # Forces SDXL out of soft watercolor regime into sharp, high-contrast fabric rendering
     user_guidance = job_input.get("guidance_scale")
     req_guidance = safe_float(user_guidance, default=GUIDANCE_SCALE) if user_guidance is not None else GUIDANCE_SCALE
-    effective_guidance = max(2.0, min(2.5, req_guidance))
+    effective_guidance = max(2.5, min(2.8, req_guidance))
 
     # Dynamic request-level IP-Adapter scale adjustment (default: 1.0)
     req_ip_scale = job_input.get("ip_adapter_scale")
@@ -3004,8 +3019,8 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # weakened garment conditioning and washed out black/dark garments
     # (lost texture, turned gray). Dark garments need FULL guidance so the
     # model actually applies the (low-luminance) garment color/texture.
-    # Guidance scale in 2.2 - 2.5 sweet spot prevents muddy color pooling while maintaining crisp seams
-    effective_guidance = max(2.0, min(2.5, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
+    # Guidance scale in 2.5 - 2.8 range forces sharp photographic fabric rendering
+    effective_guidance = max(2.5, min(2.8, safe_float(effective_guidance, default=GUIDANCE_SCALE)))
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
