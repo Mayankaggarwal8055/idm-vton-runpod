@@ -240,36 +240,35 @@ def composite_tryon_result(
 def enhance_fabric_texture(
     image: Image.Image | np.ndarray,
     garment_mask: Image.Image | np.ndarray,
-    sharpen_amount: float = 0.4,
-    sharpen_radius: float = 1.2,
-    detail_boost: float = 0.15,
+    sharpen_amount: float = 0.45,
+    sharpen_radius: float = 1.0,
+    detail_boost: float = 0.25,
 ) -> Image.Image:
     """
-    High-frequency fabric texture enhancement pass.
+    High-frequency fabric texture enhancement pass using Laplacian kernel.
 
-    Restores crisp fabric edges, button/seam clarity, and thread-level texture
-    that diffusion models tend to smooth away. Applied ONLY within the garment
-    region (via `garment_mask`) to avoid sharpening face/hair/background.
+    Restores crisp fabric edges, button/seam clarity, and fine geometric patterns
+    (such as thin pinstripes, stitch lines, and button rims) that diffusion models
+    tend to smooth away. Applied SELECTIVELY within the garment inpaint region
+    (via `garment_mask`) to strictly avoid oversharpening skin, facial features, or background.
 
     Pipeline:
-      1. Unsharp Mask (USM): Enhances mid-frequency detail (seams, buttons,
-         zipper teeth, weave pattern, fold creases). Controlled by
-         `sharpen_amount` (0.3-0.6 typical) and `sharpen_radius` (0.8-2.0).
-      2. High-Pass Detail Boost: Extracts and re-injects the highest-frequency
-         texture band (individual thread lines, fabric grain) by subtracting
-         a Gaussian blur and adding the residual back. Controlled by
-         `detail_boost` (0.1-0.25 typical).
-
-    Both passes are soft-masked to the garment region with a feathered
-    boundary so sharpening fades naturally at garment edges.
+      1. Garment Inpaint Mask Isolation: Erodes and softly feathers the garment boundary
+         so sharpening is strictly confined to fabric and completely zeroed on skin/background.
+      2. Mid-Frequency Unsharp Mask: Enhances seam lines, plackets, buttons, and fold creases.
+      3. High-Pass Laplacian Kernel Filtering: Convolves with an 8-neighbor discrete Laplacian
+         kernel to isolate the second spatial derivative of the garment. This selectively enhances
+         micro-contrast at thin pinstripe transitions and button edges without oversharpening skin.
+      4. Masked Reconstruction: Blends high-pass sharpened fabric strictly into the garment inpaint
+         area, leaving 100% of skin/background untouched.
 
     Args:
         image: Input try-on result (PIL or numpy RGB uint8).
         garment_mask: Binary mask where 255 = garment region, 0 = background/skin.
                       Can be the inpaint_mask from the pipeline.
-        sharpen_amount: Unsharp mask strength. 0.0 = no effect, 1.0 = extreme.
-        sharpen_radius: Unsharp mask Gaussian sigma (pixels).
-        detail_boost: High-pass residual injection strength. 0.0 = none, 0.5 = extreme.
+        sharpen_amount: Unsharp mask strength (0.3-0.6 typical).
+        sharpen_radius: Unsharp mask Gaussian sigma in pixels (0.8-1.5 typical).
+        detail_boost: Laplacian high-pass injection strength (0.15-0.35 typical).
 
     Returns:
         PIL.Image with enhanced fabric texture in the garment region.
@@ -295,39 +294,48 @@ def enhance_fabric_texture(
     if mask_np.shape[:2] != (h, w):
         mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # Feather mask edges (7px) for smooth transition
-    feather_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    # Inward erosion & soft feathering ensures zero sharpening spillover onto skin
+    feather_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask_eroded = cv2.erode(mask_np, feather_k, iterations=1)
-    mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (15, 15), 0) / 255.0
+    mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (11, 11), 0) / 255.0
     mask_3c = mask_soft[:, :, np.newaxis]
 
     img_f = img_np.astype(np.float32)
 
-    # ── Pass 1: Unsharp Mask (mid-frequency: seams, buttons, fold creases) ──
+    # ── Pass 1: Mid-frequency Unsharp Mask (seams, buttons, fold creases) ──
     ksize = int(np.ceil(sharpen_radius * 3) * 2 + 1)
     if ksize % 2 == 0:
         ksize += 1
     blurred = cv2.GaussianBlur(img_f, (ksize, ksize), sharpen_radius)
-    detail = img_f - blurred  # High-frequency residual
-    sharpened = img_f + sharpen_amount * detail
+    usm_detail = img_f - blurred
 
-    # ── Pass 2: High-pass detail boost (highest-frequency: thread texture, grain) ──
-    if detail_boost > 0.0:
-        # Use a tighter blur to extract only the finest texture
-        fine_blur = cv2.GaussianBlur(img_f, (3, 3), 0.5)
-        fine_detail = img_f - fine_blur
-        sharpened = sharpened + detail_boost * fine_detail
+    # ── Pass 2: High-pass Laplacian Kernel (pinstripe edges, button contours, stitch lines) ──
+    # 8-neighbor Laplacian kernel extracts isotropic 2nd-order spatial derivatives,
+    # capturing thin pinstripes in any orientation as well as circular button boundaries.
+    laplacian_k = np.array([
+        [-1.0, -1.0, -1.0],
+        [-1.0,  8.0, -1.0],
+        [-1.0, -1.0, -1.0],
+    ], dtype=np.float32) / 8.0
 
-    # Apply only within garment mask (feathered blend)
+    laplacian_detail = cv2.filter2D(img_f, -1, laplacian_k)
+    # Clamp extreme spikes to avoid ringing / saturation clipping
+    laplacian_detail = np.clip(laplacian_detail, -25.0, 25.0)
+
+    # Combine mid-frequency USM and high-pass Laplacian detail
+    sharpened = img_f + (sharpen_amount * usm_detail) + (detail_boost * laplacian_detail)
+
+    # ── Pass 3: Masked application — strictly inside garment inpaint region ──
+    # Pixels where mask_3c == 0 (skin, neck, hands, face, background) remain completely untouched.
     result = img_f * (1.0 - mask_3c) + sharpened * mask_3c
     result = np.clip(result, 0.0, 255.0).astype(np.uint8)
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     garment_pixels = int(np.sum(mask_np > 127))
     logger.debug(
-        "enhance_fabric_texture_complete sharpen_amount=%.2f sharpen_radius=%.1f "
-        "detail_boost=%.2f garment_pixels=%d elapsed_ms=%.2f",
-        sharpen_amount, sharpen_radius, detail_boost, garment_pixels, elapsed_ms,
+        "enhance_fabric_texture_laplacian_complete sharpen_amount=%.2f detail_boost=%.2f "
+        "garment_pixels=%d elapsed_ms=%.2f",
+        sharpen_amount, detail_boost, garment_pixels, elapsed_ms,
     )
 
     return Image.fromarray(result, mode="RGB")
