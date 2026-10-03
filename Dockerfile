@@ -284,11 +284,37 @@ except Exception as exc:
     raise RuntimeError(f"Failed to import mask_pipeline: {exc}") from exc
 
 print("Mask pipeline validation passed")
+
+# Also validate postprocess.py
+try:
+    from postprocess import (
+        laplacian_pyramid_blend,
+        composite_tryon_result,
+        enhance_fabric_texture,
+    )
+    print("import postprocess OK")
+    print(f"  laplacian_pyramid_blend: {callable(laplacian_pyramid_blend)}")
+    print(f"  composite_tryon_result: {callable(composite_tryon_result)}")
+    print(f"  enhance_fabric_texture: {callable(enhance_fabric_texture)}")
+except Exception as exc:
+    raise RuntimeError(f"Failed to import postprocess: {exc}") from exc
+
+print("All worker module validation passed")
 PY
 
 # =============================================================================
 # Runtime
 # =============================================================================
+# RunPod Serverless Template Configuration (set these in the RunPod dashboard):
+#   minWorkers: 1           # Always keep 1 worker warm to avoid cold starts
+#   idleTimeout: 300        # Keep worker alive for 5 min after last request
+#   maxWorkers: 3           # Scale up to 3 workers under load
+#   gpuType: "NVIDIA A40"   # or "NVIDIA A100" for best throughput
+#
+# All model weights (SDXL UNet, GarmentNet, VAE, CLIP, SCHP, DensePose, OpenPose)
+# are pre-downloaded during docker build (Layers 4-5). The container boots with
+# ZERO external network downloads. A CUDA warm-up dummy pass runs during startup
+# to pre-allocate GPU contexts, eliminating first-request latency.
 
 WORKDIR $IDM_VTON_DIR
 

@@ -235,3 +235,99 @@ def composite_tryon_result(
     final_out = np.where(inpaint_3c == 255, gen_np, final_out)
     
     return Image.fromarray(final_out, mode="RGB")
+
+
+def enhance_fabric_texture(
+    image: Image.Image | np.ndarray,
+    garment_mask: Image.Image | np.ndarray,
+    sharpen_amount: float = 0.4,
+    sharpen_radius: float = 1.2,
+    detail_boost: float = 0.15,
+) -> Image.Image:
+    """
+    High-frequency fabric texture enhancement pass.
+
+    Restores crisp fabric edges, button/seam clarity, and thread-level texture
+    that diffusion models tend to smooth away. Applied ONLY within the garment
+    region (via `garment_mask`) to avoid sharpening face/hair/background.
+
+    Pipeline:
+      1. Unsharp Mask (USM): Enhances mid-frequency detail (seams, buttons,
+         zipper teeth, weave pattern, fold creases). Controlled by
+         `sharpen_amount` (0.3-0.6 typical) and `sharpen_radius` (0.8-2.0).
+      2. High-Pass Detail Boost: Extracts and re-injects the highest-frequency
+         texture band (individual thread lines, fabric grain) by subtracting
+         a Gaussian blur and adding the residual back. Controlled by
+         `detail_boost` (0.1-0.25 typical).
+
+    Both passes are soft-masked to the garment region with a feathered
+    boundary so sharpening fades naturally at garment edges.
+
+    Args:
+        image: Input try-on result (PIL or numpy RGB uint8).
+        garment_mask: Binary mask where 255 = garment region, 0 = background/skin.
+                      Can be the inpaint_mask from the pipeline.
+        sharpen_amount: Unsharp mask strength. 0.0 = no effect, 1.0 = extreme.
+        sharpen_radius: Unsharp mask Gaussian sigma (pixels).
+        detail_boost: High-pass residual injection strength. 0.0 = none, 0.5 = extreme.
+
+    Returns:
+        PIL.Image with enhanced fabric texture in the garment region.
+    """
+    t0 = time.perf_counter()
+
+    # Normalize inputs
+    if isinstance(image, Image.Image):
+        img_np = np.array(image.convert("RGB"), dtype=np.uint8)
+    else:
+        img_np = image.copy()
+
+    if isinstance(garment_mask, Image.Image):
+        mask_np = np.array(garment_mask.convert("L"), dtype=np.uint8)
+    else:
+        mask_np = garment_mask.copy()
+        if len(mask_np.shape) == 3:
+            mask_np = mask_np[:, :, 0]
+
+    h, w = img_np.shape[:2]
+
+    # Resize mask if needed
+    if mask_np.shape[:2] != (h, w):
+        mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Feather mask edges (7px) for smooth transition
+    feather_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_eroded = cv2.erode(mask_np, feather_k, iterations=1)
+    mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (15, 15), 0) / 255.0
+    mask_3c = mask_soft[:, :, np.newaxis]
+
+    img_f = img_np.astype(np.float32)
+
+    # ── Pass 1: Unsharp Mask (mid-frequency: seams, buttons, fold creases) ──
+    ksize = int(np.ceil(sharpen_radius * 3) * 2 + 1)
+    if ksize % 2 == 0:
+        ksize += 1
+    blurred = cv2.GaussianBlur(img_f, (ksize, ksize), sharpen_radius)
+    detail = img_f - blurred  # High-frequency residual
+    sharpened = img_f + sharpen_amount * detail
+
+    # ── Pass 2: High-pass detail boost (highest-frequency: thread texture, grain) ──
+    if detail_boost > 0.0:
+        # Use a tighter blur to extract only the finest texture
+        fine_blur = cv2.GaussianBlur(img_f, (3, 3), 0.5)
+        fine_detail = img_f - fine_blur
+        sharpened = sharpened + detail_boost * fine_detail
+
+    # Apply only within garment mask (feathered blend)
+    result = img_f * (1.0 - mask_3c) + sharpened * mask_3c
+    result = np.clip(result, 0.0, 255.0).astype(np.uint8)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    garment_pixels = int(np.sum(mask_np > 127))
+    logger.debug(
+        "enhance_fabric_texture_complete sharpen_amount=%.2f sharpen_radius=%.1f "
+        "detail_boost=%.2f garment_pixels=%d elapsed_ms=%.2f",
+        sharpen_amount, sharpen_radius, detail_boost, garment_pixels, elapsed_ms,
+    )
+
+    return Image.fromarray(result, mode="RGB")

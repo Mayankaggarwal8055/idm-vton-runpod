@@ -57,8 +57,8 @@ DENSEPOSE_WEIGHTS = os.environ.get(
 
 CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
-DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "16"))
-GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "1.9"))
+DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "20"))
+GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.5"))
 # Garment IP-Adapter scale. IDM-VTON drives garment APPEARANCE (texture, grain,
 # seams, pockets, weaves) primarily through the IP-Adapter image. The library
 # default (~0.5) under-conditions this, so fabric is smoothed into an
@@ -577,6 +577,85 @@ def load_models():
 # Warmup
 # =============================================================================
 
+def _cuda_warmup_pass():
+    """
+    Run a single 1-step dummy forward pass through the full pipeline so CUDA
+    contexts, cuDNN autotuner caches, and GPU memory pools are pre-allocated
+    during container startup — NOT during the user's first request.
+
+    Without this, the first real inference triggers:
+      - CUDA context initialization (~2-4s)
+      - cuDNN algorithm selection (~3-8s per unique tensor shape)
+      - PyTorch memory allocator warm-up (~1-3s)
+    Total: 6-15s of hidden latency on the first request.
+    """
+    if pipe is None or not torch.cuda.is_available():
+        logger.info("cuda_warmup_skipped pipe=%s cuda=%s", pipe is not None, torch.cuda.is_available())
+        return
+
+    warmup_start = time.perf_counter()
+    logger.info("cuda_warmup_pass_begin (1-step dummy inference)")
+
+    try:
+        # Create minimal dummy inputs at TARGET_SIZE
+        dummy_person = Image.new("RGB", TARGET_SIZE, (128, 128, 128))
+        dummy_garment = Image.new("RGB", TARGET_SIZE, (200, 200, 200))
+        dummy_mask = Image.new("L", TARGET_SIZE, 255)
+        dummy_pose = Image.new("RGB", TARGET_SIZE, (64, 64, 64))
+
+        pose_tensor = tensor_transform(dummy_pose).unsqueeze(0).to(DEVICE, TORCH_DTYPE)
+        garm_tensor = tensor_transform(dummy_garment).unsqueeze(0).to(DEVICE, TORCH_DTYPE)
+
+        with torch.inference_mode():
+            with torch.cuda.amp.autocast(dtype=TORCH_DTYPE):
+                # Encode a minimal prompt
+                prompt_embeds, neg_embeds, pooled_embeds, neg_pooled = pipe.encode_prompt(
+                    "warmup garment",
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                    negative_prompt="low quality",
+                )
+                prompt_embeds_c, _, _, _ = pipe.encode_prompt(
+                    "warmup garment",
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                    negative_prompt="low quality",
+                )
+
+                # Single-step forward pass to trigger all CUDA allocations
+                _ = pipe(
+                    prompt_embeds=prompt_embeds.to(DEVICE, TORCH_DTYPE),
+                    negative_prompt_embeds=neg_embeds.to(DEVICE, TORCH_DTYPE),
+                    pooled_prompt_embeds=pooled_embeds.to(DEVICE, TORCH_DTYPE),
+                    negative_pooled_prompt_embeds=neg_pooled.to(DEVICE, TORCH_DTYPE),
+                    num_inference_steps=1,
+                    generator=torch.Generator(DEVICE).manual_seed(0),
+                    strength=1.0,
+                    pose_img=pose_tensor,
+                    text_embeds_cloth=prompt_embeds_c.to(DEVICE, TORCH_DTYPE),
+                    cloth=garm_tensor,
+                    mask_image=dummy_mask,
+                    image=dummy_person,
+                    height=TARGET_H,
+                    width=TARGET_W,
+                    ip_adapter_image=dummy_garment,
+                    guidance_scale=2.5,
+                )
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        warmup_ms = (time.perf_counter() - warmup_start) * 1000
+        logger.info("cuda_warmup_pass_complete elapsed_ms=%.0f", warmup_ms)
+
+    except Exception as exc:
+        warmup_ms = (time.perf_counter() - warmup_start) * 1000
+        logger.warning("cuda_warmup_pass_failed elapsed_ms=%.0f error=%s", warmup_ms, exc)
+        # Non-fatal: first real request will just be slightly slower
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def warmup():
     global _REUSE_COUNT
     if _WARM.is_set():
@@ -588,12 +667,10 @@ def warmup():
 
     load_models()
 
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        logger.info("gpu_warmup_ready=True")
-    except Exception as exc:
-        logger.warning("gpu_warmup_skipped error=%s", exc)
+    # ── CUDA Warm-Up: 1-step dummy forward pass ────────────────────────
+    # Pre-allocates CUDA contexts, cuDNN autotuner caches, and memory pools
+    # so the user's first request doesn't pay a 6-15s hidden latency tax.
+    _cuda_warmup_pass()
 
     cloudinary_ok = _configure_cloudinary()
 
@@ -1346,6 +1423,9 @@ def _build_source_specific_negative(source_cloth_type: str = "", target_subtype:
         "ugly, blurry, watermark, signature, text, logo, "
         "smooth plastic, airbrushed, cg render, 3d render, "
         "flat lighting, "
+        "flat, painted, plastic, cartoon, oversaturated, "
+        "smudged cloth, 2d vector, no texture, wax skin, "
+        "soft focus, gaussian blur, posterized, cel shaded, "
         "changed body shape, different body proportions, "
         "female body on male, male body on female, "
         "changed shoulder width, different chest size, altered waist, "
@@ -2292,8 +2372,8 @@ def run_idm_vton_inference(
     pose_img = Image.fromarray(pose_img).resize(TARGET_SIZE)
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
-    effective_guidance = max(1.8, min(2.0, float(effective_guidance)))
-    effective_steps = min(steps, 16) if steps >= 16 else steps
+    effective_guidance = max(2.0, min(3.0, float(effective_guidance)))
+    effective_steps = min(steps, 20) if steps >= 20 else steps
 
     if cloth_type in ("lower_body", "dresses", "full_body"):
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype) + (
@@ -2323,8 +2403,15 @@ def run_idm_vton_inference(
                 "symmetric skirt, ignored leg positions"
             )
     else:
-        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
-        negative_prompt = _build_source_specific_negative()
+        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype) + (
+            ", photorealistic fabric texture, visible weave and grain, "
+            "natural fabric drape and tension, crisp seam details, "
+            "realistic thread texture, soft realistic contact shadows"
+        )
+        negative_prompt = _build_source_specific_negative() + (
+            ", flat fabric, painted texture, lost stitching, "
+            "smooth cloth, no folds, plastic surface, airbrushed fabric"
+        )
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -2443,9 +2530,41 @@ def run_idm_vton_inference(
                 has_collar=garm_attrs.get("has_collar_or_high_neck", False),
             )
 
+        # ── High-frequency fabric texture enhancement ──────────────────
+        # Restores crisp seam/button/thread detail in the garment region
+        # that diffusion smooths away. Uses the inpaint mask to target
+        # only the clothing area, never face/hair/background.
+        try:
+            from postprocess import enhance_fabric_texture
+            final_img = enhance_fabric_texture(
+                final_img,
+                garment_mask=mask,
+                sharpen_amount=0.4,
+                sharpen_radius=1.2,
+                detail_boost=0.15,
+            )
+            logger.info("fabric_texture_enhanced=True")
+        except Exception as exc:
+            logger.warning("fabric_texture_enhance_failed error=%s", exc)
+
         return final_img, mask_meta
 
-    return images[0], mask_meta
+    # ── Non-auto-crop path: also apply texture enhancement ─────────────
+    raw_result = images[0]
+    try:
+        from postprocess import enhance_fabric_texture
+        raw_result = enhance_fabric_texture(
+            raw_result,
+            garment_mask=mask,
+            sharpen_amount=0.4,
+            sharpen_radius=1.2,
+            detail_boost=0.15,
+        )
+        logger.info("fabric_texture_enhanced_no_crop=True")
+    except Exception as exc:
+        logger.warning("fabric_texture_enhance_no_crop_failed error=%s", exc)
+
+    return raw_result, mask_meta
 
 
 # =============================================================================
@@ -2627,11 +2746,11 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     # model actually applies the (low-luminance) garment color/texture.
     # Guidance scale in 1.8 - 2.0 range to eliminate oversaturation and reduce artifacting
     if vton_type == "lower_body":
-        effective_guidance = 2.0
+        effective_guidance = 2.5
     elif vton_type == "upper_body":
-        effective_guidance = 1.9
+        effective_guidance = 2.5
     else:
-        effective_guidance = 1.9
+        effective_guidance = 2.5
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
