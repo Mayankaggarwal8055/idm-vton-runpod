@@ -14,6 +14,7 @@ from typing import Any
 
 import runpod
 import requests
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -1982,6 +1983,7 @@ def _render_openpose_pose_img(
     Render OpenPose skeleton overlay on grayscale person image for DensePose bypass.
     Saves ~3s GPU latency by skipping Detectron2 ResNet-50 DensePose inference on upper tops.
     """
+    import cv2
     gray_img = cv2.cvtColor(human_bgr, cv2.COLOR_BGR2GRAY)
     canvas = np.tile(gray_img[:, :, np.newaxis], [1, 1, 3])
     h, w = canvas.shape[:2]
